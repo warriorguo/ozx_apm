@@ -1,0 +1,29 @@
+# OZX APM Server Configuration
+# Copy this file to config.yaml and modify as needed
+
+server:
+  host: "0.0.0.0"
+  port: 8080
+  read_timeout: "30s"
+  write_timeout: "30s"
+
+clickhouse:
+  host: "localhost"
+  port: 9000
+  database: "ozx_apm"
+  username: "default"
+  password: ""
+
+auth:
+  enabled: false
+  app_keys:
+    # Add your app keys here
+    # "your-app-key": "Your App Name"
+
+ratelimit:
+  enabled: true
+  requests_per_min: 1000
+
+alert:
+  enabled: false
+  webhook_url: ""

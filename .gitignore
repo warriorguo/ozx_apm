@@ -1,0 +1,118 @@
+# Go
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+go.work
+go.work.sum
+
+# Go build output
+/server/ozx-apm-server
+/server/bin/
+/server/dist/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Unity
+/sdk/[Ll]ibrary/
+/sdk/[Tt]emp/
+/sdk/[Oo]bj/
+/sdk/[Bb]uild/
+/sdk/[Bb]uilds/
+/sdk/[Ll]ogs/
+/sdk/[Uu]ser[Ss]ettings/
+/sdk/[Mm]emoryCaptures/
+/sdk/[Rr]ecordings/
+*.pidb.meta
+*.pdb.meta
+*.mdb.meta
+sysinfo.txt
+*.apk
+*.aab
+*.unitypackage
+*.app
+crashlytics-build.properties
+
+# Unity3D generated meta files
+*.pidb
+*.pdb
+*.mdb
+
+# Unity3D generated file on crash reports
+sysinfo.txt
+
+# Builds
+*.apk
+*.aab
+*.ipa
+
+# Gradle (Android)
+.gradle/
+local.properties
+*.keystore
+!debug.keystore
+
+# Visual Studio
+.vs/
+*.csproj
+*.unityproj
+*.sln
+*.suo
+*.tmp
+*.user
+*.userprefs
+*.pidb
+*.booproj
+*.svd
+*.pdb
+*.mdb
+*.opendb
+*.VC.db
+
+# Environment and secrets
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+config.yaml
+!config.yaml.example
+
+# Test coverage
+coverage.out
+coverage.html
+*.cover
+
+# Logs
+*.log
+logs/
+
+# Docker
+docker-compose.override.yml
+
+# ClickHouse data (local dev)
+clickhouse_data/
+clickhouse_logs/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.temp
