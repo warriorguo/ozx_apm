@@ -7,11 +7,12 @@ import (
 )
 
 type Config struct {
-	Server     ServerConfig     `mapstructure:"server"`
-	ClickHouse ClickHouseConfig `mapstructure:"clickhouse"`
-	Auth       AuthConfig       `mapstructure:"auth"`
-	RateLimit  RateLimitConfig  `mapstructure:"ratelimit"`
-	Alert      AlertConfig      `mapstructure:"alert"`
+	Server      ServerConfig      `mapstructure:"server"`
+	AdminServer AdminServerConfig `mapstructure:"admin_server"`
+	ClickHouse  ClickHouseConfig  `mapstructure:"clickhouse"`
+	Auth        AuthConfig        `mapstructure:"auth"`
+	RateLimit   RateLimitConfig   `mapstructure:"ratelimit"`
+	Alert       AlertConfig       `mapstructure:"alert"`
 }
 
 type ServerConfig struct {
@@ -19,6 +20,15 @@ type ServerConfig struct {
 	Port         int           `mapstructure:"port"`
 	ReadTimeout  time.Duration `mapstructure:"read_timeout"`
 	WriteTimeout time.Duration `mapstructure:"write_timeout"`
+}
+
+type AdminServerConfig struct {
+	Enabled        bool          `mapstructure:"enabled"`
+	Host           string        `mapstructure:"host"`
+	Port           int           `mapstructure:"port"`
+	ReadTimeout    time.Duration `mapstructure:"read_timeout"`
+	WriteTimeout   time.Duration `mapstructure:"write_timeout"`
+	AllowedOrigins []string      `mapstructure:"allowed_origins"`
 }
 
 type ClickHouseConfig struct {
@@ -56,6 +66,13 @@ func Load() (*Config, error) {
 	viper.SetDefault("server.port", 8080)
 	viper.SetDefault("server.read_timeout", "30s")
 	viper.SetDefault("server.write_timeout", "30s")
+
+	viper.SetDefault("admin_server.enabled", true)
+	viper.SetDefault("admin_server.host", "0.0.0.0")
+	viper.SetDefault("admin_server.port", 8081)
+	viper.SetDefault("admin_server.read_timeout", "30s")
+	viper.SetDefault("admin_server.write_timeout", "30s")
+	viper.SetDefault("admin_server.allowed_origins", []string{"*"})
 
 	viper.SetDefault("clickhouse.host", "localhost")
 	viper.SetDefault("clickhouse.port", 9000)

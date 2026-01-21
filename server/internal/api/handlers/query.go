@@ -78,6 +78,11 @@ func parseQueryFilter(r *http.Request) models.QueryFilter {
 
 // GetFPSMetrics returns FPS distribution metrics
 func (h *QueryHandler) GetFPSMetrics(w http.ResponseWriter, r *http.Request) {
+	if h.repo == nil {
+		http.Error(w, "repository not configured", http.StatusInternalServerError)
+		return
+	}
+
 	filter := parseQueryFilter(r)
 
 	metrics, err := h.repo.QueryFPSMetrics(r.Context(), filter)
@@ -95,6 +100,11 @@ func (h *QueryHandler) GetFPSMetrics(w http.ResponseWriter, r *http.Request) {
 
 // GetStartupMetrics returns startup time percentiles
 func (h *QueryHandler) GetStartupMetrics(w http.ResponseWriter, r *http.Request) {
+	if h.repo == nil {
+		http.Error(w, "repository not configured", http.StatusInternalServerError)
+		return
+	}
+
 	filter := parseQueryFilter(r)
 
 	metrics, err := h.repo.QueryStartupMetrics(r.Context(), filter)
@@ -112,6 +122,11 @@ func (h *QueryHandler) GetStartupMetrics(w http.ResponseWriter, r *http.Request)
 
 // GetJankMetrics returns jank statistics
 func (h *QueryHandler) GetJankMetrics(w http.ResponseWriter, r *http.Request) {
+	if h.repo == nil {
+		http.Error(w, "repository not configured", http.StatusInternalServerError)
+		return
+	}
+
 	filter := parseQueryFilter(r)
 
 	metrics, err := h.repo.QueryJankMetrics(r.Context(), filter)
@@ -129,6 +144,11 @@ func (h *QueryHandler) GetJankMetrics(w http.ResponseWriter, r *http.Request) {
 
 // GetExceptions returns exception list with counts
 func (h *QueryHandler) GetExceptions(w http.ResponseWriter, r *http.Request) {
+	if h.repo == nil {
+		http.Error(w, "repository not configured", http.StatusInternalServerError)
+		return
+	}
+
 	filter := parseQueryFilter(r)
 
 	exceptions, err := h.repo.QueryExceptions(r.Context(), filter)
@@ -146,6 +166,11 @@ func (h *QueryHandler) GetExceptions(w http.ResponseWriter, r *http.Request) {
 
 // GetCrashes returns crash list with counts
 func (h *QueryHandler) GetCrashes(w http.ResponseWriter, r *http.Request) {
+	if h.repo == nil {
+		http.Error(w, "repository not configured", http.StatusInternalServerError)
+		return
+	}
+
 	filter := parseQueryFilter(r)
 
 	crashes, err := h.repo.QueryCrashes(r.Context(), filter)

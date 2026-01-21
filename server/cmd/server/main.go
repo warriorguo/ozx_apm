@@ -53,40 +53,66 @@ func main() {
 	// Initialize repository
 	repo := storage.NewRepository(chClient, logger)
 
-	// Create router
-	router := api.NewRouter(cfg, repo, logger)
+	// Create SDK ingestion router
+	sdkRouter := api.NewRouter(cfg, repo, logger)
 
-	// Create HTTP server
-	addr := fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port)
-	server := &http.Server{
-		Addr:         addr,
-		Handler:      router,
+	// Create SDK ingestion server
+	sdkAddr := fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port)
+	sdkServer := &http.Server{
+		Addr:         sdkAddr,
+		Handler:      sdkRouter,
 		ReadTimeout:  cfg.Server.ReadTimeout,
 		WriteTimeout: cfg.Server.WriteTimeout,
 	}
 
-	// Start server in goroutine
+	// Start SDK server in goroutine
 	go func() {
-		logger.Info("HTTP server listening", zap.String("addr", addr))
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			logger.Fatal("server error", zap.Error(err))
+		logger.Info("SDK ingestion server listening", zap.String("addr", sdkAddr))
+		if err := sdkServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			logger.Fatal("SDK server error", zap.Error(err))
 		}
 	}()
+
+	// Start Admin server if enabled
+	var adminServer *http.Server
+	if cfg.AdminServer.Enabled {
+		adminRouter := api.NewAdminRouter(cfg, repo, logger)
+		adminAddr := fmt.Sprintf("%s:%d", cfg.AdminServer.Host, cfg.AdminServer.Port)
+		adminServer = &http.Server{
+			Addr:         adminAddr,
+			Handler:      adminRouter,
+			ReadTimeout:  cfg.AdminServer.ReadTimeout,
+			WriteTimeout: cfg.AdminServer.WriteTimeout,
+		}
+
+		go func() {
+			logger.Info("Admin server listening", zap.String("addr", adminAddr))
+			if err := adminServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				logger.Fatal("Admin server error", zap.Error(err))
+			}
+		}()
+	}
 
 	// Wait for shutdown signal
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
 
-	logger.Info("shutting down server...")
+	logger.Info("shutting down servers...")
 
 	// Graceful shutdown with timeout
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	if err := server.Shutdown(ctx); err != nil {
-		logger.Error("server shutdown error", zap.Error(err))
+	if err := sdkServer.Shutdown(ctx); err != nil {
+		logger.Error("SDK server shutdown error", zap.Error(err))
 	}
 
-	logger.Info("server stopped")
+	if adminServer != nil {
+		if err := adminServer.Shutdown(ctx); err != nil {
+			logger.Error("Admin server shutdown error", zap.Error(err))
+		}
+	}
+
+	logger.Info("servers stopped")
 }

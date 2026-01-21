@@ -1,11 +1,12 @@
 package api
 
 import (
+	"time"
+
 	"github.com/go-chi/chi/v5"
 	chiMiddleware "github.com/go-chi/chi/v5/middleware"
 	"github.com/go-chi/httprate"
 	"go.uber.org/zap"
-	"time"
 
 	"github.com/warriorguo/ozx_apm/server/internal/api/handlers"
 	"github.com/warriorguo/ozx_apm/server/internal/api/middleware"
@@ -13,6 +14,7 @@ import (
 	"github.com/warriorguo/ozx_apm/server/internal/storage"
 )
 
+// NewRouter creates the SDK ingestion API router (separate from admin API)
 func NewRouter(cfg *config.Config, repo *storage.Repository, logger *zap.Logger) *chi.Mux {
 	r := chi.NewRouter()
 
@@ -32,7 +34,7 @@ func NewRouter(cfg *config.Config, repo *storage.Repository, logger *zap.Logger)
 	healthHandler := handlers.NewHealthHandler(repo)
 	r.Get("/health", healthHandler.Health)
 
-	// API v1 routes
+	// API v1 routes (SDK ingestion)
 	r.Route("/v1", func(r chi.Router) {
 		// Auth middleware for v1 routes
 		if cfg.Auth.Enabled {

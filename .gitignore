@@ -107,6 +107,12 @@ logs/
 # Docker
 docker-compose.override.yml
 
+# Admin frontend
+/admin/node_modules/
+/admin/dist/
+/admin/.vite/
+/admin/.eslintcache
+
 # ClickHouse data (local dev)
 clickhouse_data/
 clickhouse_logs/

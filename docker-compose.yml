@@ -1,0 +1,70 @@
+version: '3.8'
+
+services:
+  # ClickHouse database
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.1
+    container_name: ozx-apm-clickhouse
+    ports:
+      - "8123:8123"  # HTTP interface
+      - "9000:9000"  # Native interface
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+      - clickhouse-logs:/var/log/clickhouse-server
+    environment:
+      - CLICKHOUSE_DB=ozx_apm
+      - CLICKHOUSE_USER=default
+      - CLICKHOUSE_PASSWORD=
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # OZX APM Server (SDK ingestion + Admin API)
+  server:
+    build:
+      context: ./server
+      dockerfile: Dockerfile
+    container_name: ozx-apm-server
+    ports:
+      - "8080:8080"  # SDK ingestion API
+      - "8081:8081"  # Admin API
+    environment:
+      - OZX_SERVER_HOST=0.0.0.0
+      - OZX_SERVER_PORT=8080
+      - OZX_ADMIN_SERVER_ENABLED=true
+      - OZX_ADMIN_SERVER_HOST=0.0.0.0
+      - OZX_ADMIN_SERVER_PORT=8081
+      - OZX_CLICKHOUSE_HOST=clickhouse
+      - OZX_CLICKHOUSE_PORT=9000
+      - OZX_CLICKHOUSE_DATABASE=ozx_apm
+      - OZX_CLICKHOUSE_USERNAME=default
+      - OZX_CLICKHOUSE_PASSWORD=
+      - OZX_AUTH_ENABLED=false
+      - OZX_RATELIMIT_ENABLED=true
+      - OZX_RATELIMIT_REQUESTS_PER_MIN=1000
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Admin UI (optional - can access API directly)
+  admin:
+    build:
+      context: ./admin
+      dockerfile: Dockerfile
+    container_name: ozx-apm-admin
+    ports:
+      - "3000:80"
+    depends_on:
+      - server
+    restart: unless-stopped
+
+volumes:
+  clickhouse-data:
+  clickhouse-logs:
