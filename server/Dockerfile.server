@@ -1,5 +1,6 @@
 # Dockerfile.server - SDK Ingestion Server
 # Only serves port 8080 for receiving events from Unity SDK
+# Build context: project root (ozx_apm/)
 
 # Build stage
 FROM golang:1.22-alpine AS builder
@@ -10,13 +11,13 @@ WORKDIR /app
 RUN apk add --no-cache git
 
 # Copy go mod files
-COPY go.mod go.sum ./
+COPY server/go.mod server/go.sum ./
 
 # Download dependencies
 RUN go mod download
 
 # Copy source code
-COPY . .
+COPY server/ ./
 
 # Build the application with optimizations
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \

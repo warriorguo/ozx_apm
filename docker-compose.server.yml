@@ -30,8 +30,8 @@ services:
 
   server:
     build:
-      context: ./server
-      dockerfile: Dockerfile.server
+      context: .
+      dockerfile: server/Dockerfile.server
     container_name: ozx-apm-server
     ports:
       - "8080:8080"

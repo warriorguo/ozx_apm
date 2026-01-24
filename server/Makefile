@@ -149,7 +149,7 @@ docker-build:
 # Build server-only image (SDK ingestion)
 docker-build-server:
 	@echo "Building server Docker image..."
-	docker build -f Dockerfile.server -t $(DOCKER_IMAGE)-server:$(DOCKER_TAG) .
+	cd .. && docker build -f server/Dockerfile.server -t $(DOCKER_IMAGE)-server:$(DOCKER_TAG) .
 
 # Build admin image (frontend + backend)
 docker-build-admin:
