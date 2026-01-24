@@ -1,0 +1,57 @@
+# Dockerfile.server - SDK Ingestion Server
+# Only serves port 8080 for receiving events from Unity SDK
+
+# Build stage
+FROM golang:1.22-alpine AS builder
+
+WORKDIR /app
+
+# Install git for go mod download
+RUN apk add --no-cache git
+
+# Copy go mod files
+COPY go.mod go.sum ./
+
+# Download dependencies
+RUN go mod download
+
+# Copy source code
+COPY . .
+
+# Build the application with optimizations
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+    -ldflags="-s -w" \
+    -o /ozx-apm-server ./cmd/server
+
+# Final stage - minimal image
+FROM alpine:3.19
+
+WORKDIR /app
+
+# Install ca-certificates for HTTPS
+RUN apk --no-cache add ca-certificates tzdata
+
+# Create non-root user
+RUN adduser -D -g '' appuser
+
+# Copy the binary
+COPY --from=builder /ozx-apm-server /app/ozx-apm-server
+
+# Use non-root user
+USER appuser
+
+# Expose SDK ingestion port only
+EXPOSE 8080
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD wget --no-verbose --tries=1 --spider http://localhost:8080/health || exit 1
+
+# Environment variables for server-only mode
+ENV OZX_SERVER_ENABLED=true \
+    OZX_ADMIN_SERVER_ENABLED=false \
+    OZX_SERVER_HOST=0.0.0.0 \
+    OZX_SERVER_PORT=8080
+
+# Run the server
+CMD ["/app/ozx-apm-server"]

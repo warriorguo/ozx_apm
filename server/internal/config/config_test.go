@@ -189,3 +189,117 @@ func TestAlertConfig(t *testing.T) {
 		t.Errorf("unexpected webhook url: %s", cfg.WebhookURL)
 	}
 }
+
+func TestParseClickHouseURL(t *testing.T) {
+	tests := []struct {
+		name     string
+		url      string
+		expected ClickHouseConfig
+	}{
+		{
+			name: "full URL with credentials",
+			url:  "clickhouse://admin:secret@db.example.com:9000/mydb",
+			expected: ClickHouseConfig{
+				Host:     "db.example.com",
+				Port:     9000,
+				Database: "mydb",
+				Username: "admin",
+				Password: "secret",
+			},
+		},
+		{
+			name: "URL without password",
+			url:  "clickhouse://default@localhost:9000/ozx_apm",
+			expected: ClickHouseConfig{
+				Host:     "localhost",
+				Port:     9000,
+				Database: "ozx_apm",
+				Username: "default",
+				Password: "",
+			},
+		},
+		{
+			name: "URL without credentials",
+			url:  "clickhouse://localhost:9000/testdb",
+			expected: ClickHouseConfig{
+				Host:     "localhost",
+				Port:     9000,
+				Database: "testdb",
+				Username: "",
+				Password: "",
+			},
+		},
+		{
+			name: "legacy host:port format",
+			url:  "clickhouse.local:9001",
+			expected: ClickHouseConfig{
+				Host: "clickhouse.local",
+				Port: 9001,
+			},
+		},
+		{
+			name: "URL with special characters in password",
+			url:  "clickhouse://user:p%40ss%3Aword@host:9000/db",
+			expected: ClickHouseConfig{
+				Host:     "host",
+				Port:     9000,
+				Database: "db",
+				Username: "user",
+				Password: "p@ss:word",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := ClickHouseConfig{}
+			err := parseClickHouseURL(tt.url, &cfg)
+			if err != nil {
+				t.Fatalf("parseClickHouseURL failed: %v", err)
+			}
+
+			if cfg.Host != tt.expected.Host {
+				t.Errorf("host: expected %s, got %s", tt.expected.Host, cfg.Host)
+			}
+			if cfg.Port != tt.expected.Port {
+				t.Errorf("port: expected %d, got %d", tt.expected.Port, cfg.Port)
+			}
+			if cfg.Database != tt.expected.Database {
+				t.Errorf("database: expected %s, got %s", tt.expected.Database, cfg.Database)
+			}
+			if cfg.Username != tt.expected.Username {
+				t.Errorf("username: expected %s, got %s", tt.expected.Username, cfg.Username)
+			}
+			if cfg.Password != tt.expected.Password {
+				t.Errorf("password: expected %s, got %s", tt.expected.Password, cfg.Password)
+			}
+		})
+	}
+}
+
+func TestLoad_DatabaseURL(t *testing.T) {
+	// Set DATABASE_URL
+	os.Setenv("DATABASE_URL", "clickhouse://testuser:testpass@dbhost:9999/testdb")
+	defer os.Unsetenv("DATABASE_URL")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("failed to load config: %v", err)
+	}
+
+	if cfg.ClickHouse.Host != "dbhost" {
+		t.Errorf("expected host=dbhost, got %s", cfg.ClickHouse.Host)
+	}
+	if cfg.ClickHouse.Port != 9999 {
+		t.Errorf("expected port=9999, got %d", cfg.ClickHouse.Port)
+	}
+	if cfg.ClickHouse.Database != "testdb" {
+		t.Errorf("expected database=testdb, got %s", cfg.ClickHouse.Database)
+	}
+	if cfg.ClickHouse.Username != "testuser" {
+		t.Errorf("expected username=testuser, got %s", cfg.ClickHouse.Username)
+	}
+	if cfg.ClickHouse.Password != "testpass" {
+		t.Errorf("expected password=testpass, got %s", cfg.ClickHouse.Password)
+	}
+}

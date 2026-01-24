@@ -1,0 +1,77 @@
+# Dockerfile.admin - Admin Dashboard
+# Serves frontend on port 80 and backend API on port 8081
+# Build context should be project root (ozx_apm/)
+
+# Stage 1: Build Go backend
+FROM golang:1.22-alpine AS go-builder
+
+WORKDIR /app
+
+RUN apk add --no-cache git
+
+# Copy server source
+COPY server/go.mod server/go.sum ./
+RUN go mod download
+
+COPY server/ ./
+
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+    -ldflags="-s -w" \
+    -o /ozx-apm-server ./cmd/server
+
+# Stage 2: Build React frontend
+FROM node:20-alpine AS node-builder
+
+WORKDIR /app
+
+# Copy frontend source
+COPY admin/package.json admin/package-lock.json* ./
+RUN npm ci
+
+COPY admin/ ./
+
+# Build frontend
+RUN npm run build
+
+# Stage 3: Final image with nginx + backend
+FROM alpine:3.19
+
+WORKDIR /app
+
+# Install nginx and supervisor
+RUN apk --no-cache add \
+    ca-certificates \
+    tzdata \
+    nginx \
+    supervisor
+
+# Create directories
+RUN mkdir -p /var/log/supervisor /run/nginx /usr/share/nginx/html
+
+# Copy Go backend
+COPY --from=go-builder /ozx-apm-server /app/ozx-apm-server
+
+# Copy frontend build
+COPY --from=node-builder /app/dist /usr/share/nginx/html
+
+# Copy nginx config
+COPY server/deployments/nginx-admin.conf /etc/nginx/http.d/default.conf
+
+# Copy supervisor config
+COPY server/deployments/supervisord.conf /etc/supervisor/conf.d/supervisord.conf
+
+# Expose ports
+EXPOSE 80
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
+    CMD wget --no-verbose --tries=1 --spider http://localhost/api/health || exit 1
+
+# Environment variables for admin-only mode
+ENV OZX_SERVER_ENABLED=false \
+    OZX_ADMIN_SERVER_ENABLED=true \
+    OZX_ADMIN_SERVER_HOST=127.0.0.1 \
+    OZX_ADMIN_SERVER_PORT=8081
+
+# Run supervisor to manage nginx and backend
+CMD ["/usr/bin/supervisord", "-c", "/etc/supervisor/conf.d/supervisord.conf"]

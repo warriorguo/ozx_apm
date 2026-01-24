@@ -241,11 +241,11 @@ func (r *Repository) QueryFPSMetrics(ctx context.Context, filter models.QueryFil
 			platform,
 			scene,
 			count() as count,
-			avg(fps) as avg_fps,
-			quantile(0.5)(fps) as p50_fps,
-			quantile(0.9)(fps) as p90_fps,
-			quantile(0.95)(fps) as p95_fps,
-			quantile(0.99)(fps) as p99_fps
+			toFloat64(avg(fps)) as avg_fps,
+			toFloat64(quantile(0.5)(fps)) as p50_fps,
+			toFloat64(quantile(0.9)(fps)) as p90_fps,
+			toFloat64(quantile(0.95)(fps)) as p95_fps,
+			toFloat64(quantile(0.99)(fps)) as p99_fps
 		FROM apm_perf_samples
 		WHERE timestamp >= ? AND timestamp <= ?
 	`
@@ -304,12 +304,12 @@ func (r *Repository) QueryStartupMetrics(ctx context.Context, filter models.Quer
 			app_version,
 			platform,
 			count() as count,
-			avg(phase1_ms) as avg_phase1,
-			avg(phase2_ms) as avg_phase2,
-			avg(tti_ms) as avg_tti,
-			quantile(0.5)(phase1_ms + phase2_ms + tti_ms) as p50_total,
-			quantile(0.95)(phase1_ms + phase2_ms + tti_ms) as p95_total,
-			quantile(0.99)(phase1_ms + phase2_ms + tti_ms) as p99_total
+			toFloat64(avg(phase1_ms)) as avg_phase1,
+			toFloat64(avg(phase2_ms)) as avg_phase2,
+			toFloat64(avg(tti_ms)) as avg_tti,
+			toFloat64(quantile(0.5)(phase1_ms + phase2_ms + tti_ms)) as p50_total,
+			toFloat64(quantile(0.95)(phase1_ms + phase2_ms + tti_ms)) as p95_total,
+			toFloat64(quantile(0.99)(phase1_ms + phase2_ms + tti_ms)) as p99_total
 		FROM apm_startups
 		WHERE timestamp >= ? AND timestamp <= ?
 	`
@@ -365,8 +365,8 @@ func (r *Repository) QueryJankMetrics(ctx context.Context, filter models.QueryFi
 			platform,
 			scene,
 			count() as count,
-			avg(duration_ms) as avg_duration,
-			max(max_frame_ms) as max_duration,
+			toFloat64(avg(duration_ms)) as avg_duration,
+			toFloat64(max(max_frame_ms)) as max_duration,
 			uniqExact(session_id) as session_count
 		FROM apm_janks
 		WHERE timestamp >= ? AND timestamp <= ?

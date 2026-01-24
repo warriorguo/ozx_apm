@@ -1,6 +1,10 @@
 package config
 
 import (
+	"net/url"
+	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/spf13/viper"
@@ -16,6 +20,7 @@ type Config struct {
 }
 
 type ServerConfig struct {
+	Enabled      bool          `mapstructure:"enabled"`
 	Host         string        `mapstructure:"host"`
 	Port         int           `mapstructure:"port"`
 	ReadTimeout  time.Duration `mapstructure:"read_timeout"`
@@ -62,6 +67,7 @@ func Load() (*Config, error) {
 	viper.AddConfigPath("/etc/ozx-apm/")
 
 	// Set defaults
+	viper.SetDefault("server.enabled", true)
 	viper.SetDefault("server.host", "0.0.0.0")
 	viper.SetDefault("server.port", 8080)
 	viper.SetDefault("server.read_timeout", "30s")
@@ -97,5 +103,59 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 
+	// Override ClickHouse config if DATABASE_URL is set
+	if dbURL := os.Getenv("DATABASE_URL"); dbURL != "" {
+		if err := parseClickHouseURL(dbURL, &cfg.ClickHouse); err != nil {
+			return nil, err
+		}
+	}
+
 	return &cfg, nil
+}
+
+// parseClickHouseURL parses a ClickHouse connection URL and populates the config.
+// Supported formats:
+//   - clickhouse://user:password@host:port/database
+//   - clickhouse://host:port/database
+//   - host:port (legacy format)
+func parseClickHouseURL(rawURL string, cfg *ClickHouseConfig) error {
+	// Handle legacy format: host:port
+	if !strings.Contains(rawURL, "://") {
+		parts := strings.Split(rawURL, ":")
+		if len(parts) == 2 {
+			cfg.Host = parts[0]
+			if port, err := strconv.Atoi(parts[1]); err == nil {
+				cfg.Port = port
+			}
+		}
+		return nil
+	}
+
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return err
+	}
+
+	// Host and port
+	cfg.Host = u.Hostname()
+	if portStr := u.Port(); portStr != "" {
+		if port, err := strconv.Atoi(portStr); err == nil {
+			cfg.Port = port
+		}
+	}
+
+	// Username and password
+	if u.User != nil {
+		cfg.Username = u.User.Username()
+		if password, ok := u.User.Password(); ok {
+			cfg.Password = password
+		}
+	}
+
+	// Database from path
+	if u.Path != "" {
+		cfg.Database = strings.TrimPrefix(u.Path, "/")
+	}
+
+	return nil
 }

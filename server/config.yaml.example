@@ -1,12 +1,28 @@
 # OZX APM Server Configuration
 # Copy this file to config.yaml and modify as needed
 
+# SDK Ingestion Server (receives events from Unity SDK)
 server:
+  enabled: true        # Set to false for admin-only deployment
   host: "0.0.0.0"
   port: 8080
   read_timeout: "30s"
   write_timeout: "30s"
 
+# Admin Server (API for admin dashboard)
+admin_server:
+  enabled: true        # Set to false for server-only deployment
+  host: "0.0.0.0"
+  port: 8081
+  read_timeout: "30s"
+  write_timeout: "30s"
+  allowed_origins:
+    - "*"
+
+# ClickHouse database configuration
+# Can also be configured via DATABASE_URL environment variable:
+#   DATABASE_URL=clickhouse://user:password@host:port/database
+# DATABASE_URL takes precedence over the settings below
 clickhouse:
   host: "localhost"
   port: 9000

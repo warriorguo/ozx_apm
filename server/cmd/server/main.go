@@ -31,9 +31,14 @@ func main() {
 		logger.Fatal("failed to load config", zap.Error(err))
 	}
 
-	logger.Info("starting OZX APM server",
-		zap.String("host", cfg.Server.Host),
-		zap.Int("port", cfg.Server.Port),
+	// Check if at least one server is enabled
+	if !cfg.Server.Enabled && !cfg.AdminServer.Enabled {
+		logger.Fatal("at least one of server or admin_server must be enabled")
+	}
+
+	logger.Info("starting OZX APM",
+		zap.Bool("sdk_server_enabled", cfg.Server.Enabled),
+		zap.Bool("admin_server_enabled", cfg.AdminServer.Enabled),
 	)
 
 	// Initialize ClickHouse client
@@ -53,25 +58,25 @@ func main() {
 	// Initialize repository
 	repo := storage.NewRepository(chClient, logger)
 
-	// Create SDK ingestion router
-	sdkRouter := api.NewRouter(cfg, repo, logger)
-
-	// Create SDK ingestion server
-	sdkAddr := fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port)
-	sdkServer := &http.Server{
-		Addr:         sdkAddr,
-		Handler:      sdkRouter,
-		ReadTimeout:  cfg.Server.ReadTimeout,
-		WriteTimeout: cfg.Server.WriteTimeout,
-	}
-
-	// Start SDK server in goroutine
-	go func() {
-		logger.Info("SDK ingestion server listening", zap.String("addr", sdkAddr))
-		if err := sdkServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			logger.Fatal("SDK server error", zap.Error(err))
+	// Start SDK ingestion server if enabled
+	var sdkServer *http.Server
+	if cfg.Server.Enabled {
+		sdkRouter := api.NewRouter(cfg, repo, logger)
+		sdkAddr := fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port)
+		sdkServer = &http.Server{
+			Addr:         sdkAddr,
+			Handler:      sdkRouter,
+			ReadTimeout:  cfg.Server.ReadTimeout,
+			WriteTimeout: cfg.Server.WriteTimeout,
 		}
-	}()
+
+		go func() {
+			logger.Info("SDK ingestion server listening", zap.String("addr", sdkAddr))
+			if err := sdkServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				logger.Fatal("SDK server error", zap.Error(err))
+			}
+		}()
+	}
 
 	// Start Admin server if enabled
 	var adminServer *http.Server
@@ -104,8 +109,10 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	if err := sdkServer.Shutdown(ctx); err != nil {
-		logger.Error("SDK server shutdown error", zap.Error(err))
+	if sdkServer != nil {
+		if err := sdkServer.Shutdown(ctx); err != nil {
+			logger.Error("SDK server shutdown error", zap.Error(err))
+		}
 	}
 
 	if adminServer != nil {
