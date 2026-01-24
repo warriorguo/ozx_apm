@@ -296,4 +296,345 @@ namespace OzxApm.Network
             }
         }
     }
+
+    /// <summary>
+    /// Records all network communication with the server for debugging purposes.
+    /// Logs are persisted to file and can be retrieved for analysis.
+    /// </summary>
+    public class NetworkLogger
+    {
+        private readonly ApmConfig _config;
+        private readonly string _logFilePath;
+        private readonly object _lock = new object();
+        private readonly List<NetworkLogEntry> _recentLogs = new List<NetworkLogEntry>();
+
+        private const int MaxRecentLogs = 100;
+        private const string LogFileName = "ozx_apm_network.log";
+
+        public NetworkLogger(ApmConfig config)
+        {
+            _config = config;
+            _logFilePath = Path.Combine(Application.persistentDataPath, LogFileName);
+
+            // Output log file path to console
+            Debug.Log($"[OzxApm] Network log file: {_logFilePath}");
+
+            // Write session start marker
+            WriteLog(new NetworkLogEntry
+            {
+                Timestamp = DateTime.UtcNow,
+                Level = NetworkLogLevel.Info,
+                Message = $"=== Network logging session started === App: {config.AppVersion}, Server: {config.ServerUrl}"
+            });
+        }
+
+        /// <summary>
+        /// Logs a request being sent to the server
+        /// </summary>
+        public void LogRequest(string url, string method, Dictionary<string, string> headers, string body, int bodyBytes, bool isCompressed)
+        {
+            var entry = new NetworkLogEntry
+            {
+                Timestamp = DateTime.UtcNow,
+                Level = NetworkLogLevel.Info,
+                Type = NetworkLogType.Request,
+                Url = url,
+                Method = method,
+                Headers = headers,
+                Body = TruncateBody(body),
+                BodyBytes = bodyBytes,
+                IsCompressed = isCompressed,
+                Message = $"REQUEST: {method} {url} ({bodyBytes} bytes{(isCompressed ? ", gzip" : "")})"
+            };
+
+            WriteLog(entry);
+            LogToConsole(entry);
+        }
+
+        /// <summary>
+        /// Logs a successful response from the server
+        /// </summary>
+        public void LogResponse(string url, int statusCode, string responseBody, double elapsedMs, int eventCount)
+        {
+            var entry = new NetworkLogEntry
+            {
+                Timestamp = DateTime.UtcNow,
+                Level = NetworkLogLevel.Info,
+                Type = NetworkLogType.Response,
+                Url = url,
+                StatusCode = statusCode,
+                Body = TruncateBody(responseBody),
+                ElapsedMs = elapsedMs,
+                EventCount = eventCount,
+                Message = $"RESPONSE: {statusCode} OK from {url} ({elapsedMs:F0}ms, {eventCount} events)"
+            };
+
+            WriteLog(entry);
+            LogToConsole(entry);
+        }
+
+        /// <summary>
+        /// Logs a failed request
+        /// </summary>
+        public void LogFailure(string url, int statusCode, string error, string responseBody, double elapsedMs, int eventCount, int consecutiveFailures, float backoffMultiplier)
+        {
+            var entry = new NetworkLogEntry
+            {
+                Timestamp = DateTime.UtcNow,
+                Level = NetworkLogLevel.Error,
+                Type = NetworkLogType.Failure,
+                Url = url,
+                StatusCode = statusCode,
+                Error = error,
+                Body = TruncateBody(responseBody),
+                ElapsedMs = elapsedMs,
+                EventCount = eventCount,
+                ConsecutiveFailures = consecutiveFailures,
+                BackoffMultiplier = backoffMultiplier,
+                Message = $"FAILURE: {error} from {url} (status: {statusCode}, {elapsedMs:F0}ms, failures: {consecutiveFailures}, backoff: {backoffMultiplier}x)"
+            };
+
+            WriteLog(entry);
+            LogToConsole(entry);
+        }
+
+        /// <summary>
+        /// Logs when events are queued for offline storage
+        /// </summary>
+        public void LogOfflineQueue(int eventCount, string reason)
+        {
+            var entry = new NetworkLogEntry
+            {
+                Timestamp = DateTime.UtcNow,
+                Level = NetworkLogLevel.Warning,
+                Type = NetworkLogType.OfflineQueue,
+                EventCount = eventCount,
+                Message = $"OFFLINE_QUEUE: {eventCount} events queued - {reason}"
+            };
+
+            WriteLog(entry);
+            LogToConsole(entry);
+        }
+
+        /// <summary>
+        /// Logs when offline events are being retried
+        /// </summary>
+        public void LogOfflineRetry(int fileCount, int eventCount)
+        {
+            var entry = new NetworkLogEntry
+            {
+                Timestamp = DateTime.UtcNow,
+                Level = NetworkLogLevel.Info,
+                Type = NetworkLogType.OfflineRetry,
+                EventCount = eventCount,
+                Message = $"OFFLINE_RETRY: Processing {fileCount} offline files ({eventCount} events)"
+            };
+
+            WriteLog(entry);
+            LogToConsole(entry);
+        }
+
+        /// <summary>
+        /// Logs compression details
+        /// </summary>
+        public void LogCompression(int originalBytes, int compressedBytes)
+        {
+            float ratio = (float)compressedBytes / originalBytes;
+            var entry = new NetworkLogEntry
+            {
+                Timestamp = DateTime.UtcNow,
+                Level = NetworkLogLevel.Debug,
+                Type = NetworkLogType.Compression,
+                BodyBytes = compressedBytes,
+                Message = $"COMPRESSION: {originalBytes} -> {compressedBytes} bytes ({ratio:P0})"
+            };
+
+            WriteLog(entry);
+            LogToConsole(entry);
+        }
+
+        /// <summary>
+        /// Gets recent log entries (in-memory cache)
+        /// </summary>
+        public List<NetworkLogEntry> GetRecentLogs()
+        {
+            lock (_lock)
+            {
+                return new List<NetworkLogEntry>(_recentLogs);
+            }
+        }
+
+        /// <summary>
+        /// Gets the full log file path
+        /// </summary>
+        public string GetLogFilePath()
+        {
+            return _logFilePath;
+        }
+
+        /// <summary>
+        /// Clears the log file
+        /// </summary>
+        public void ClearLogs()
+        {
+            lock (_lock)
+            {
+                _recentLogs.Clear();
+                try
+                {
+                    if (File.Exists(_logFilePath))
+                    {
+                        File.Delete(_logFilePath);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    ApmClient.Log(LogLevel.Warning, $"Failed to clear network log file: {ex.Message}");
+                }
+            }
+        }
+
+        private void WriteLog(NetworkLogEntry entry)
+        {
+            lock (_lock)
+            {
+                // Add to recent logs cache
+                _recentLogs.Add(entry);
+                if (_recentLogs.Count > MaxRecentLogs)
+                {
+                    _recentLogs.RemoveAt(0);
+                }
+
+                // Only write to file in debug builds or if log level is Debug
+                if (!Debug.isDebugBuild && _config.LogLevel > LogLevel.Debug)
+                    return;
+
+                try
+                {
+                    string logLine = FormatLogEntry(entry);
+                    File.AppendAllText(_logFilePath, logLine + Environment.NewLine);
+                }
+                catch (Exception ex)
+                {
+                    // Silently fail - don't want logging to break the SDK
+                    Debug.LogWarning($"[OzxApm] Failed to write network log: {ex.Message}");
+                }
+            }
+        }
+
+        private void LogToConsole(NetworkLogEntry entry)
+        {
+            if (_config.LogLevel > LogLevel.Debug)
+                return;
+
+            string prefix = "[OzxApm] [Network] ";
+            switch (entry.Level)
+            {
+                case NetworkLogLevel.Error:
+                    Debug.LogError(prefix + entry.Message);
+                    break;
+                case NetworkLogLevel.Warning:
+                    Debug.LogWarning(prefix + entry.Message);
+                    break;
+                default:
+                    Debug.Log(prefix + entry.Message);
+                    break;
+            }
+        }
+
+        private string FormatLogEntry(NetworkLogEntry entry)
+        {
+            var sb = new StringBuilder();
+            sb.Append($"[{entry.Timestamp:yyyy-MM-dd HH:mm:ss.fff}] ");
+            sb.Append($"[{entry.Level}] ");
+            sb.Append(entry.Message);
+
+            // Add detailed info for requests and failures
+            if (entry.Type == NetworkLogType.Request && entry.Headers != null)
+            {
+                sb.Append(" | Headers: ");
+                foreach (var kv in entry.Headers)
+                {
+                    // Mask sensitive headers
+                    string value = kv.Key.ToLower().Contains("key") || kv.Key.ToLower().Contains("auth")
+                        ? MaskValue(kv.Value)
+                        : kv.Value;
+                    sb.Append($"{kv.Key}={value}, ");
+                }
+            }
+
+            if (!string.IsNullOrEmpty(entry.Body) && (entry.Type == NetworkLogType.Request || entry.Type == NetworkLogType.Failure))
+            {
+                sb.Append($" | Body: {entry.Body}");
+            }
+
+            if (!string.IsNullOrEmpty(entry.Error))
+            {
+                sb.Append($" | Error: {entry.Error}");
+            }
+
+            return sb.ToString();
+        }
+
+        private string TruncateBody(string body)
+        {
+            if (string.IsNullOrEmpty(body))
+                return null;
+
+            const int maxLength = 1000;
+            return body.Length > maxLength
+                ? body.Substring(0, maxLength) + "... (truncated)"
+                : body;
+        }
+
+        private string MaskValue(string value)
+        {
+            if (string.IsNullOrEmpty(value) || value.Length <= 4)
+                return "****";
+            return value.Substring(0, 4) + "****";
+        }
+    }
+
+    /// <summary>
+    /// Represents a single network log entry
+    /// </summary>
+    [Serializable]
+    public class NetworkLogEntry
+    {
+        public DateTime Timestamp;
+        public NetworkLogLevel Level;
+        public NetworkLogType Type;
+        public string Message;
+        public string Url;
+        public string Method;
+        public Dictionary<string, string> Headers;
+        public string Body;
+        public int BodyBytes;
+        public bool IsCompressed;
+        public int StatusCode;
+        public string Error;
+        public double ElapsedMs;
+        public int EventCount;
+        public int ConsecutiveFailures;
+        public float BackoffMultiplier;
+    }
+
+    public enum NetworkLogLevel
+    {
+        Debug,
+        Info,
+        Warning,
+        Error
+    }
+
+    public enum NetworkLogType
+    {
+        Request,
+        Response,
+        Failure,
+        OfflineQueue,
+        OfflineRetry,
+        Compression,
+        Other
+    }
 }

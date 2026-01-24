@@ -19,6 +19,7 @@ namespace OzxApm.Network
     {
         private readonly ApmConfig _config;
         private readonly OfflineStorage _offlineStorage;
+        private readonly NetworkLogger _networkLogger;
         private readonly string _ingestUrl;
 
         private bool _isSending;
@@ -26,10 +27,11 @@ namespace OzxApm.Network
         private const int MaxConsecutiveFailures = 5;
         private float _backoffMultiplier = 1f;
 
-        public EventReporter(ApmConfig config, OfflineStorage offlineStorage)
+        public EventReporter(ApmConfig config, OfflineStorage offlineStorage, NetworkLogger networkLogger)
         {
             _config = config;
             _offlineStorage = offlineStorage;
+            _networkLogger = networkLogger;
             _ingestUrl = config.ServerUrl.TrimEnd('/') + "/v1/events";
         }
 
@@ -52,16 +54,18 @@ namespace OzxApm.Network
             {
                 payload = Compress(data);
                 isCompressed = true;
+                _networkLogger?.LogCompression(data.Length, payload.Length);
             }
 
             // Start coroutine to send
-            CoroutineRunner.Instance.StartCoroutine(SendRequest(payload, isCompressed, events));
+            CoroutineRunner.Instance.StartCoroutine(SendRequest(payload, isCompressed, events, json));
         }
 
-        private IEnumerator SendRequest(byte[] payload, bool isCompressed, List<BaseEvent> originalEvents)
+        private IEnumerator SendRequest(byte[] payload, bool isCompressed, List<BaseEvent> originalEvents, string jsonPayload = null)
         {
             if (_isSending)
             {
+                _networkLogger?.LogOfflineQueue(originalEvents.Count, "Already sending another batch");
                 // Queue for later
                 if (_offlineStorage != null)
                 {
@@ -71,56 +75,90 @@ namespace OzxApm.Network
             }
 
             _isSending = true;
+            var requestStartTime = DateTime.UtcNow;
+
+            // Build headers dictionary for logging
+            var headers = new Dictionary<string, string>
+            {
+                { "Content-Type", "application/json" }
+            };
+            if (!string.IsNullOrEmpty(_config.AppKey))
+            {
+                headers["X-App-Key"] = _config.AppKey;
+            }
+            if (isCompressed)
+            {
+                headers["Content-Encoding"] = "gzip";
+            }
+
+            // Log the request
+            _networkLogger?.LogRequest(_ingestUrl, "POST", headers, jsonPayload, payload.Length, isCompressed);
 
             using (var request = new UnityWebRequest(_ingestUrl, "POST"))
             {
                 request.uploadHandler = new UploadHandlerRaw(payload);
                 request.downloadHandler = new DownloadHandlerBuffer();
 
-                request.SetRequestHeader("Content-Type", "application/json");
-                if (!string.IsNullOrEmpty(_config.AppKey))
+                // Set headers
+                foreach (var header in headers)
                 {
-                    request.SetRequestHeader("X-App-Key", _config.AppKey);
-                }
-                if (isCompressed)
-                {
-                    request.SetRequestHeader("Content-Encoding", "gzip");
+                    request.SetRequestHeader(header.Key, header.Value);
                 }
 
                 request.timeout = (int)_config.RequestTimeoutSeconds;
 
                 yield return request.SendWebRequest();
 
+                var elapsed = (DateTime.UtcNow - requestStartTime).TotalMilliseconds;
+
                 if (request.result == UnityWebRequest.Result.Success)
                 {
-                    OnSuccess();
+                    OnSuccess(request, elapsed, originalEvents.Count);
                 }
                 else
                 {
-                    OnFailure(request.error, originalEvents);
+                    OnFailure(request, elapsed, originalEvents);
                 }
             }
 
             _isSending = false;
         }
 
-        private void OnSuccess()
+        private void OnSuccess(UnityWebRequest request, double elapsedMs, int eventCount)
         {
             _consecutiveFailures = 0;
             _backoffMultiplier = 1f;
+
+            string responseBody = request.downloadHandler?.text;
+            _networkLogger?.LogResponse(_ingestUrl, (int)request.responseCode, responseBody, elapsedMs, eventCount);
         }
 
-        private void OnFailure(string error, List<BaseEvent> events)
+        private void OnFailure(UnityWebRequest request, double elapsedMs, List<BaseEvent> events)
         {
             _consecutiveFailures++;
             _backoffMultiplier = Math.Min(_backoffMultiplier * 2, 32f);
 
-            ApmClient.Log(LogLevel.Warning, $"Failed to send events: {error}");
+            string responseBody = request.downloadHandler?.text;
+            _networkLogger?.LogFailure(
+                _ingestUrl,
+                (int)request.responseCode,
+                request.error,
+                responseBody,
+                elapsedMs,
+                events.Count,
+                _consecutiveFailures,
+                _backoffMultiplier
+            );
 
             // Store for retry if we haven't failed too many times
             if (_consecutiveFailures < MaxConsecutiveFailures && _offlineStorage != null)
             {
+                _networkLogger?.LogOfflineQueue(events.Count, "Request failed, storing for retry");
                 _offlineStorage.Store(events);
+            }
+            else if (_consecutiveFailures >= MaxConsecutiveFailures)
+            {
+                _networkLogger?.LogOfflineQueue(events.Count, $"Max failures ({MaxConsecutiveFailures}) reached, discarding");
             }
         }
 

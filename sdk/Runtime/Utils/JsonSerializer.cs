@@ -58,7 +58,7 @@ namespace OzxApm.Utils
                     AppendField(sb, "frame_time_ms", perf.frame_time_ms);
                     AppendField(sb, "main_thread_ms", perf.main_thread_ms);
                     AppendField(sb, "gc_alloc_kb", perf.gc_alloc_kb);
-                    AppendField(sb, "mem_mb", perf.mem_mb, false);
+                    AppendField(sb, "mem_mb", perf.mem_mb);
                     break;
 
                 case JankEvent jank:
@@ -66,33 +66,33 @@ namespace OzxApm.Utils
                     AppendField(sb, "max_frame_ms", jank.max_frame_ms);
                     AppendField(sb, "recent_gc_count", jank.recent_gc_count);
                     AppendField(sb, "recent_gc_alloc_kb", jank.recent_gc_alloc_kb);
-                    AppendFieldArray(sb, "recent_events", jank.recent_events, false);
+                    AppendFieldArray(sb, "recent_events", jank.recent_events);
                     break;
 
                 case StartupEvent startup:
                     AppendField(sb, "phase1_ms", startup.phase1_ms);
                     AppendField(sb, "phase2_ms", startup.phase2_ms);
-                    AppendField(sb, "tti_ms", startup.tti_ms, false);
+                    AppendField(sb, "tti_ms", startup.tti_ms);
                     break;
 
                 case SceneLoadEvent scene:
                     AppendField(sb, "scene_name", scene.scene_name);
                     AppendField(sb, "load_ms", scene.load_ms);
-                    AppendField(sb, "activate_ms", scene.activate_ms, false);
+                    AppendField(sb, "activate_ms", scene.activate_ms);
                     break;
 
                 case ExceptionEvent exc:
                     AppendField(sb, "fingerprint", exc.fingerprint);
                     AppendField(sb, "message", exc.message);
                     AppendField(sb, "stack", exc.stack);
-                    AppendField(sb, "count", exc.count, false);
+                    AppendField(sb, "count", exc.count);
                     break;
 
                 case CrashEvent crash:
                     AppendField(sb, "crash_type", crash.crash_type);
                     AppendField(sb, "fingerprint", crash.fingerprint);
                     AppendField(sb, "stack", crash.stack);
-                    AppendFieldArray(sb, "breadcrumbs", crash.breadcrumbs, false);
+                    AppendFieldArray(sb, "breadcrumbs", crash.breadcrumbs);
                     break;
             }
 

@@ -1,4 +1,5 @@
 using System;
+using UnityEngine;
 using OzxApm.Models;
 
 namespace OzxApm.Core
@@ -127,15 +128,23 @@ namespace OzxApm.Core
         public string UserId { get; set; } = "";
 
         /// <summary>
-        /// Creates a default configuration
+        /// Creates a default configuration.
+        /// In Debug builds, LogLevel defaults to Debug to enable network logging.
+        /// In Release builds, LogLevel defaults to Warning.
         /// </summary>
         public static ApmConfig Default()
         {
-            return new ApmConfig();
+            return new ApmConfig
+            {
+                // Enable Debug level logging in development builds
+                LogLevel = Debug.isDebugBuild ? LogLevel.Debug : LogLevel.Warning
+            };
         }
 
         /// <summary>
-        /// Creates a minimal configuration with reduced overhead
+        /// Creates a minimal configuration with reduced overhead.
+        /// In Debug builds, LogLevel defaults to Debug to enable network logging.
+        /// In Release builds, LogLevel defaults to Warning.
         /// </summary>
         public static ApmConfig Minimal()
         {
@@ -146,7 +155,9 @@ namespace OzxApm.Core
                 EnableStartupTiming = false,
                 EnableSceneLoadTracking = false,
                 SamplingIntervalSeconds = 5.0f,
-                FlushIntervalSeconds = 60.0f
+                FlushIntervalSeconds = 60.0f,
+                // Enable Debug level logging in development builds
+                LogLevel = Debug.isDebugBuild ? LogLevel.Debug : LogLevel.Warning
             };
         }
     }

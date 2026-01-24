@@ -24,6 +24,7 @@ namespace OzxApm.Core
         private EventQueue _eventQueue;
         private EventReporter _reporter;
         private OfflineStorage _offlineStorage;
+        private NetworkLogger _networkLogger;
 
         // Collectors
         private PerformanceCollector _performanceCollector;
@@ -66,6 +67,7 @@ namespace OzxApm.Core
         public static bool IsInitialized => _isInitialized;
         public ApmConfig Config => _config;
         public SessionManager Session => _sessionManager;
+        public NetworkLogger NetworkLog => _networkLogger;
 
         /// <summary>
         /// Initializes the APM SDK with the given configuration
@@ -154,6 +156,41 @@ namespace OzxApm.Core
         }
 
         /// <summary>
+        /// Gets recent network log entries (in-memory cache)
+        /// </summary>
+        public static List<NetworkLogEntry> GetNetworkLogs()
+        {
+            if (_isInitialized && Instance._networkLogger != null)
+            {
+                return Instance._networkLogger.GetRecentLogs();
+            }
+            return new List<NetworkLogEntry>();
+        }
+
+        /// <summary>
+        /// Gets the network log file path
+        /// </summary>
+        public static string GetNetworkLogFilePath()
+        {
+            if (_isInitialized && Instance._networkLogger != null)
+            {
+                return Instance._networkLogger.GetLogFilePath();
+            }
+            return null;
+        }
+
+        /// <summary>
+        /// Clears all network logs
+        /// </summary>
+        public static void ClearNetworkLogs()
+        {
+            if (_isInitialized && Instance._networkLogger != null)
+            {
+                Instance._networkLogger.ClearLogs();
+            }
+        }
+
+        /// <summary>
         /// Shuts down the SDK
         /// </summary>
         public static void Shutdown()
@@ -180,7 +217,8 @@ namespace OzxApm.Core
             _sessionManager = new SessionManager();
             _eventQueue = new EventQueue(config);
             _offlineStorage = new OfflineStorage(config);
-            _reporter = new EventReporter(config, _offlineStorage);
+            _networkLogger = new NetworkLogger(config);
+            _reporter = new EventReporter(config, _offlineStorage, _networkLogger);
 
             // Subscribe to batch ready events
             _eventQueue.OnBatchReady += OnBatchReady;
