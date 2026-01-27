@@ -10,7 +10,10 @@ import (
 
 // GetDashboardSummary returns aggregated metrics for the dashboard
 func (r *Repository) GetDashboardSummary(ctx context.Context, startTime, endTime time.Time, appVersion, platform string) (*models.DashboardSummary, error) {
-	summary := &models.DashboardSummary{}
+	summary := &models.DashboardSummary{
+		TopVersions:  []models.VersionStats{},
+		TopPlatforms: []models.PlatformStats{},
+	}
 
 	// Build WHERE clause
 	whereClause := "WHERE timestamp >= ? AND timestamp <= ?"
@@ -178,7 +181,7 @@ func (r *Repository) GetTimeSeries(ctx context.Context, metric string, startTime
 	}
 	defer rows.Close()
 
-	var points []models.TimeSeriesPoint
+	points := []models.TimeSeriesPoint{}
 	for rows.Next() {
 		var p models.TimeSeriesPoint
 		if err := rows.Scan(&p.Timestamp, &p.Value); err != nil {
@@ -238,7 +241,7 @@ func (r *Repository) GetDistribution(ctx context.Context, metric string, startTi
 		FROM %s %s
 	`, valueColumn, valueColumn, valueColumn, valueColumn, table, whereClause)
 
-	resp := &models.DistributionResponse{Metric: metric}
+	resp := &models.DistributionResponse{Metric: metric, Buckets: []models.DistributionBucket{}}
 	row := r.client.conn.QueryRow(ctx, pctQuery, args...)
 	row.Scan(&resp.P50, &resp.P90, &resp.P95, &resp.P99)
 
@@ -320,7 +323,7 @@ func (r *Repository) GetAppVersions(ctx context.Context) ([]string, error) {
 	}
 	defer rows.Close()
 
-	var versions []string
+	versions := []string{}
 	for rows.Next() {
 		var v string
 		rows.Scan(&v)
@@ -354,7 +357,7 @@ func (r *Repository) GetScenes(ctx context.Context, appVersion string) ([]string
 	}
 	defer rows.Close()
 
-	var scenes []string
+	scenes := []string{}
 	for rows.Next() {
 		var s string
 		rows.Scan(&s)
@@ -408,12 +411,18 @@ func (r *Repository) GetCrashGroups(ctx context.Context, startTime, endTime time
 	}
 	defer rows.Close()
 
-	var crashes []models.CrashGroup
+	crashes := []models.CrashGroup{}
 	for rows.Next() {
 		var c models.CrashGroup
 		var versions, devices []string
 		if err := rows.Scan(&c.Fingerprint, &c.CrashType, &c.Count, &c.SessionCount, &c.FirstSeen, &c.LastSeen, &versions, &devices); err != nil {
 			continue
+		}
+		if versions == nil {
+			versions = []string{}
+		}
+		if devices == nil {
+			devices = []string{}
 		}
 		c.AffectedVersions = versions
 		c.TopDevices = devices
@@ -440,7 +449,11 @@ func (r *Repository) GetCrashDetail(ctx context.Context, fingerprint string, sta
 		GROUP BY fingerprint
 	`
 
-	detail := &models.CrashDetail{}
+	detail := &models.CrashDetail{
+		Occurrences:  []models.CrashOccurrence{},
+		VersionDist:  []models.VersionDist{},
+		DeviceDist:   []models.DeviceDist{},
+	}
 	row := r.client.conn.QueryRow(ctx, query, fingerprint, startTime, endTime)
 	if err := row.Scan(&detail.Fingerprint, &detail.CrashType, &detail.Stack, &detail.Count, &detail.SessionCount, &detail.FirstSeen, &detail.LastSeen); err != nil {
 		return nil, err
@@ -547,7 +560,7 @@ func (r *Repository) GetExceptionGroups(ctx context.Context, startTime, endTime 
 	}
 	defer rows.Close()
 
-	var exceptions []models.ExceptionGroup
+	exceptions := []models.ExceptionGroup{}
 	for rows.Next() {
 		var e models.ExceptionGroup
 		if err := rows.Scan(&e.Fingerprint, &e.Message, &e.Count, &e.SessionCount, &e.FirstSeen, &e.LastSeen); err != nil {
