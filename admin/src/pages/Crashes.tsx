@@ -182,7 +182,7 @@ export function Crashes() {
                   </div>
                 </div>
 
-                {crashDetail.occurrences?.length > 0 && (
+                {crashDetail.occurrences && crashDetail.occurrences.length > 0 && (
                   <div>
                     <p className="text-xs text-gray-500 mb-1">Recent Occurrences</p>
                     <div className="space-y-2">
@@ -198,7 +198,7 @@ export function Crashes() {
                           <p>
                             <span className="text-gray-500">Scene:</span> {occ.scene}
                           </p>
-                          {occ.breadcrumbs?.length > 0 && (
+                          {occ.breadcrumbs && occ.breadcrumbs.length > 0 && (
                             <details className="mt-1">
                               <summary className="text-gray-500 cursor-pointer">
                                 Breadcrumbs ({occ.breadcrumbs.length})

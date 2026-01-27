@@ -10,7 +10,7 @@ import {
 import type { DistributionResponse } from '../types/api'
 
 interface DistributionChartProps {
-  data: DistributionResponse
+  data: DistributionResponse | null | undefined
   title: string
   color?: string
 }
@@ -20,15 +20,26 @@ export function DistributionChart({
   title,
   color = '#3b82f6',
 }: DistributionChartProps) {
+  if (!data || !data.buckets || data.buckets.length === 0) {
+    return (
+      <div className="bg-white rounded-lg shadow p-6">
+        <h3 className="text-sm font-medium text-gray-700 mb-4">{title}</h3>
+        <div className="h-64 flex items-center justify-center text-gray-400 text-sm">
+          No data available
+        </div>
+      </div>
+    )
+  }
+
   return (
     <div className="bg-white rounded-lg shadow p-6">
       <div className="flex items-start justify-between mb-4">
         <h3 className="text-sm font-medium text-gray-700">{title}</h3>
         <div className="flex gap-4 text-xs text-gray-500">
-          <span>P50: {data.p50.toFixed(1)}</span>
-          <span>P90: {data.p90.toFixed(1)}</span>
-          <span>P95: {data.p95.toFixed(1)}</span>
-          <span>P99: {data.p99.toFixed(1)}</span>
+          <span>P50: {data.p50?.toFixed(1) ?? '-'}</span>
+          <span>P90: {data.p90?.toFixed(1) ?? '-'}</span>
+          <span>P95: {data.p95?.toFixed(1) ?? '-'}</span>
+          <span>P99: {data.p99?.toFixed(1) ?? '-'}</span>
         </div>
       </div>
       <div className="h-64">
