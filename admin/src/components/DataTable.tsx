@@ -1,6 +1,6 @@
 import { ReactNode } from 'react'
 
-interface Column<T> {
+export interface Column<T> {
   key: string
   header: string
   render?: (item: T) => ReactNode
@@ -15,7 +15,7 @@ interface DataTableProps<T> {
   isLoading?: boolean
 }
 
-export function DataTable<T extends Record<string, unknown>>({
+export function DataTable<T extends object>({
   data,
   columns,
   onRowClick,
@@ -66,7 +66,7 @@ export function DataTable<T extends Record<string, unknown>>({
                     key={col.key}
                     className={`px-4 py-3 text-sm text-gray-900 ${col.className || ''}`}
                   >
-                    {col.render ? col.render(item) : String(item[col.key] ?? '')}
+                    {col.render ? col.render(item) : String((item as Record<string, unknown>)[col.key] ?? '')}
                   </td>
                 ))}
               </tr>
