@@ -26,7 +26,7 @@ type RawEvent struct {
 
 // PerfSample represents a performance sample event
 type PerfSample struct {
-	Timestamp    time.Time `json:"timestamp" ch:"timestamp"`
+	Timestamp    time.Time `json:"-" ch:"timestamp"`
 	AppVersion   string    `json:"app_version" ch:"app_version"`
 	Platform     string    `json:"platform" ch:"platform"`
 	DeviceModel  string    `json:"device_model" ch:"device_model"`
@@ -43,7 +43,7 @@ type PerfSample struct {
 
 // Jank represents a jank event
 type Jank struct {
-	Timestamp       time.Time `json:"timestamp" ch:"timestamp"`
+	Timestamp       time.Time `json:"-" ch:"timestamp"`
 	AppVersion      string    `json:"app_version" ch:"app_version"`
 	Platform        string    `json:"platform" ch:"platform"`
 	DeviceModel     string    `json:"device_model" ch:"device_model"`
@@ -60,7 +60,7 @@ type Jank struct {
 
 // Startup represents a startup timing event
 type Startup struct {
-	Timestamp   time.Time `json:"timestamp" ch:"timestamp"`
+	Timestamp   time.Time `json:"-" ch:"timestamp"`
 	AppVersion  string    `json:"app_version" ch:"app_version"`
 	Platform    string    `json:"platform" ch:"platform"`
 	DeviceModel string    `json:"device_model" ch:"device_model"`
@@ -74,7 +74,7 @@ type Startup struct {
 
 // SceneLoad represents a scene load timing event
 type SceneLoad struct {
-	Timestamp   time.Time `json:"timestamp" ch:"timestamp"`
+	Timestamp   time.Time `json:"-" ch:"timestamp"`
 	AppVersion  string    `json:"app_version" ch:"app_version"`
 	Platform    string    `json:"platform" ch:"platform"`
 	DeviceModel string    `json:"device_model" ch:"device_model"`
@@ -87,7 +87,7 @@ type SceneLoad struct {
 
 // Exception represents a non-fatal exception event
 type Exception struct {
-	Timestamp   time.Time `json:"timestamp" ch:"timestamp"`
+	Timestamp   time.Time `json:"-" ch:"timestamp"`
 	AppVersion  string    `json:"app_version" ch:"app_version"`
 	Platform    string    `json:"platform" ch:"platform"`
 	DeviceModel string    `json:"device_model" ch:"device_model"`
@@ -103,7 +103,7 @@ type Exception struct {
 
 // Crash represents a fatal crash event
 type Crash struct {
-	Timestamp   time.Time `json:"timestamp" ch:"timestamp"`
+	Timestamp   time.Time `json:"-" ch:"timestamp"`
 	AppVersion  string    `json:"app_version" ch:"app_version"`
 	Platform    string    `json:"platform" ch:"platform"`
 	DeviceModel string    `json:"device_model" ch:"device_model"`
