@@ -11,7 +11,7 @@ import { format, parseISO } from 'date-fns'
 import type { TimeSeriesPoint } from '../types/api'
 
 interface TimeSeriesChartProps {
-  data: TimeSeriesPoint[]
+  data: TimeSeriesPoint[] | null | undefined
   title: string
   color?: string
   yAxisLabel?: string
@@ -25,6 +25,17 @@ export function TimeSeriesChart({
   yAxisLabel,
   formatValue = (v) => v.toFixed(1),
 }: TimeSeriesChartProps) {
+  if (!data || data.length === 0) {
+    return (
+      <div className="bg-white rounded-lg shadow p-6">
+        <h3 className="text-sm font-medium text-gray-700 mb-4">{title}</h3>
+        <div className="h-64 flex items-center justify-center text-gray-400 text-sm">
+          No data available
+        </div>
+      </div>
+    )
+  }
+
   const chartData = data.map((point) => ({
     timestamp: point.timestamp,
     value: point.value,
