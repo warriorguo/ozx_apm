@@ -138,7 +138,7 @@ func (r *Repository) GetTimeSeries(ctx context.Context, metric string, startTime
 			FROM apm_perf_samples %s
 			GROUP BY t ORDER BY t
 		`, interval, whereClause)
-	case "crashes":
+	case "crashes", "crash_count":
 		query = fmt.Sprintf(`
 			SELECT toStartOfInterval(timestamp, INTERVAL %s) as t, count()
 			FROM apm_crashes %s
@@ -162,7 +162,7 @@ func (r *Repository) GetTimeSeries(ctx context.Context, metric string, startTime
 			FROM apm_perf_samples %s
 			GROUP BY t ORDER BY t
 		`, interval, whereClause)
-	case "startup":
+	case "startup", "startup_time":
 		query = fmt.Sprintf(`
 			SELECT toStartOfInterval(timestamp, INTERVAL %s) as t, avg(phase1_ms + phase2_ms + tti_ms)
 			FROM apm_startups %s
