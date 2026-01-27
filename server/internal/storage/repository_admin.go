@@ -150,7 +150,7 @@ func (r *Repository) GetTimeSeries(ctx context.Context, metric string, startTime
 			FROM apm_exceptions %s
 			GROUP BY t ORDER BY t
 		`, interval, whereClause)
-	case "janks":
+	case "janks", "jank_count":
 		query = fmt.Sprintf(`
 			SELECT toStartOfInterval(timestamp, INTERVAL %s) as t, count()
 			FROM apm_janks %s
