@@ -8,7 +8,7 @@ export interface Column<T> {
 }
 
 interface DataTableProps<T> {
-  data: T[]
+  data: T[] | null | undefined
   columns: Column<T>[]
   onRowClick?: (item: T) => void
   emptyMessage?: string
@@ -30,7 +30,7 @@ export function DataTable<T extends object>({
     )
   }
 
-  if (data.length === 0) {
+  if (!data || data.length === 0) {
     return (
       <div className="bg-white rounded-lg shadow p-8 text-center text-gray-500">
         {emptyMessage}
