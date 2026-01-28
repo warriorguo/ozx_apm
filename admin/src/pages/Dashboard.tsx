@@ -90,6 +90,8 @@ export function Dashboard() {
               <TimeSeriesChart
                 data={fpsTimeSeries.data}
                 title="FPS Over Time"
+                startTime={queryParams.start_time}
+                endTime={queryParams.end_time}
                 color="#10b981"
                 formatValue={(v) => `${v.toFixed(1)} FPS`}
               />
@@ -98,6 +100,8 @@ export function Dashboard() {
               <TimeSeriesChart
                 data={crashTimeSeries.data}
                 title="Crashes Over Time"
+                startTime={queryParams.start_time}
+                endTime={queryParams.end_time}
                 color="#ef4444"
                 formatValue={(v) => `${Math.round(v)} crashes`}
               />
@@ -109,6 +113,8 @@ export function Dashboard() {
               <TimeSeriesChart
                 data={jankTimeSeries.data}
                 title="Jank Events Over Time"
+                startTime={queryParams.start_time}
+                endTime={queryParams.end_time}
                 color="#f59e0b"
                 formatValue={(v) => `${Math.round(v)} janks`}
               />

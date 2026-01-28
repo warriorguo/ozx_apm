@@ -49,6 +49,8 @@ export function Performance() {
               <TimeSeriesChart
                 data={fpsTimeSeries.data}
                 title="Average FPS Over Time"
+                startTime={queryParams.start_time}
+                endTime={queryParams.end_time}
                 color="#10b981"
                 formatValue={(v) => `${v.toFixed(1)} FPS`}
               />
@@ -71,6 +73,8 @@ export function Performance() {
               <TimeSeriesChart
                 data={frameTimeTimeSeries.data}
                 title="Average Frame Time Over Time"
+                startTime={queryParams.start_time}
+                endTime={queryParams.end_time}
                 color="#3b82f6"
                 yAxisLabel="ms"
                 formatValue={(v) => `${v.toFixed(1)}ms`}
@@ -93,6 +97,8 @@ export function Performance() {
               <TimeSeriesChart
                 data={startupTimeSeries.data}
                 title="Average Startup Time Over Time"
+                startTime={queryParams.start_time}
+                endTime={queryParams.end_time}
                 color="#8b5cf6"
                 yAxisLabel="ms"
                 formatValue={(v) => `${v.toFixed(0)}ms`}
@@ -115,6 +121,8 @@ export function Performance() {
               <TimeSeriesChart
                 data={jankTimeSeries.data}
                 title="Jank Events Over Time"
+                startTime={queryParams.start_time}
+                endTime={queryParams.end_time}
                 color="#f59e0b"
                 formatValue={(v) => `${Math.round(v)} janks`}
               />

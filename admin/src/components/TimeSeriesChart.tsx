@@ -7,12 +7,14 @@ import {
   Tooltip,
   ResponsiveContainer,
 } from 'recharts'
-import { format, parseISO } from 'date-fns'
+import { format, parseISO, differenceInDays } from 'date-fns'
 import type { TimeSeriesPoint } from '../types/api'
 
 interface TimeSeriesChartProps {
   data: TimeSeriesPoint[] | null | undefined
   title: string
+  startTime?: string
+  endTime?: string
   color?: string
   yAxisLabel?: string
   formatValue?: (value: number) => string
@@ -21,6 +23,8 @@ interface TimeSeriesChartProps {
 export function TimeSeriesChart({
   data,
   title,
+  startTime,
+  endTime,
   color = '#3b82f6',
   yAxisLabel,
   formatValue = (v) => v.toFixed(1),
@@ -36,11 +40,34 @@ export function TimeSeriesChart({
     )
   }
 
+  // Determine time format based on range
+  const getTimeFormat = () => {
+    if (!startTime || !endTime) return 'HH:mm'
+    const start = parseISO(startTime)
+    const end = parseISO(endTime)
+    const days = differenceInDays(end, start)
+
+    if (days > 7) return 'MM/dd'
+    if (days > 1) return 'MM/dd HH:mm'
+    return 'HH:mm'
+  }
+
+  const timeFormat = getTimeFormat()
+
   const chartData = data.map((point) => ({
-    timestamp: point.timestamp,
+    timestamp: new Date(point.timestamp).getTime(),
     value: point.value,
-    time: format(parseISO(point.timestamp), 'HH:mm'),
+    time: format(parseISO(point.timestamp), timeFormat),
   }))
+
+  // Calculate domain for x-axis based on startTime/endTime
+  const domain: [number, number] | undefined = startTime && endTime
+    ? [new Date(startTime).getTime(), new Date(endTime).getTime()]
+    : undefined
+
+  const formatXAxis = (timestamp: number) => {
+    return format(new Date(timestamp), timeFormat)
+  }
 
   return (
     <div className="bg-white rounded-lg shadow p-6">
@@ -50,7 +77,11 @@ export function TimeSeriesChart({
           <LineChart data={chartData} margin={{ top: 5, right: 20, left: 10, bottom: 5 }}>
             <CartesianGrid strokeDasharray="3 3" stroke="#e5e7eb" />
             <XAxis
-              dataKey="time"
+              dataKey="timestamp"
+              type="number"
+              scale="time"
+              domain={domain}
+              tickFormatter={formatXAxis}
               tick={{ fontSize: 11 }}
               tickLine={false}
               axisLine={{ stroke: '#e5e7eb' }}
@@ -67,7 +98,7 @@ export function TimeSeriesChart({
             />
             <Tooltip
               formatter={(value: number) => [formatValue(value), title]}
-              labelFormatter={(label) => `Time: ${label}`}
+              labelFormatter={(ts: number) => `Time: ${format(new Date(ts), 'yyyy-MM-dd HH:mm')}`}
               contentStyle={{ fontSize: 12 }}
             />
             <Line
@@ -77,6 +108,7 @@ export function TimeSeriesChart({
               strokeWidth={2}
               dot={false}
               activeDot={{ r: 4 }}
+              connectNulls={false}
             />
           </LineChart>
         </ResponsiveContainer>
