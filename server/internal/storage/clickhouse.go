@@ -28,7 +28,7 @@ func NewClickHouseClient(cfg *config.ClickHouseConfig, logger *zap.Logger) (*Cli
 		Settings: clickhouse.Settings{
 			"max_execution_time": 60,
 		},
-		DialTimeout:     5 * time.Second,
+		DialTimeout:     10 * time.Second,
 		MaxOpenConns:    10,
 		MaxIdleConns:    5,
 		ConnMaxLifetime: time.Hour,
@@ -37,23 +37,37 @@ func NewClickHouseClient(cfg *config.ClickHouseConfig, logger *zap.Logger) (*Cli
 		return nil, fmt.Errorf("failed to connect to clickhouse: %w", err)
 	}
 
-	// Test connection
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if err := conn.Ping(ctx); err != nil {
-		return nil, fmt.Errorf("failed to ping clickhouse: %w", err)
+	// Test connection with retry
+	maxRetries := 5
+	retryDelay := 3 * time.Second
+	var lastErr error
+	for i := 0; i < maxRetries; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		err := conn.Ping(ctx)
+		cancel()
+		if err == nil {
+			logger.Info("connected to ClickHouse",
+				zap.String("host", cfg.Host),
+				zap.Int("port", cfg.Port),
+				zap.String("database", cfg.Database),
+			)
+			return &ClickHouseClient{
+				conn:   conn,
+				logger: logger,
+			}, nil
+		}
+		lastErr = err
+		logger.Warn("failed to ping ClickHouse, retrying...",
+			zap.Int("attempt", i+1),
+			zap.Int("max_retries", maxRetries),
+			zap.Error(err),
+		)
+		if i < maxRetries-1 {
+			time.Sleep(retryDelay)
+		}
 	}
 
-	logger.Info("connected to ClickHouse",
-		zap.String("host", cfg.Host),
-		zap.Int("port", cfg.Port),
-		zap.String("database", cfg.Database),
-	)
-
-	return &ClickHouseClient{
-		conn:   conn,
-		logger: logger,
-	}, nil
+	return nil, fmt.Errorf("failed to ping clickhouse after %d retries: %w", maxRetries, lastErr)
 }
 
 func (c *ClickHouseClient) Conn() driver.Conn {
