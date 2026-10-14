@@ -632,6 +632,15 @@ namespace OzxApm.Core
         /// <summary>
         /// Gets memory stats from the memory collector
         /// </summary>
+        /// <summary>
+        /// Managed heap size in MB. Uses the value MemoryCollector already read this
+        /// frame instead of taking the GC lock again.
+        /// </summary>
+        internal float GetUsedMemoryMB()
+        {
+            return _memoryCollector != null ? _memoryCollector.LastUsedMemoryMB : DeviceInfo.GetUsedMemoryMB();
+        }
+
         internal (int gcCount, float gcAllocKb) GetMemoryStats()
         {
             if (_memoryCollector != null)

@@ -89,6 +89,9 @@ namespace OzxApm.Collectors
             return GC.GetTotalMemory(false) / (1024f * 1024f);
         }
 
+        /// <summary>Managed heap size read during this frame's Update (no extra GC lock).</summary>
+        public float LastUsedMemoryMB => _lastGcMemory / (1024f * 1024f);
+
         /// <summary>
         /// Gets total reserved memory in MB (if available)
         /// </summary>

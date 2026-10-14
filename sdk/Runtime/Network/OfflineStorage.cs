@@ -926,7 +926,11 @@ namespace OzxApm.Network
         {
             // Second consent gate: consent may have been revoked after enqueue.
             if (_config.Consent != ConsentState.Granted)
+            {
+                for (int i = 0; i < events.Count; i++)
+                    PerfSamplePool.Return(events[i]);
                 return;
+            }
 
             int batchSize = Math.Max(1, _config.BatchSize);
             int maxBytes = Math.Max(1024, _config.MaxBatchBytes);
@@ -961,6 +965,7 @@ namespace OzxApm.Network
                     catch (Exception ex)
                     {
                         Warn($"Failed to serialize {evt.type} event: {ex.Message}");
+                        PerfSamplePool.Return(evt);
                         continue;
                     }
 
@@ -1178,6 +1183,9 @@ namespace OzxApm.Network
             _totalBytes += length;
             open.EventCount += w.Buffered.Count;
             w.Buffer.SetLength(0);
+            // On disk now: pooled events can be reused by the main thread.
+            for (int i = 0; i < w.Buffered.Count; i++)
+                PerfSamplePool.Return(w.Buffered[i]);
             w.Buffered.Clear();
         }
 

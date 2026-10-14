@@ -20,6 +20,9 @@ namespace OzxApm.Models
         public string session_id;
         public string device_id;
         public string scene;
+
+        /// <summary>Came from an event pool; returned to it after serialization.</summary>
+        [NonSerialized] internal bool pooled;
     }
 
     [Serializable]

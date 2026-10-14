@@ -74,14 +74,14 @@ namespace OzxApm.Collectors
 
             var (gcCount, gcAllocKb) = _client.GetMemoryStats();
 
-            var evt = new PerfSampleEvent
-            {
-                fps = fps,
-                frame_time_ms = avgFrameTime,
-                main_thread_ms = avgFrameTime, // In Unity, main thread ≈ frame time for most cases
-                gc_alloc_kb = gcAllocKb,
-                mem_mb = DeviceInfo.GetUsedMemoryMB()
-            };
+            // Pooled: emitting a sample allocates nothing on the main thread. The
+            // storage worker returns the event to the pool after writing it.
+            var evt = PerfSamplePool.Rent();
+            evt.fps = fps;
+            evt.frame_time_ms = avgFrameTime;
+            evt.main_thread_ms = avgFrameTime; // In Unity, main thread ≈ frame time for most cases
+            evt.gc_alloc_kb = gcAllocKb;
+            evt.mem_mb = _client.GetUsedMemoryMB();
 
             _client.EnqueueEvent(evt);
             ResetCounters();

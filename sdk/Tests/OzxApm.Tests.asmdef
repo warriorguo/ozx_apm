@@ -2,7 +2,8 @@
     "name": "OzxApm.Tests",
     "rootNamespace": "OzxApm.Tests",
     "references": [
-        "OzxApm"
+        "OzxApm",
+        "UnityEngine.TestRunner"
     ],
     "includePlatforms": [
         "Editor"
