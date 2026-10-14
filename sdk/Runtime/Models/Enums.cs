@@ -43,4 +43,17 @@ namespace OzxApm.Models
         Info = 3,
         Debug = 4
     }
+
+    /// <summary>
+    /// Player consent for data collection. Checked before an event is
+    /// enqueued, before anything is written to disk and before uploading.
+    /// Only Granted collects. The full consent feature (persisted state,
+    /// clearing local data on Denied, per-category control) is APM-14.
+    /// </summary>
+    public enum ConsentState
+    {
+        Unknown = 0,
+        Granted = 1,
+        Denied = 2
+    }
 }

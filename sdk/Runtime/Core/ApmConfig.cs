@@ -93,14 +93,40 @@ namespace OzxApm.Core
         public int MaxQueueSize { get; set; } = 1000;
 
         /// <summary>
-        /// Enable offline storage for failed uploads
+        /// Persist events to disk as soon as they are enqueued and keep them until
+        /// the server confirms receipt (survives crashes, kills and offline sessions).
+        /// When false, events are queued in memory only and are lost on exit.
         /// </summary>
         public bool EnableOfflineStorage { get; set; } = true;
 
         /// <summary>
-        /// Maximum offline storage size in bytes
+        /// Maximum local event storage in bytes. When full, the oldest events are dropped.
         /// </summary>
         public int MaxOfflineStorageBytes { get; set; } = 5 * 1024 * 1024;
+
+        /// <summary>
+        /// How often the background writer appends newly enqueued events to disk (ms).
+        /// This bounds how many events can be lost on a crash or kill. Exceptions and
+        /// crashes are written immediately.
+        /// </summary>
+        public int PersistIntervalMs { get; set; } = 200;
+
+        /// <summary>
+        /// First retry delay after a failed upload (seconds). Doubles per consecutive failure.
+        /// </summary>
+        public float RetryBaseDelaySeconds { get; set; } = 5.0f;
+
+        /// <summary>
+        /// Upper bound for the retry delay (seconds). Uploads are retried at least this
+        /// often for as long as there is unsent data; nothing is discarded for failing.
+        /// </summary>
+        public float RetryMaxDelaySeconds { get; set; } = 300.0f;
+
+        /// <summary>
+        /// Player consent. Nothing is enqueued, written to disk or uploaded unless Granted.
+        /// Defaults to Granted (pre-APM-14 behaviour). Change at runtime with ApmClient.SetConsent.
+        /// </summary>
+        public ConsentState Consent { get; set; } = ConsentState.Granted;
 
         /// <summary>
         /// Request timeout in seconds

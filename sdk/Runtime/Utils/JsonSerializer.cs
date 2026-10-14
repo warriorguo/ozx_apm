@@ -35,12 +35,29 @@ namespace OzxApm.Utils
             }
         }
 
+        /// <summary>
+        /// Serializes a single event to one line of JSON (no newlines inside).
+        /// This is both the on-disk record and the element of the upload batch.
+        /// Output does not depend on the current culture.
+        /// </summary>
+        public static string SerializeEvent(BaseEvent evt)
+        {
+            lock (_lock)
+            {
+                _builder.Clear();
+                SerializeEvent(_builder, evt);
+                return _builder.ToString();
+            }
+        }
+
         private static void SerializeEvent(StringBuilder sb, BaseEvent evt)
         {
             sb.Append('{');
 
             // Common fields
             AppendField(sb, "type", evt.type, true);
+            AppendField(sb, "event_id", evt.event_id);
+            AppendField(sb, "seq", evt.seq);
             AppendField(sb, "timestamp", evt.timestamp);
             AppendField(sb, "app_version", evt.app_version);
             AppendField(sb, "platform", evt.platform);
