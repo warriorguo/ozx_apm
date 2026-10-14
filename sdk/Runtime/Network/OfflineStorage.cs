@@ -119,6 +119,7 @@ namespace OzxApm.Network
         private readonly List<Completion> _completions = new List<Completion>();
         private bool _stopRequested;
         private long _busyGen;              // bumped (under _lock) whenever new work is requested
+        private bool _workerLongWait;       // worker sleeps until signalled (under _lock)
         private long _droppedPendingEvents;
 
         private struct Completion
@@ -169,6 +170,10 @@ namespace OzxApm.Network
         private bool _directoryReady;
         private long _droppedByCap;
         private int _lastSyncPumpTicks;
+        private DateTime _lastActivityUtc = DateTime.MinValue;
+        // After writing events, the worker keeps polling every PersistIntervalMs for
+        // this long, so a steady event stream needs no wake-up from the main thread.
+        private const int ActiveWindowMs = 5000;
         private DateTime _writeRetryAtUtc = DateTime.MinValue;
         private int _writeFailures;
         private DateTime _lastWarningUtc = DateTime.MinValue;
@@ -314,7 +319,12 @@ namespace OzxApm.Network
                     _pending.RemoveAt(0);
                     _droppedPendingEvents++;
                 }
-                wake = _pending.Count == 0 || evt is ExceptionEvent || evt is CrashEvent;
+                // While events are flowing the worker polls every PersistIntervalMs on
+                // its own; the main thread only signals (a kernel call) when the worker
+                // is in its long idle wait, or for exceptions/crashes.
+                wake = _workerLongWait || evt is ExceptionEvent || evt is CrashEvent;
+                if (wake)
+                    _workerLongWait = false;
                 _pending.Add(evt);
                 MarkBusy();
             }
@@ -386,14 +396,18 @@ namespace OzxApm.Network
         /// </summary>
         public void RequestUpload()
         {
+            bool wake;
             lock (_lock)
             {
                 if (_uploadState == UploadPoll.Pending || _preparedUpload != null)
                     return;
                 _uploadRequested = true;
                 _uploadState = UploadPoll.Pending;
+                wake = _workerLongWait;
+                _workerLongWait = false;
             }
-            _wake.Set();
+            if (wake)
+                _wake.Set();
         }
 
         /// <summary>
@@ -428,12 +442,16 @@ namespace OzxApm.Network
             if (batch == null)
                 return;
 
+            bool wake;
             lock (_lock)
             {
                 _completions.Add(new Completion { Batch = batch, Outcome = outcome });
                 MarkBusy();
+                wake = _workerLongWait;
+                _workerLongWait = false;
             }
-            _wake.Set();
+            if (wake)
+                _wake.Set();
         }
 
         /// <summary>delivered=true: Delivered; false: Retry.</summary>
@@ -574,9 +592,11 @@ namespace OzxApm.Network
         }
 
         /// <summary>
-        /// How long the worker may sleep: briefly while events are pending, until
-        /// the open segment's seal deadline, otherwise a long idle wait (any
-        /// Enqueue/Flush/upload request wakes it immediately).
+        /// How long the worker may sleep. While events arrived in the last
+        /// ActiveWindowMs (or work is pending) it polls every PersistIntervalMs, so
+        /// Enqueue does not have to signal; otherwise it sleeps until the next seal
+        /// deadline or IdleWaitMs and marks itself as needing a signal. The decision
+        /// and the flag are taken under _lock, so no Enqueue can slip in between.
         /// </summary>
         private int ComputeWaitMs()
         {
@@ -586,18 +606,26 @@ namespace OzxApm.Network
             {
                 if (_pending.Count > 0 || _flushRequested || _clearRequested || _uploadRequested || _completions.Count > 0)
                 {
+                    _workerLongWait = false;
                     if (_writeRetryAtUtc > now && _pending.Count > 0)
                         return (int)Math.Min(IdleWaitMs, Math.Max(persist, (_writeRetryAtUtc - now).TotalMilliseconds));
                     return persist;
                 }
+                if ((now - _lastActivityUtc).TotalMilliseconds < ActiveWindowMs)
+                {
+                    _workerLongWait = false;
+                    return persist;
+                }
+
+                double wait = IdleWaitMs;
+                foreach (var w in Writers)
+                {
+                    if (w.Open != null && w.Open.EventCount > 0)
+                        wait = Math.Min(wait, (w.Open.CreatedUtc.AddSeconds(_config.FlushIntervalSeconds) - now).TotalMilliseconds);
+                }
+                _workerLongWait = true;
+                return (int)Math.Max(10, wait);
             }
-            double wait = IdleWaitMs;
-            foreach (var w in Writers)
-            {
-                if (w.Open != null && w.Open.EventCount > 0)
-                    wait = Math.Min(wait, (w.Open.CreatedUtc.AddSeconds(_config.FlushIntervalSeconds) - now).TotalMilliseconds);
-            }
-            return (int)Math.Max(10, wait);
         }
 
         private void PumpInternal()
@@ -640,7 +668,10 @@ namespace OzxApm.Network
                     DeleteAll();
 
                 if (_drain.Count > 0)
+                {
+                    _lastActivityUtc = DateTime.UtcNow;
                     WriteEvents(_drain);
+                }
 
                 foreach (var w in Writers)
                 {
