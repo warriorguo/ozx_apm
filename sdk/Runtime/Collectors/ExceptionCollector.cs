@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
 using UnityEngine;
@@ -91,7 +92,7 @@ namespace OzxApm.Collectors
                 _breadcrumbs.Dequeue();
             }
 
-            string timestamp = DateTime.UtcNow.ToString("HH:mm:ss.fff");
+            string timestamp = DateTime.UtcNow.ToString("HH:mm:ss.fff", CultureInfo.InvariantCulture);
             _breadcrumbs.Enqueue($"[{timestamp}] {message}");
         }
 

@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Text;
 using OzxApm.Models;
 
@@ -107,22 +108,29 @@ namespace OzxApm.Utils
             sb.Append('"');
         }
 
+        // All numbers are formatted with InvariantCulture: under e.g. de-DE the
+        // default formatting writes "59,50", which is invalid JSON and gets the
+        // whole batch rejected.
         private static void AppendField(StringBuilder sb, string name, long value, bool addComma = true)
         {
             if (addComma) sb.Append(',');
-            sb.Append('"').Append(name).Append("\":").Append(value);
+            sb.Append('"').Append(name).Append("\":").Append(value.ToString(CultureInfo.InvariantCulture));
         }
 
         private static void AppendField(StringBuilder sb, string name, int value, bool addComma = true)
         {
             if (addComma) sb.Append(',');
-            sb.Append('"').Append(name).Append("\":").Append(value);
+            sb.Append('"').Append(name).Append("\":").Append(value.ToString(CultureInfo.InvariantCulture));
         }
 
         private static void AppendField(StringBuilder sb, string name, float value, bool addComma = true)
         {
             if (addComma) sb.Append(',');
-            sb.Append('"').Append(name).Append("\":").Append(value.ToString("F2"));
+            sb.Append('"').Append(name).Append("\":");
+            if (float.IsNaN(value) || float.IsInfinity(value))
+                sb.Append("null"); // JSON has no NaN/Infinity
+            else
+                sb.Append(value.ToString("F2", CultureInfo.InvariantCulture));
         }
 
         private static void AppendFieldArray(StringBuilder sb, string name, List<string> values, bool addComma = true)
@@ -157,7 +165,7 @@ namespace OzxApm.Utils
                     case '\t': sb.Append("\\t"); break;
                     default:
                         if (c < 32)
-                            sb.Append($"\\u{(int)c:x4}");
+                            sb.Append("\\u").Append(((int)c).ToString("x4", CultureInfo.InvariantCulture));
                         else
                             sb.Append(c);
                         break;

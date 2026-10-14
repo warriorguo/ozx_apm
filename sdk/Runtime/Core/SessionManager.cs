@@ -1,4 +1,5 @@
 using System;
+using System.Globalization;
 using UnityEngine;
 using OzxApm.Utils;
 
@@ -112,7 +113,7 @@ namespace OzxApm.Core
 
             // Persist session info for crash recovery
             PlayerPrefs.SetString(SessionIdKey, _sessionId);
-            PlayerPrefs.SetString(SessionStartKey, _sessionStart.ToString("o"));
+            PlayerPrefs.SetString(SessionStartKey, _sessionStart.ToString("o", CultureInfo.InvariantCulture));
             PlayerPrefs.Save();
         }
 
@@ -152,7 +153,8 @@ namespace OzxApm.Core
             sessionId = PlayerPrefs.GetString(SessionIdKey, "");
             string startStr = PlayerPrefs.GetString(SessionStartKey, "");
 
-            if (!string.IsNullOrEmpty(sessionId) && DateTime.TryParse(startStr, out sessionStart))
+            if (!string.IsNullOrEmpty(sessionId) &&
+                DateTime.TryParse(startStr, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out sessionStart))
             {
                 return true;
             }
