@@ -16,13 +16,24 @@ var (
 	ErrInvalidEventType  = errors.New("invalid event type")
 )
 
+// MaxEventAge is the oldest client timestamp the server accepts.
+//
+// The SDK persists events on the device and keeps retrying until the server
+// confirms them, so a player who is offline for days uploads late, and the
+// event keeps the time it actually happened. Rejecting late events would
+// silently drop exactly the data the offline queue exists to keep.
+// 30 days matches the detail-data retention (TTL 30 DAY, CLAUDE.md privacy
+// rules): anything older would expire as soon as it was written. Clients
+// with a wrong clock are bounded by the same window.
+const MaxEventAge = 30 * 24 * time.Hour
+
 type Validator struct {
 	maxTimestampAge time.Duration
 }
 
 func NewValidator() *Validator {
 	return &Validator{
-		maxTimestampAge: 7 * 24 * time.Hour, // Accept events up to 7 days old
+		maxTimestampAge: MaxEventAge,
 	}
 }
 

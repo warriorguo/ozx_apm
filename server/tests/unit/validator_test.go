@@ -80,9 +80,22 @@ func TestValidator_ValidatePerfSample(t *testing.T) {
 			wantErr: true,
 		},
 		{
+			// Offline players upload late; anything inside the 30-day
+			// retention window must still be accepted.
+			name: "late upload within retention window",
+			sample: &models.PerfSample{
+				Timestamp:  time.Now().Add(-20 * 24 * time.Hour),
+				AppVersion: "1.0.0",
+				Platform:   "Android",
+				DeviceID:   "device123",
+				SessionID:  "session123",
+			},
+			wantErr: false,
+		},
+		{
 			name: "timestamp too old",
 			sample: &models.PerfSample{
-				Timestamp:  time.Now().Add(-8 * 24 * time.Hour),
+				Timestamp:  time.Now().Add(-31 * 24 * time.Hour),
 				AppVersion: "1.0.0",
 				Platform:   "Android",
 				DeviceID:   "device123",
