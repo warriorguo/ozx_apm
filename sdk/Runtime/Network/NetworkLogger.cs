@@ -11,7 +11,8 @@ namespace OzxApm.Network
 {
     /// <summary>
     /// Records all network communication with the server for debugging purposes.
-    /// Only active in development builds or when LogLevel is Debug; otherwise every
+    /// Only active when LogLevel is Debug (ApmConfig.Default() picks Debug in
+    /// development builds); otherwise every
     /// method returns immediately without building any strings. The log file is
     /// capped at MaxLogFileBytes (one rotated copy is kept) and is only written
     /// with consent.
@@ -33,18 +34,21 @@ namespace OzxApm.Network
         private bool _sessionMarkerWritten;
 
         public NetworkLogger(ApmConfig config)
-            : this(config, Path.Combine(Application.persistentDataPath, LogFileName), Debug.isDebugBuild)
+            : this(config, Path.Combine(Application.persistentDataPath, LogFileName), false)
         {
         }
 
-        internal NetworkLogger(ApmConfig config, string logFilePath, bool isDebugBuild)
+        /// <param name="forceEnable">Tests: enable regardless of LogLevel.</param>
+        internal NetworkLogger(ApmConfig config, string logFilePath, bool forceEnable)
         {
             _config = config;
             _logFilePath = logFilePath;
-            _enabled = isDebugBuild || config.LogLevel >= LogLevel.Debug;
+            // Not tied to Debug.isDebugBuild: a development build with LogLevel.Warning
+            // must not pay for per-request string building and main-thread file writes.
+            _enabled = forceEnable || config.LogLevel >= LogLevel.Debug;
         }
 
-        /// <summary>True in development builds or with LogLevel.Debug.</summary>
+        /// <summary>True with LogLevel.Debug.</summary>
         public bool IsEnabled => _enabled;
 
         /// <summary>

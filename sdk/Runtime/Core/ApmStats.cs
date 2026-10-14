@@ -24,5 +24,8 @@ namespace OzxApm.Core
         public bool HasWorkerThread;
         /// <summary>Main-thread time of the last ApmClient.Update, in milliseconds.</summary>
         public double LastUpdateMs;
+        /// <summary>Main-thread cost of the last upload start / completion, in milliseconds.</summary>
+        public double LastUploadSendMs;
+        public double LastUploadCompleteMs;
     }
 }

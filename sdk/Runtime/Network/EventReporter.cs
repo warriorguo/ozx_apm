@@ -1,5 +1,6 @@
 using System;
 using System.Globalization;
+using Unity.Profiling;
 using UnityEngine;
 using UnityEngine.Networking;
 using OzxApm.Core;
@@ -69,6 +70,10 @@ namespace OzxApm.Network
         private const float ReachabilityPollSeconds = 1f;
         private const float MaxRetryAfterSeconds = 3600f;
 
+        private static readonly ProfilerMarker s_sendMarker = new ProfilerMarker("OzxApm.Upload.Send");
+        private static readonly ProfilerMarker s_completeMarker = new ProfilerMarker("OzxApm.Upload.Complete");
+        private static readonly ProfilerMarker s_pollMarker = new ProfilerMarker("OzxApm.Upload.Poll");
+
         private readonly ApmConfig _config;
         private readonly OfflineStorage _storage;
         private readonly NetworkLogger _networkLogger;
@@ -91,6 +96,9 @@ namespace OzxApm.Network
         private NetworkReachability _lastReachability = NetworkReachability.ReachableViaLocalAreaNetwork;
 
         public int ConsecutiveFailures => _consecutiveFailures;
+        /// <summary>Main-thread cost of the last request start / completion (Stopwatch ticks).</summary>
+        public long LastSendTicks { get; private set; }
+        public long LastCompleteTicks { get; private set; }
         public bool IsSending => _state == State.Sending;
         /// <summary>Time (on the reporter's clock) of the next upload attempt.</summary>
         public float NextAttemptTime => Mathf.Max(_nextAttemptTime, _uploadsAllowedAt);
@@ -151,7 +159,10 @@ namespace OzxApm.Network
                     break;
 
                 case State.WaitingForBatch:
-                    var poll = _storage.PollUpload(out var batch);
+                    UploadPoll poll;
+                    UploadBatch batch;
+                    using (s_pollMarker.Auto())
+                        poll = _storage.PollUpload(out batch);
                     if (poll == UploadPoll.Ready)
                     {
                         if (_config.Consent != ConsentState.Granted)
@@ -162,7 +173,10 @@ namespace OzxApm.Network
                         }
                         else
                         {
-                            Send(batch, now);
+                            long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+                            using (s_sendMarker.Auto())
+                                Send(batch, now);
+                            LastSendTicks = System.Diagnostics.Stopwatch.GetTimestamp() - t0;
                         }
                     }
                     else if (poll == UploadPoll.Empty)
@@ -174,7 +188,12 @@ namespace OzxApm.Network
 
                 case State.Sending:
                     if (_request != null && _request.IsDone)
-                        OnRequestDone(now);
+                    {
+                        long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+                        using (s_completeMarker.Auto())
+                            OnRequestDone(now);
+                        LastCompleteTicks = System.Diagnostics.Stopwatch.GetTimestamp() - t0;
+                    }
                     break;
             }
         }

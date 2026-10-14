@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using Unity.Profiling;
 using UnityEngine;
 using UnityEngine.SceneManagement;
 using OzxApm.Models;
@@ -56,6 +57,12 @@ namespace OzxApm.Core
         private List<ICollector> _collectors = new List<ICollector>();
         private string _currentScene;
         private bool _isStopping;
+
+        // Static per device: read once at Initialize instead of per event
+        // (SystemInfo strings cross into native code and allocate on every call).
+        private string _platform;
+        private string _deviceModel;
+        private string _osVersion;
 
         public static ApmClient Instance
         {
@@ -312,6 +319,9 @@ namespace OzxApm.Core
             // Initialize core components. None of these read or parse stored
             // events on this thread; the storage worker does that in the background.
             _sessionManager = new SessionManager(() => _config.Consent == ConsentState.Granted);
+            _platform = DeviceInfo.GetPlatformString();
+            _deviceModel = DeviceInfo.GetDeviceModel();
+            _osVersion = DeviceInfo.GetOSVersion();
             _offlineStorage = new OfflineStorage(config);
             _networkLogger = new NetworkLogger(config);
             _reporter = new EventReporter(config, _offlineStorage, _networkLogger);
@@ -364,8 +374,10 @@ namespace OzxApm.Core
             }
 
             // Start all collectors
+            _collectorMarkers.Clear();
             foreach (var collector in _collectors)
             {
+                _collectorMarkers.Add(new ProfilerMarker("OzxApm.Collector." + collector.GetType().Name));
                 try
                 {
                     collector.Start();
@@ -398,7 +410,11 @@ namespace OzxApm.Core
                 stats.HasWorkerThread = client._offlineStorage.HasWorkerThread;
             }
             if (client._reporter != null)
+            {
                 stats.UploadFailures = client._reporter.ConsecutiveFailures;
+                stats.LastUploadSendMs = client._reporter.LastSendTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+                stats.LastUploadCompleteMs = client._reporter.LastCompleteTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+            }
             stats.LastUpdateMs = client._lastUpdateTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
             return stats;
         }
@@ -415,29 +431,41 @@ namespace OzxApm.Core
             _lastUpdateTicks = System.Diagnostics.Stopwatch.GetTimestamp() - start;
         }
 
+        // Profiler markers (development builds only; compiled out of release players).
+        private static readonly ProfilerMarker s_collectorsMarker = new ProfilerMarker("OzxApm.Collectors");
+        private static readonly ProfilerMarker s_uploadMarker = new ProfilerMarker("OzxApm.Upload");
+        private readonly List<ProfilerMarker> _collectorMarkers = new List<ProfilerMarker>();
+
         private void UpdateInternal()
         {
             // Update collectors
-            for (int i = 0; i < _collectors.Count; i++)
+            using (s_collectorsMarker.Auto())
             {
-                try
+                for (int i = 0; i < _collectors.Count; i++)
                 {
-                    _collectors[i].Update();
-                }
-                catch (Exception ex)
-                {
-                    ReportInternalError("Collector.Update", ex);
+                    try
+                    {
+                        using (_collectorMarkers[i].Auto())
+                            _collectors[i].Update();
+                    }
+                    catch (Exception ex)
+                    {
+                        ReportInternalError("Collector.Update", ex);
+                    }
                 }
             }
 
-            try
+            using (s_uploadMarker.Auto())
             {
-                _offlineStorage.Tick();
-                _reporter.Update();
-            }
-            catch (Exception ex)
-            {
-                ReportInternalError("Reporter.Update", ex);
+                try
+                {
+                    _offlineStorage.Tick();
+                    _reporter.Update();
+                }
+                catch (Exception ex)
+                {
+                    ReportInternalError("Reporter.Update", ex);
+                }
             }
         }
 
@@ -571,14 +599,14 @@ namespace OzxApm.Core
                 // (e.g. first-seen time of an exception); otherwise it is now.
                 if (evt.timestamp <= 0)
                     evt.timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-                if (string.IsNullOrEmpty(evt.event_id))
-                    evt.event_id = Guid.NewGuid().ToString("N");
-                // evt.seq is assigned by the storage worker, in enqueue order.
+                // event_id and seq are assigned by the storage worker before the event
+                // is persisted (Guid generation reads the OS random source: keep it
+                // off the main thread).
 
                 evt.app_version = _config.AppVersion;
-                evt.platform = DeviceInfo.GetPlatformString();
-                evt.device_model = DeviceInfo.GetDeviceModel();
-                evt.os_version = DeviceInfo.GetOSVersion();
+                evt.platform = _platform;
+                evt.device_model = _deviceModel;
+                evt.os_version = _osVersion;
                 evt.session_id = _sessionManager.SessionId;
                 evt.device_id = _sessionManager.DeviceId;
                 evt.scene = _currentScene;

@@ -9,7 +9,7 @@ namespace OzxApm.Models
         public string type;
         /// <summary>When the event happened (Unix ms, UTC). Never rewritten on flush or retry.</summary>
         public long timestamp;
-        /// <summary>Client-generated unique id, assigned at enqueue. Lets the server de-duplicate retries (APM-12).</summary>
+        /// <summary>Client-generated unique id, assigned by the SDK before the event is persisted. Lets the server de-duplicate retries (APM-12).</summary>
         public string event_id;
         /// <summary>Per-install monotonic sequence number, persisted across launches. A gap means events were dropped locally.</summary>
         public long seq;

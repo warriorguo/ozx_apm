@@ -848,6 +848,8 @@ namespace OzxApm.Network
                     var evt = events[i];
                     if (evt.seq == 0)
                         evt.seq = ++_seq; // kept if the write is retried
+                    if (string.IsNullOrEmpty(evt.event_id))
+                        evt.event_id = Guid.NewGuid().ToString("N"); // client-unique id, generated off the main thread
 
                     string line;
                     try

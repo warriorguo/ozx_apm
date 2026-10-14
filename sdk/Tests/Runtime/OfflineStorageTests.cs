@@ -128,6 +128,24 @@ namespace OzxApm.Tests
         }
 
         [Test]
+        public void EventsWithoutId_GetAUniqueEventIdBeforeTheyArePersisted()
+        {
+            var store = NewStore();
+            for (int i = 0; i < 50; i++)
+            {
+                var e = Perf(i);
+                e.event_id = null; // ApmClient leaves it to the worker
+                store.Enqueue(e);
+            }
+            store.Pump();
+
+            var ids = Regex.Matches(string.Concat(SegmentFiles().Select(File.ReadAllText)), "\"event_id\":\"([0-9a-f]{32})\"")
+                .Cast<Match>().Select(m => m.Groups[1].Value).ToList();
+            Assert.AreEqual(50, ids.Count);
+            Assert.AreEqual(50, ids.Distinct().Count());
+        }
+
+        [Test]
         public void Enqueue_DoesNoIoOnTheCallingThread()
         {
             var store = NewStore();
