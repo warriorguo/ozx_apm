@@ -562,6 +562,9 @@ namespace OzxApm.Network
             UnityWebRequest request;
             using (s_createMarker.Auto())
             {
+#if UNITY_2021_2_OR_NEWER
+                // UploadHandlerRaw(NativeArray<byte>, bool) exists since 2021.2: one copy
+                // into native memory owned by the handler, no managed copy per request.
                 var data = new NativeArray<byte>(length, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
                 try
                 {
@@ -579,6 +582,18 @@ namespace OzxApm.Network
                         data.Dispose();
                     throw;
                 }
+#else
+                // 2020.3: only UploadHandlerRaw(byte[]) exists, and it sends the whole
+                // array, so make an exact-length copy of the pooled buffer.
+                var data = new byte[length];
+                Buffer.BlockCopy(payload, 0, data, 0, length);
+                request = new UnityWebRequest(url, UnityWebRequest.kHttpVerbPOST)
+                {
+                    uploadHandler = new UploadHandlerRaw(data),
+                    downloadHandler = new DownloadHandlerBuffer(),
+                    timeout = timeoutSeconds
+                };
+#endif
             }
             try
             {
@@ -621,7 +636,13 @@ namespace OzxApm.Network
                 var handler = _request.downloadHandler;
                 if (handler == null)
                     return 0;
-                var data = handler.nativeData;
+#if UNITY_2021_2_OR_NEWER
+                var data = handler.nativeData; // since 2021.2: no managed copy
+#else
+                var data = handler.data;       // 2020.3: allocates a copy of the body
+                if (data == null)
+                    return 0;
+#endif
                 int n = Math.Min(dst.Length, data.Length);
                 for (int i = 0; i < n; i++)
                     dst[i] = data[i];

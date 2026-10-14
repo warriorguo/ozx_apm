@@ -95,16 +95,20 @@ namespace OzxApm.Utils
             if (_cachedPlatform != Platform.Unknown)
                 return _cachedPlatform;
 
-            _cachedPlatform = Application.platform switch
+            // C# 8 syntax (no "or" patterns): the package supports Unity 2020.3.
+            switch (Application.platform)
             {
-                RuntimePlatform.Android => Platform.Android,
-                RuntimePlatform.IPhonePlayer => Platform.iOS,
-                RuntimePlatform.WindowsPlayer or RuntimePlatform.WindowsEditor => Platform.Windows,
-                RuntimePlatform.OSXPlayer or RuntimePlatform.OSXEditor => Platform.MacOS,
-                RuntimePlatform.LinuxPlayer or RuntimePlatform.LinuxEditor => Platform.Linux,
-                RuntimePlatform.WebGLPlayer => Platform.WebGL,
-                _ => Platform.Unknown
-            };
+                case RuntimePlatform.Android: _cachedPlatform = Platform.Android; break;
+                case RuntimePlatform.IPhonePlayer: _cachedPlatform = Platform.iOS; break;
+                case RuntimePlatform.WindowsPlayer:
+                case RuntimePlatform.WindowsEditor: _cachedPlatform = Platform.Windows; break;
+                case RuntimePlatform.OSXPlayer:
+                case RuntimePlatform.OSXEditor: _cachedPlatform = Platform.MacOS; break;
+                case RuntimePlatform.LinuxPlayer:
+                case RuntimePlatform.LinuxEditor: _cachedPlatform = Platform.Linux; break;
+                case RuntimePlatform.WebGLPlayer: _cachedPlatform = Platform.WebGL; break;
+                default: _cachedPlatform = Platform.Unknown; break;
+            }
 
             return _cachedPlatform;
         }
