@@ -37,7 +37,7 @@ func (r *Repository) InsertPerfSamples(ctx context.Context, samples []models.Per
 		return nil
 	}
 
-	batch, err := r.client.conn.PrepareBatch(ctx, "INSERT INTO apm_perf_samples")
+	batch, err := r.client.conn.PrepareBatch(ctx, "INSERT INTO apm_perf_samples (timestamp, app_version, platform, device_model, os_version, session_id, device_id, scene, fps, frame_time_ms, main_thread_ms, gc_alloc_kb, mem_mb)")
 	if err != nil {
 		return fmt.Errorf("prepare batch: %w", err)
 	}
@@ -72,7 +72,7 @@ func (r *Repository) InsertJanks(ctx context.Context, janks []models.Jank) error
 		return nil
 	}
 
-	batch, err := r.client.conn.PrepareBatch(ctx, "INSERT INTO apm_janks")
+	batch, err := r.client.conn.PrepareBatch(ctx, "INSERT INTO apm_janks (timestamp, app_version, platform, device_model, os_version, session_id, device_id, scene, duration_ms, max_frame_ms, recent_gc_count, recent_gc_alloc_kb, recent_events)")
 	if err != nil {
 		return fmt.Errorf("prepare batch: %w", err)
 	}
@@ -107,7 +107,7 @@ func (r *Repository) InsertStartups(ctx context.Context, startups []models.Start
 		return nil
 	}
 
-	batch, err := r.client.conn.PrepareBatch(ctx, "INSERT INTO apm_startups")
+	batch, err := r.client.conn.PrepareBatch(ctx, "INSERT INTO apm_startups (timestamp, app_version, platform, device_model, os_version, session_id, device_id, phase1_ms, phase2_ms, tti_ms)")
 	if err != nil {
 		return fmt.Errorf("prepare batch: %w", err)
 	}
@@ -139,7 +139,7 @@ func (r *Repository) InsertSceneLoads(ctx context.Context, loads []models.SceneL
 		return nil
 	}
 
-	batch, err := r.client.conn.PrepareBatch(ctx, "INSERT INTO apm_scene_loads")
+	batch, err := r.client.conn.PrepareBatch(ctx, "INSERT INTO apm_scene_loads (timestamp, app_version, platform, device_model, session_id, device_id, scene_name, load_ms, activate_ms)")
 	if err != nil {
 		return fmt.Errorf("prepare batch: %w", err)
 	}
@@ -170,7 +170,7 @@ func (r *Repository) InsertExceptions(ctx context.Context, exceptions []models.E
 		return nil
 	}
 
-	batch, err := r.client.conn.PrepareBatch(ctx, "INSERT INTO apm_exceptions")
+	batch, err := r.client.conn.PrepareBatch(ctx, "INSERT INTO apm_exceptions (timestamp, app_version, platform, device_model, os_version, session_id, device_id, scene, fingerprint, message, stack, count)")
 	if err != nil {
 		return fmt.Errorf("prepare batch: %w", err)
 	}
@@ -204,7 +204,7 @@ func (r *Repository) InsertCrashes(ctx context.Context, crashes []models.Crash) 
 		return nil
 	}
 
-	batch, err := r.client.conn.PrepareBatch(ctx, "INSERT INTO apm_crashes")
+	batch, err := r.client.conn.PrepareBatch(ctx, "INSERT INTO apm_crashes (timestamp, app_version, platform, device_model, os_version, session_id, device_id, scene, crash_type, fingerprint, stack, breadcrumbs)")
 	if err != nil {
 		return fmt.Errorf("prepare batch: %w", err)
 	}
