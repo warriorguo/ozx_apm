@@ -29,14 +29,18 @@ namespace OzxApm.Collectors
         private readonly Queue<string> _breadcrumbs = new Queue<string>();
         private const int MaxBreadcrumbs = 50;
 
+        // Within a dedupe window, the first occurrence of a fingerprint is enqueued
+        // (and so persisted) immediately with count=1. Further occurrences are only
+        // counted and enqueued as one event with count=N at the end of the window,
+        // timestamped with the first repeat. sum(count) stays exact, and a crash
+        // right after an exception does not lose it.
         private class ExceptionInfo
         {
             public string Fingerprint;
             public string Message;
             public string Stack;
-            public int Count;
-            public float FirstSeen;
-            public float LastSeen;
+            public int RepeatCount;
+            public long RepeatFirstSeenMs;
         }
 
         public bool IsActive => _isActive;
@@ -80,6 +84,15 @@ namespace OzxApm.Collectors
         }
 
         /// <summary>
+        /// Enqueues the repeat counts collected so far (e.g. before going to background).
+        /// </summary>
+        public void FlushPending()
+        {
+            FlushExceptions();
+            _lastCleanupTime = Time.realtimeSinceStartup;
+        }
+
+        /// <summary>
         /// Records a breadcrumb for crash context
         /// </summary>
         public void RecordBreadcrumb(string message)
@@ -106,6 +119,20 @@ namespace OzxApm.Collectors
 
         private void OnLogMessage(string message, string stackTrace, LogType type)
         {
+            // An exception thrown from a log callback would be logged again and
+            // land right back here: never let anything escape.
+            try
+            {
+                HandleLogMessage(message, stackTrace, type);
+            }
+            catch
+            {
+                // Swallowed on purpose.
+            }
+        }
+
+        private void HandleLogMessage(string message, string stackTrace, LogType type)
+        {
             if (!_isActive)
                 return;
 
@@ -113,14 +140,20 @@ namespace OzxApm.Collectors
             if (type != LogType.Error && type != LogType.Exception && type != LogType.Assert)
                 return;
 
+            // Never capture the SDK's own output.
+            if (message != null && message.StartsWith(ApmClient.LogPrefix, StringComparison.Ordinal))
+                return;
+
+            message = message ?? "";
             string fingerprint = GenerateFingerprint(message, stackTrace);
-            float now = Time.realtimeSinceStartup;
+            long nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 
             if (_recentExceptions.TryGetValue(fingerprint, out var existing))
             {
-                // Deduplicate - just increment count
-                existing.Count++;
-                existing.LastSeen = now;
+                // Deduplicate - count it, report at the end of the window
+                if (existing.RepeatCount == 0)
+                    existing.RepeatFirstSeenMs = nowMs;
+                existing.RepeatCount++;
             }
             else
             {
@@ -130,15 +163,16 @@ namespace OzxApm.Collectors
                     FlushExceptions();
                 }
 
-                _recentExceptions[fingerprint] = new ExceptionInfo
+                var info = new ExceptionInfo
                 {
                     Fingerprint = fingerprint,
                     Message = TruncateMessage(message, 500),
-                    Stack = TruncateStack(stackTrace, 4000),
-                    Count = 1,
-                    FirstSeen = now,
-                    LastSeen = now
+                    Stack = TruncateStack(stackTrace, 4000)
                 };
+                _recentExceptions[fingerprint] = info;
+
+                // First occurrence goes to disk right away, with the time it happened.
+                Enqueue(info, 1, nowMs);
             }
 
             // Record as breadcrumb
@@ -150,18 +184,25 @@ namespace OzxApm.Collectors
             foreach (var kvp in _recentExceptions)
             {
                 var info = kvp.Value;
-                var evt = new ExceptionEvent
-                {
-                    fingerprint = info.Fingerprint,
-                    message = info.Message,
-                    stack = info.Stack,
-                    count = info.Count
-                };
-
-                _client.EnqueueEvent(evt);
+                if (info.RepeatCount > 0)
+                    Enqueue(info, info.RepeatCount, info.RepeatFirstSeenMs);
             }
 
             _recentExceptions.Clear();
+        }
+
+        private void Enqueue(ExceptionInfo info, int count, long timestampMs)
+        {
+            var evt = new ExceptionEvent
+            {
+                timestamp = timestampMs,
+                fingerprint = info.Fingerprint,
+                message = info.Message,
+                stack = info.Stack,
+                count = count
+            };
+
+            _client.EnqueueEvent(evt);
         }
 
         private string GenerateFingerprint(string message, string stackTrace)

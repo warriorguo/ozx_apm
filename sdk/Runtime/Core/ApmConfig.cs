@@ -134,7 +134,9 @@ namespace OzxApm.Core
         public float RequestTimeoutSeconds { get; set; } = 30.0f;
 
         /// <summary>
-        /// Maximum retry attempts for failed requests
+        /// Not used. Stored events are retried until the server confirms them
+        /// (see RetryBaseDelaySeconds / RetryMaxDelaySeconds); the storage cap
+        /// (MaxOfflineStorageBytes) is the only thing that drops them.
         /// </summary>
         public int MaxRetryAttempts { get; set; } = 3;
 

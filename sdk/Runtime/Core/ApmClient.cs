@@ -14,14 +14,29 @@ namespace OzxApm.Core
     /// </summary>
     public class ApmClient : MonoBehaviour
     {
+        /// <summary>
+        /// Prefix of every console message the SDK writes. ExceptionCollector ignores
+        /// messages with this prefix so the SDK never reports itself.
+        /// </summary>
+        internal const string LogPrefix = "[OzxApm]";
+
+        // How long lifecycle events may wait for the storage worker to write to disk.
+        private const int PauseFlushTimeoutMs = 100;
+        private const int ShutdownFlushTimeoutMs = 500;
+        private const int MaxReportedInternalErrors = 10;
+
         private static ApmClient _instance;
         private static readonly object _lock = new object();
         private static bool _isInitialized;
         private static bool _isShuttingDown;
 
+        // Read by Log() from any thread; avoids touching the UnityEngine.Object off the main thread.
+        private static volatile ApmConfig _logConfig;
+        private static ConsentState? _consentBeforeInit;
+        private static int _internalErrorCount;
+
         private ApmConfig _config;
         private SessionManager _sessionManager;
-        private EventQueue _eventQueue;
         private EventReporter _reporter;
         private OfflineStorage _offlineStorage;
         private NetworkLogger _networkLogger;
@@ -36,6 +51,7 @@ namespace OzxApm.Core
 
         private List<ICollector> _collectors = new List<ICollector>();
         private string _currentScene;
+        private bool _isStopping;
 
         public static ApmClient Instance
         {
@@ -70,7 +86,9 @@ namespace OzxApm.Core
         public NetworkLogger NetworkLog => _networkLogger;
 
         /// <summary>
-        /// Initializes the APM SDK with the given configuration
+        /// Initializes the APM SDK with the given configuration.
+        /// Does no disk or network I/O on the calling thread beyond PlayerPrefs:
+        /// stored events are scanned and uploaded in the background.
         /// </summary>
         public static void Initialize(ApmConfig config)
         {
@@ -85,7 +103,15 @@ namespace OzxApm.Core
                 config = ApmConfig.Default();
             }
 
-            Instance.InitializeInternal(config);
+            try
+            {
+                Instance?.InitializeInternal(config);
+            }
+            catch (Exception ex)
+            {
+                // The SDK must never break the game, not even on a bad config.
+                ReportInternalError("Initialize", ex);
+            }
         }
 
         /// <summary>
@@ -98,6 +124,33 @@ namespace OzxApm.Core
             config.AppKey = appKey;
             config.AppVersion = appVersion;
             Initialize(config);
+        }
+
+        /// <summary>
+        /// Current consent state. Events are only collected, stored and uploaded when Granted.
+        /// </summary>
+        public static ConsentState Consent
+        {
+            get
+            {
+                if (_isInitialized && _instance != null && _instance._config != null)
+                    return _instance._config.Consent;
+                return _consentBeforeInit ?? ConsentState.Granted;
+            }
+        }
+
+        /// <summary>
+        /// Sets the player's consent. Takes effect immediately: while not Granted,
+        /// nothing is enqueued, written to disk or uploaded. Can be called before
+        /// Initialize. Persisting the choice and deleting already stored data on
+        /// Denied are part of APM-14.
+        /// </summary>
+        public static void SetConsent(ConsentState state)
+        {
+            _consentBeforeInit = state;
+            var config = _logConfig;
+            if (config != null)
+                config.Consent = state;
         }
 
         /// <summary>
@@ -129,7 +182,14 @@ namespace OzxApm.Core
         {
             if (_isInitialized && Instance._startupTracker != null)
             {
-                Instance._startupTracker.MarkTTI();
+                try
+                {
+                    Instance._startupTracker.MarkTTI();
+                }
+                catch (Exception ex)
+                {
+                    ReportInternalError("MarkTTI", ex);
+                }
             }
         }
 
@@ -145,13 +205,24 @@ namespace OzxApm.Core
         }
 
         /// <summary>
-        /// Flushes all pending events
+        /// Writes pending events to disk and uploads them as soon as possible.
+        /// Does not block.
         /// </summary>
         public static void Flush()
         {
-            if (_isInitialized)
+            if (!_isInitialized)
+                return;
+
+            try
             {
-                Instance._eventQueue?.Flush();
+                var client = Instance;
+                client._exceptionCollector?.FlushPending();
+                client._offlineStorage?.Flush();
+                client._reporter?.RetryNow();
+            }
+            catch (Exception ex)
+            {
+                ReportInternalError("Flush", ex);
             }
         }
 
@@ -204,6 +275,9 @@ namespace OzxApm.Core
         private void InitializeInternal(ApmConfig config)
         {
             _config = config;
+            if (_consentBeforeInit.HasValue)
+                _config.Consent = _consentBeforeInit.Value;
+            _logConfig = config;
 
             if (!_config.Enabled)
             {
@@ -213,15 +287,13 @@ namespace OzxApm.Core
 
             Log(LogLevel.Info, $"Initializing APM SDK v1.0.0 for {config.AppVersion}");
 
-            // Initialize core components
+            // Initialize core components. None of these read or parse stored
+            // events on this thread; the storage worker does that in the background.
             _sessionManager = new SessionManager();
-            _eventQueue = new EventQueue(config);
             _offlineStorage = new OfflineStorage(config);
             _networkLogger = new NetworkLogger(config);
             _reporter = new EventReporter(config, _offlineStorage, _networkLogger);
-
-            // Subscribe to batch ready events
-            _eventQueue.OnBatchReady += OnBatchReady;
+            _offlineStorage.Start();
 
             // Initialize collectors
             InitializeCollectors();
@@ -229,9 +301,6 @@ namespace OzxApm.Core
             // Subscribe to scene changes
             SceneManager.sceneLoaded += OnSceneLoaded;
             _currentScene = SceneManager.GetActiveScene().name;
-
-            // Process any offline events from previous sessions
-            _offlineStorage.ProcessOfflineEvents(_reporter);
 
             _isInitialized = true;
             Log(LogLevel.Info, "APM SDK initialized successfully");
@@ -275,7 +344,14 @@ namespace OzxApm.Core
             // Start all collectors
             foreach (var collector in _collectors)
             {
-                collector.Start();
+                try
+                {
+                    collector.Start();
+                }
+                catch (Exception ex)
+                {
+                    ReportInternalError(collector.GetType().Name + ".Start", ex);
+                }
             }
         }
 
@@ -285,13 +361,27 @@ namespace OzxApm.Core
                 return;
 
             // Update collectors
-            foreach (var collector in _collectors)
+            for (int i = 0; i < _collectors.Count; i++)
             {
-                collector.Update();
+                try
+                {
+                    _collectors[i].Update();
+                }
+                catch (Exception ex)
+                {
+                    ReportInternalError("Collector.Update", ex);
+                }
             }
 
-            // Update event queue
-            _eventQueue.Update();
+            try
+            {
+                _offlineStorage.Tick();
+                _reporter.Update();
+            }
+            catch (Exception ex)
+            {
+                ReportInternalError("Reporter.Update", ex);
+            }
         }
 
         private void OnApplicationPause(bool paused)
@@ -299,12 +389,27 @@ namespace OzxApm.Core
             if (!_isInitialized)
                 return;
 
-            _sessionManager.OnApplicationPause(paused);
-
-            if (paused)
+            try
             {
-                // Flush events when going to background
-                _eventQueue.Flush();
+                _sessionManager.OnApplicationPause(paused);
+
+                if (paused)
+                {
+                    // The OS may kill us in the background: get everything onto disk
+                    // and sealed for upload. Bounded wait; the worker is normally idle.
+                    _exceptionCollector?.FlushPending();
+                    _offlineStorage.Flush();
+                    _offlineStorage.WaitIdle(PauseFlushTimeoutMs);
+                }
+                else
+                {
+                    // The network may have changed while we were away.
+                    _reporter.RetryNow();
+                }
+            }
+            catch (Exception ex)
+            {
+                ReportInternalError("OnApplicationPause", ex);
             }
         }
 
@@ -313,7 +418,14 @@ namespace OzxApm.Core
             if (!_isInitialized)
                 return;
 
-            _sessionManager.OnApplicationFocus(hasFocus);
+            try
+            {
+                _sessionManager.OnApplicationFocus(hasFocus);
+            }
+            catch (Exception ex)
+            {
+                ReportInternalError("OnApplicationFocus", ex);
+            }
         }
 
         private void OnApplicationQuit()
@@ -329,58 +441,97 @@ namespace OzxApm.Core
 
         private void ShutdownInternal()
         {
-            if (!_isInitialized)
+            if (!_isInitialized || _isStopping)
                 return;
 
-            Log(LogLevel.Info, "Shutting down APM SDK");
+            // OnApplicationQuit and OnDestroy both land here; run once.
+            _isStopping = true;
 
-            // Stop collectors
-            foreach (var collector in _collectors)
+            try
             {
-                collector.Stop();
+                Log(LogLevel.Info, "Shutting down APM SDK");
+
+                // Stop collectors (ExceptionCollector enqueues its pending repeats here)
+                foreach (var collector in _collectors)
+                {
+                    try
+                    {
+                        collector.Stop();
+                    }
+                    catch (Exception ex)
+                    {
+                        ReportInternalError(collector.GetType().Name + ".Stop", ex);
+                    }
+                }
+                _collectors.Clear();
+
+                SceneManager.sceneLoaded -= OnSceneLoaded;
+
+                // Unsent batches stay on disk and are uploaded on the next launch.
+                _reporter.Shutdown();
+                _offlineStorage.Shutdown(ShutdownFlushTimeoutMs);
             }
-            _collectors.Clear();
-
-            // Flush remaining events
-            _eventQueue.Flush();
-
-            // Unsubscribe from events
-            _eventQueue.OnBatchReady -= OnBatchReady;
-            SceneManager.sceneLoaded -= OnSceneLoaded;
-
-            _isInitialized = false;
+            catch (Exception ex)
+            {
+                ReportInternalError("Shutdown", ex);
+            }
+            finally
+            {
+                _isInitialized = false;
+                _isStopping = false;
+            }
         }
 
         private void OnSceneLoaded(Scene scene, LoadSceneMode mode)
         {
-            _currentScene = scene.name;
-            RecordBreadcrumb($"Scene: {scene.name}");
-        }
-
-        private void OnBatchReady(List<BaseEvent> batch)
-        {
-            _reporter.SendBatch(batch);
+            try
+            {
+                _currentScene = scene.name;
+                RecordBreadcrumb($"Scene: {scene.name}");
+            }
+            catch (Exception ex)
+            {
+                ReportInternalError("OnSceneLoaded", ex);
+            }
         }
 
         /// <summary>
-        /// Enqueues an event for transmission
+        /// Enqueues an event. It is written to disk by the storage worker within
+        /// PersistIntervalMs and kept until the server confirms it. Main thread.
         /// </summary>
         internal void EnqueueEvent(BaseEvent evt)
         {
             if (!_isInitialized || evt == null)
                 return;
 
-            // Fill common fields
-            evt.timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-            evt.app_version = _config.AppVersion;
-            evt.platform = DeviceInfo.GetPlatformString();
-            evt.device_model = DeviceInfo.GetDeviceModel();
-            evt.os_version = DeviceInfo.GetOSVersion();
-            evt.session_id = _sessionManager.SessionId;
-            evt.device_id = _sessionManager.DeviceId;
-            evt.scene = _currentScene;
+            // Consent gate: without consent the event is not even queued.
+            if (_config.Consent != ConsentState.Granted)
+                return;
 
-            _eventQueue.Enqueue(evt);
+            try
+            {
+                // Keep the time the event happened if the collector set it
+                // (e.g. first-seen time of an exception); otherwise it is now.
+                if (evt.timestamp <= 0)
+                    evt.timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                if (string.IsNullOrEmpty(evt.event_id))
+                    evt.event_id = Guid.NewGuid().ToString("N");
+                // evt.seq is assigned by the storage worker, in enqueue order.
+
+                evt.app_version = _config.AppVersion;
+                evt.platform = DeviceInfo.GetPlatformString();
+                evt.device_model = DeviceInfo.GetDeviceModel();
+                evt.os_version = DeviceInfo.GetOSVersion();
+                evt.session_id = _sessionManager.SessionId;
+                evt.device_id = _sessionManager.DeviceId;
+                evt.scene = _currentScene;
+
+                _offlineStorage.Enqueue(evt);
+            }
+            catch (Exception ex)
+            {
+                ReportInternalError("EnqueueEvent", ex);
+            }
         }
 
         /// <summary>
@@ -403,27 +554,45 @@ namespace OzxApm.Core
             return (0, 0);
         }
 
+        /// <summary>
+        /// Logs an SDK-internal exception at warning level (rate limited). Never rethrows.
+        /// </summary>
+        internal static void ReportInternalError(string where, Exception ex)
+        {
+            if (System.Threading.Interlocked.Increment(ref _internalErrorCount) > MaxReportedInternalErrors)
+                return;
+            Log(LogLevel.Warning, $"Internal error in {where}: {ex.GetType().Name}: {ex.Message}");
+        }
+
+        /// <summary>
+        /// SDK-internal logging. Thread-safe. Never uses Debug.LogError or
+        /// Debug.LogException: those would be captured by ExceptionCollector (and the
+        /// game's own error reporting) and make the SDK report itself. Errors are
+        /// written as warnings.
+        /// </summary>
         internal static void Log(LogLevel level, string message)
         {
-            if (_instance == null || _instance._config == null)
+            var config = _logConfig;
+            if (config == null || level == LogLevel.None || level > config.LogLevel)
                 return;
 
-            if (level > _instance._config.LogLevel)
-                return;
-
-            string prefix = "[OzxApm] ";
-            switch (level)
+            try
             {
-                case LogLevel.Error:
-                    Debug.LogError(prefix + message);
-                    break;
-                case LogLevel.Warning:
-                    Debug.LogWarning(prefix + message);
-                    break;
-                case LogLevel.Info:
-                case LogLevel.Debug:
-                    Debug.Log(prefix + message);
-                    break;
+                string text = LogPrefix + " " + message;
+                switch (level)
+                {
+                    case LogLevel.Error:
+                    case LogLevel.Warning:
+                        Debug.LogWarning(text);
+                        break;
+                    default:
+                        Debug.Log(text);
+                        break;
+                }
+            }
+            catch
+            {
+                // Logging must never throw into the game.
             }
         }
     }
