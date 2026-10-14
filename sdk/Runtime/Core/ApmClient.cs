@@ -146,8 +146,10 @@ namespace OzxApm.Core
         /// <summary>
         /// Sets the player's consent. Takes effect immediately: while not Granted,
         /// nothing is enqueued, written to disk or uploaded. Can be called before
-        /// Initialize. Persisting the choice and deleting already stored data on
-        /// Denied are part of APM-14.
+        /// Initialize. Main thread. Until consent is Granted the SDK also writes no
+        /// PlayerPrefs (device/session ids are kept in memory); they are stored when
+        /// consent is granted. Persisting the choice and deleting already stored
+        /// data on Denied are part of APM-14.
         /// </summary>
         public static void SetConsent(ConsentState state)
         {
@@ -155,6 +157,18 @@ namespace OzxApm.Core
             var config = _logConfig;
             if (config != null)
                 config.Consent = state;
+
+            if (state == ConsentState.Granted && _isInitialized && !ReferenceEquals(_instance, null))
+            {
+                try
+                {
+                    _instance._sessionManager?.OnConsentGranted();
+                }
+                catch (Exception ex)
+                {
+                    ReportInternalError("SetConsent", ex);
+                }
+            }
         }
 
         /// <summary>
@@ -293,11 +307,11 @@ namespace OzxApm.Core
                 return;
             }
 
-            Log(LogLevel.Info, $"Initializing APM SDK v1.0.0 for {config.AppVersion}");
+            Log(LogLevel.Info, $"Initializing APM SDK v{SdkVersion} for {config.AppVersion}");
 
             // Initialize core components. None of these read or parse stored
             // events on this thread; the storage worker does that in the background.
-            _sessionManager = new SessionManager();
+            _sessionManager = new SessionManager(() => _config.Consent == ConsentState.Granted);
             _offlineStorage = new OfflineStorage(config);
             _networkLogger = new NetworkLogger(config);
             _reporter = new EventReporter(config, _offlineStorage, _networkLogger);

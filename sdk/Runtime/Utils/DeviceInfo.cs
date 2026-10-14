@@ -12,27 +12,53 @@ namespace OzxApm.Utils
         private static Platform _cachedPlatform;
         private static string _cachedNetworkType;
 
+        private const string DeviceIdKey = "ozx_apm_device_id";
+        private static bool _deviceIdPersisted;
+
         /// <summary>
-        /// Gets an anonymous, resettable device identifier
+        /// Gets an anonymous, resettable device identifier (and stores it).
         /// </summary>
         public static string GetDeviceId()
         {
-            if (!string.IsNullOrEmpty(_cachedDeviceId))
-                return _cachedDeviceId;
+            return GetDeviceId(true);
+        }
 
-            // Try to load from PlayerPrefs first
-            const string key = "ozx_apm_device_id";
-            _cachedDeviceId = PlayerPrefs.GetString(key, "");
-
+        /// <summary>
+        /// Gets the device identifier. With persist=false a newly generated id is
+        /// only kept in memory (no PlayerPrefs write, e.g. before consent); call
+        /// PersistDeviceId once writing is allowed.
+        /// </summary>
+        public static string GetDeviceId(bool persist)
+        {
             if (string.IsNullOrEmpty(_cachedDeviceId))
             {
-                // Generate a new anonymous device ID
-                _cachedDeviceId = GenerateAnonymousId();
-                PlayerPrefs.SetString(key, _cachedDeviceId);
-                PlayerPrefs.Save();
+                // Reading PlayerPrefs writes nothing.
+                _cachedDeviceId = PlayerPrefs.GetString(DeviceIdKey, "");
+                _deviceIdPersisted = !string.IsNullOrEmpty(_cachedDeviceId);
+
+                if (!_deviceIdPersisted)
+                {
+                    // Generate a new anonymous device ID
+                    _cachedDeviceId = GenerateAnonymousId();
+                }
             }
 
+            if (persist)
+                PersistDeviceId();
+
             return _cachedDeviceId;
+        }
+
+        /// <summary>
+        /// Writes the current device id to PlayerPrefs if it is not stored yet.
+        /// </summary>
+        public static void PersistDeviceId()
+        {
+            if (_deviceIdPersisted || string.IsNullOrEmpty(_cachedDeviceId))
+                return;
+            PlayerPrefs.SetString(DeviceIdKey, _cachedDeviceId);
+            PlayerPrefs.Save();
+            _deviceIdPersisted = true;
         }
 
         /// <summary>
@@ -40,10 +66,25 @@ namespace OzxApm.Utils
         /// </summary>
         public static void ResetDeviceId()
         {
-            const string key = "ozx_apm_device_id";
+            ResetDeviceId(true);
+        }
+
+        /// <summary>
+        /// Resets the device ID; with persist=false the new id is not written yet.
+        /// </summary>
+        public static void ResetDeviceId(bool persist)
+        {
             _cachedDeviceId = GenerateAnonymousId();
-            PlayerPrefs.SetString(key, _cachedDeviceId);
-            PlayerPrefs.Save();
+            _deviceIdPersisted = false;
+            if (persist)
+                PersistDeviceId();
+        }
+
+        /// <summary>Test seam: forget the cached id.</summary>
+        internal static void ClearCacheForTests()
+        {
+            _cachedDeviceId = null;
+            _deviceIdPersisted = false;
         }
 
         /// <summary>

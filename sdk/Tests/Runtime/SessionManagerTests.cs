@@ -68,6 +68,35 @@ namespace OzxApm.Tests
         }
 
         [Test]
+        public void WithoutConsent_NoPlayerPrefsAreWritten_UntilGranted()
+        {
+            const string deviceKey = "ozx_apm_device_id";
+            const string sessionKey = "ozx_apm_session_id";
+            const string startKey = "ozx_apm_session_start";
+            UnityEngine.PlayerPrefs.DeleteKey(deviceKey);
+            UnityEngine.PlayerPrefs.DeleteKey(sessionKey);
+            UnityEngine.PlayerPrefs.DeleteKey(startKey);
+            OzxApm.Utils.DeviceInfo.ClearCacheForTests();
+
+            bool granted = false;
+            var manager = new SessionManager(() => granted);
+            manager.StartNewSession();
+            manager.ResetDeviceId();
+
+            Assert.IsFalse(string.IsNullOrEmpty(manager.DeviceId));
+            Assert.IsFalse(string.IsNullOrEmpty(manager.SessionId));
+            Assert.IsFalse(UnityEngine.PlayerPrefs.HasKey(deviceKey), "device id written without consent");
+            Assert.IsFalse(UnityEngine.PlayerPrefs.HasKey(sessionKey), "session id written without consent");
+            Assert.IsFalse(UnityEngine.PlayerPrefs.HasKey(startKey));
+
+            granted = true;
+            manager.OnConsentGranted();
+            Assert.AreEqual(manager.DeviceId, UnityEngine.PlayerPrefs.GetString(deviceKey));
+            Assert.AreEqual(manager.SessionId, UnityEngine.PlayerPrefs.GetString(sessionKey));
+            Assert.IsTrue(UnityEngine.PlayerPrefs.HasKey(startKey));
+        }
+
+        [Test]
         public void SessionStart_IsRecent()
         {
             var now = System.DateTime.UtcNow;

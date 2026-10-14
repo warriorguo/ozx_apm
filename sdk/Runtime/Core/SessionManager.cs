@@ -30,11 +30,38 @@ namespace OzxApm.Core
         public string UserId => _userId;
         public DateTime SessionStart => _sessionStart;
 
-        public SessionManager()
+        // Returns whether PlayerPrefs may be written (consent). Null: always.
+        private readonly Func<bool> _canPersist;
+        private bool _sessionPersisted;
+
+        public SessionManager() : this(null)
         {
-            _deviceId = DeviceInfo.GetDeviceId();
+        }
+
+        /// <param name="canPersist">
+        /// Checked before every PlayerPrefs write. While it returns false (no
+        /// consent) ids live in memory only; call OnConsentGranted to store them.
+        /// </param>
+        public SessionManager(Func<bool> canPersist)
+        {
+            _canPersist = canPersist;
+            _deviceId = DeviceInfo.GetDeviceId(CanPersist);
             _lastActivity = DateTime.UtcNow;
             StartNewSession();
+        }
+
+        private bool CanPersist => _canPersist == null || _canPersist();
+
+        /// <summary>
+        /// Writes the ids that were held back while consent was missing.
+        /// </summary>
+        public void OnConsentGranted()
+        {
+            if (!CanPersist)
+                return;
+            DeviceInfo.PersistDeviceId();
+            if (!_sessionPersisted)
+                PersistSession();
         }
 
         /// <summary>
@@ -58,8 +85,8 @@ namespace OzxApm.Core
         /// </summary>
         public void ResetDeviceId()
         {
-            DeviceInfo.ResetDeviceId();
-            _deviceId = DeviceInfo.GetDeviceId();
+            DeviceInfo.ResetDeviceId(CanPersist);
+            _deviceId = DeviceInfo.GetDeviceId(CanPersist);
         }
 
         /// <summary>
@@ -110,11 +137,19 @@ namespace OzxApm.Core
             _sessionId = GenerateSessionId();
             _sessionStart = DateTime.UtcNow;
             _lastActivity = _sessionStart;
+            _sessionPersisted = false;
 
-            // Persist session info for crash recovery
+            // Persist session info for crash recovery (only with consent)
+            if (CanPersist)
+                PersistSession();
+        }
+
+        private void PersistSession()
+        {
             PlayerPrefs.SetString(SessionIdKey, _sessionId);
             PlayerPrefs.SetString(SessionStartKey, _sessionStart.ToString("o", CultureInfo.InvariantCulture));
             PlayerPrefs.Save();
+            _sessionPersisted = true;
         }
 
         /// <summary>
