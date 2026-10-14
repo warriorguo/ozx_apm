@@ -128,3 +128,12 @@ net_type, country (optional)
 - user_id must be optional and disableable
 - Data retention: 30 days detail, 1 year aggregated
 - SDK must support data deletion/disable for compliance requests
+
+## Project Management (Memory Flow)
+
+This repo is registered in Memory Flow as project **APM** (OZX APM). Use the `memory-flow-pm` skill / `mf` CLI.
+
+- Issue keys: `APM-<N>`; commit messages use `[APM-<N>] description`
+- Close issues with `mf issue done APM-<N> --git HEAD`
+- CI/CD (server): https://cicd.local.playquota.com/apps/36
+- CI/CD (admin): https://cicd.local.playquota.com/apps/38
