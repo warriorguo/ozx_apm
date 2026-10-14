@@ -19,7 +19,9 @@ CREATE TABLE IF NOT EXISTS apm_perf_samples (
     frame_time_ms Float32,
     main_thread_ms Float32,
     gc_alloc_kb Float32,
-    mem_mb Float32
+    mem_mb Float32,
+    event_id String DEFAULT '',
+    seq UInt64 DEFAULT 0
 ) ENGINE = MergeTree()
 PARTITION BY toYYYYMMDD(timestamp)
 ORDER BY (app_version, platform, timestamp);
@@ -38,7 +40,9 @@ CREATE TABLE IF NOT EXISTS apm_janks (
     max_frame_ms Float32,
     recent_gc_count UInt32,
     recent_gc_alloc_kb Float32,
-    recent_events Array(String)
+    recent_events Array(String),
+    event_id String DEFAULT '',
+    seq UInt64 DEFAULT 0
 ) ENGINE = MergeTree()
 PARTITION BY toYYYYMMDD(timestamp)
 ORDER BY (app_version, scene, timestamp);
@@ -54,7 +58,9 @@ CREATE TABLE IF NOT EXISTS apm_startups (
     device_id String,
     phase1_ms Float32,
     phase2_ms Float32,
-    tti_ms Float32
+    tti_ms Float32,
+    event_id String DEFAULT '',
+    seq UInt64 DEFAULT 0
 ) ENGINE = MergeTree()
 PARTITION BY toYYYYMMDD(timestamp)
 ORDER BY (app_version, platform, timestamp);
@@ -69,7 +75,9 @@ CREATE TABLE IF NOT EXISTS apm_scene_loads (
     device_id String,
     scene_name String,
     load_ms Float32,
-    activate_ms Float32
+    activate_ms Float32,
+    event_id String DEFAULT '',
+    seq UInt64 DEFAULT 0
 ) ENGINE = MergeTree()
 PARTITION BY toYYYYMMDD(timestamp)
 ORDER BY (app_version, scene_name, timestamp);
@@ -87,7 +95,9 @@ CREATE TABLE IF NOT EXISTS apm_exceptions (
     fingerprint String,
     message String,
     stack String,
-    count UInt32
+    count UInt32,
+    event_id String DEFAULT '',
+    seq UInt64 DEFAULT 0
 ) ENGINE = MergeTree()
 PARTITION BY toYYYYMMDD(timestamp)
 ORDER BY (app_version, fingerprint, timestamp);
@@ -105,7 +115,9 @@ CREATE TABLE IF NOT EXISTS apm_crashes (
     crash_type String,
     fingerprint String,
     stack String,
-    breadcrumbs Array(String)
+    breadcrumbs Array(String),
+    event_id String DEFAULT '',
+    seq UInt64 DEFAULT 0
 ) ENGINE = MergeTree()
 PARTITION BY toYYYYMMDD(timestamp)
 ORDER BY (app_version, fingerprint, timestamp);
@@ -125,7 +137,9 @@ var schemaStatements = []string{
     frame_time_ms Float32,
     main_thread_ms Float32,
     gc_alloc_kb Float32,
-    mem_mb Float32
+    mem_mb Float32,
+    event_id String DEFAULT '',
+    seq UInt64 DEFAULT 0
 ) ENGINE = MergeTree()
 PARTITION BY toYYYYMMDD(timestamp)
 ORDER BY (app_version, platform, timestamp)`,
@@ -143,7 +157,9 @@ ORDER BY (app_version, platform, timestamp)`,
     max_frame_ms Float32,
     recent_gc_count UInt32,
     recent_gc_alloc_kb Float32,
-    recent_events Array(String)
+    recent_events Array(String),
+    event_id String DEFAULT '',
+    seq UInt64 DEFAULT 0
 ) ENGINE = MergeTree()
 PARTITION BY toYYYYMMDD(timestamp)
 ORDER BY (app_version, scene, timestamp)`,
@@ -158,7 +174,9 @@ ORDER BY (app_version, scene, timestamp)`,
     device_id String,
     phase1_ms Float32,
     phase2_ms Float32,
-    tti_ms Float32
+    tti_ms Float32,
+    event_id String DEFAULT '',
+    seq UInt64 DEFAULT 0
 ) ENGINE = MergeTree()
 PARTITION BY toYYYYMMDD(timestamp)
 ORDER BY (app_version, platform, timestamp)`,
@@ -172,7 +190,9 @@ ORDER BY (app_version, platform, timestamp)`,
     device_id String,
     scene_name String,
     load_ms Float32,
-    activate_ms Float32
+    activate_ms Float32,
+    event_id String DEFAULT '',
+    seq UInt64 DEFAULT 0
 ) ENGINE = MergeTree()
 PARTITION BY toYYYYMMDD(timestamp)
 ORDER BY (app_version, scene_name, timestamp)`,
@@ -189,7 +209,9 @@ ORDER BY (app_version, scene_name, timestamp)`,
     fingerprint String,
     message String,
     stack String,
-    count UInt32
+    count UInt32,
+    event_id String DEFAULT '',
+    seq UInt64 DEFAULT 0
 ) ENGINE = MergeTree()
 PARTITION BY toYYYYMMDD(timestamp)
 ORDER BY (app_version, fingerprint, timestamp)`,
@@ -206,10 +228,27 @@ ORDER BY (app_version, fingerprint, timestamp)`,
     crash_type String,
     fingerprint String,
     stack String,
-    breadcrumbs Array(String)
+    breadcrumbs Array(String),
+    event_id String DEFAULT '',
+    seq UInt64 DEFAULT 0
 ) ENGINE = MergeTree()
 PARTITION BY toYYYYMMDD(timestamp)
 ORDER BY (app_version, fingerprint, timestamp)`,
+
+	// Additive migrations for deployments created before APM-2. Must stay
+	// idempotent: Migrate runs on every server start.
+	`ALTER TABLE apm_perf_samples ADD COLUMN IF NOT EXISTS event_id String DEFAULT ''`,
+	`ALTER TABLE apm_perf_samples ADD COLUMN IF NOT EXISTS seq UInt64 DEFAULT 0`,
+	`ALTER TABLE apm_janks ADD COLUMN IF NOT EXISTS event_id String DEFAULT ''`,
+	`ALTER TABLE apm_janks ADD COLUMN IF NOT EXISTS seq UInt64 DEFAULT 0`,
+	`ALTER TABLE apm_startups ADD COLUMN IF NOT EXISTS event_id String DEFAULT ''`,
+	`ALTER TABLE apm_startups ADD COLUMN IF NOT EXISTS seq UInt64 DEFAULT 0`,
+	`ALTER TABLE apm_scene_loads ADD COLUMN IF NOT EXISTS event_id String DEFAULT ''`,
+	`ALTER TABLE apm_scene_loads ADD COLUMN IF NOT EXISTS seq UInt64 DEFAULT 0`,
+	`ALTER TABLE apm_exceptions ADD COLUMN IF NOT EXISTS event_id String DEFAULT ''`,
+	`ALTER TABLE apm_exceptions ADD COLUMN IF NOT EXISTS seq UInt64 DEFAULT 0`,
+	`ALTER TABLE apm_crashes ADD COLUMN IF NOT EXISTS event_id String DEFAULT ''`,
+	`ALTER TABLE apm_crashes ADD COLUMN IF NOT EXISTS seq UInt64 DEFAULT 0`,
 }
 
 func (c *ClickHouseClient) Migrate(ctx context.Context) error {

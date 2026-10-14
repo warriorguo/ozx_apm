@@ -106,6 +106,30 @@ func TestIngest_AllStored(t *testing.T) {
 	}
 }
 
+func TestIngest_StoresEventIDAndSeq(t *testing.T) {
+	store := &fakeEventStore{}
+	h := newIngestHandler(store, zap.NewNop())
+
+	_, resp := postBatch(t, h, batchOf(
+		sdkEventJSON("perf_sample", "0f8fad5bd9cb469fa16570867728950e", 41, `,"fps":59.5`),
+		sdkEventJSON("exception", "7c9e6679742540de944be07fc1f90ae7", 42, `,"fingerprint":"abc","count":1`),
+		sdkEventJSON("perf_sample", "", 0, `,"fps":30`), // old SDK
+	), nil)
+
+	if resp.Accepted != 3 {
+		t.Fatalf("unexpected response %+v", resp)
+	}
+	if store.perfSamples[0].EventID != "0f8fad5bd9cb469fa16570867728950e" || store.perfSamples[0].Seq != 41 {
+		t.Errorf("perf sample event_id/seq not stored: %+v", store.perfSamples[0])
+	}
+	if store.exceptions[0].EventID != "7c9e6679742540de944be07fc1f90ae7" || store.exceptions[0].Seq != 42 {
+		t.Errorf("exception event_id/seq not stored: %+v", store.exceptions[0])
+	}
+	if store.perfSamples[1].EventID != "" || store.perfSamples[1].Seq != 0 {
+		t.Errorf("old-SDK event should have empty event_id/seq: %+v", store.perfSamples[1])
+	}
+}
+
 func TestIngest_TransientInsertErrorIsRetriedServerSide(t *testing.T) {
 	store := &fakeEventStore{failExceptionsTimes: 2}
 	h := newIngestHandler(store, zap.NewNop())

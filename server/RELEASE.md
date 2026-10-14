@@ -48,3 +48,46 @@ Response body:
 ```
 
 Rollback: redeploy the previous binary. No schema action.
+
+## APM-2, phase 2: store `event_id` and `seq` (additive schema change)
+
+Deploy only after phase 1 runs everywhere: no instance of the pre-phase-1
+binary may still serve traffic, including during the rolling deploy.
+
+Changes:
+
+- `Migrate` (run on every server start) adds two columns to all six event
+  tables (`apm_perf_samples`, `apm_janks`, `apm_startups`, `apm_scene_loads`,
+  `apm_exceptions`, `apm_crashes`):
+  ```sql
+  ALTER TABLE <table> ADD COLUMN IF NOT EXISTS event_id String DEFAULT '';
+  ALTER TABLE <table> ADD COLUMN IF NOT EXISTS seq UInt64 DEFAULT 0;
+  ```
+  The same statements are in `scripts/migrate.sql`. In ClickHouse they only
+  change metadata (existing parts are not rewritten), and they are idempotent.
+- Inserts write `event_id` and `seq`. Events from old SDKs store `''` / `0`.
+- No de-duplication yet (APM-12).
+
+Rolling deploy: phase-1 and phase-2 binaries can serve side by side. Phase 1
+names its columns, so it keeps inserting after the ALTER and its rows get the
+defaults. Verified on ClickHouse 23.8 and 24.1.
+
+### Rollback
+
+- **To phase 1:** redeploy the phase-1 binary. No schema action is needed;
+  the extra columns stay and get their defaults.
+- **To anything older than phase 1** (the binary with positional
+  `INSERT INTO t` and no column list): that binary fails every insert against
+  the migrated tables with `expected 15 arguments, got 13`, and it still
+  answers 200, so clients delete the data. **Before** starting it, stop every
+  phase-2 instance (its `Migrate` would add the columns back on restart), then
+  drop the columns on all six tables:
+  ```sql
+  ALTER TABLE apm_perf_samples DROP COLUMN IF EXISTS event_id, DROP COLUMN IF EXISTS seq;
+  ALTER TABLE apm_janks        DROP COLUMN IF EXISTS event_id, DROP COLUMN IF EXISTS seq;
+  ALTER TABLE apm_startups     DROP COLUMN IF EXISTS event_id, DROP COLUMN IF EXISTS seq;
+  ALTER TABLE apm_scene_loads  DROP COLUMN IF EXISTS event_id, DROP COLUMN IF EXISTS seq;
+  ALTER TABLE apm_exceptions   DROP COLUMN IF EXISTS event_id, DROP COLUMN IF EXISTS seq;
+  ALTER TABLE apm_crashes      DROP COLUMN IF EXISTS event_id, DROP COLUMN IF EXISTS seq;
+  ```
+  This loses the stored `event_id`/`seq` values. Prefer rolling back to phase 1.
