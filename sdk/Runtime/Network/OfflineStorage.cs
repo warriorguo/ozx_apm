@@ -20,8 +20,29 @@ namespace OzxApm.Network
     {
         /// <summary>Name of the first (oldest) segment in the batch.</summary>
         public string SegmentName;
-        /// <summary>Request body, gzip-compressed when Compressed is true.</summary>
-        public byte[] Payload;
+        /// <summary>
+        /// Request body (gzip-compressed when Compressed is true): the first
+        /// PayloadLength bytes of PayloadBuffer, a buffer pooled by the storage
+        /// worker. Valid until the batch is completed; the transport copies it
+        /// straight into native memory, so no per-request managed copy is made.
+        /// </summary>
+        internal byte[] PayloadBuffer;
+        internal int PayloadLength;
+        private byte[] _payload;
+
+        /// <summary>Copy of the request body (allocates on first access; tests and diagnostics).</summary>
+        public byte[] Payload
+        {
+            get
+            {
+                if (_payload == null && PayloadBuffer != null)
+                {
+                    _payload = new byte[PayloadLength];
+                    Buffer.BlockCopy(PayloadBuffer, 0, _payload, 0, PayloadLength);
+                }
+                return _payload;
+            }
+        }
         public bool Compressed;
         public int EventCount;
         public int UncompressedBytes;
@@ -81,6 +102,8 @@ namespace OzxApm.Network
         private const int IdleWaitMs = 60000;
         private const float WarningIntervalSeconds = 60f;
         private const int MaxPooledBufferBytes = 256 * 1024;
+        /// <summary>Upper bound of events in one merged request (bytes are bounded by MaxBatchBytes).</summary>
+        public const int MaxEventsPerRequest = 1000;
 
         /// <summary>Memory-only mode keeps at most this much (CLAUDE.md: &lt; 5MB resident in total).</summary>
         public const long MemoryOnlyMaxBytes = 1024 * 1024;
@@ -1572,7 +1595,10 @@ namespace OzxApm.Network
                 return FinishBatch(batch);
             }
 
-            int batchSize = Math.Max(1, _config.BatchSize);
+            // A backlog is sent in requests of up to MaxBatchBytes (64KB) made of
+            // consecutive segments, not one request per small segment: fewer
+            // request frames on the main thread and fewer, larger inserts.
+            int maxEvents = MaxEventsPerRequest;
             int maxBytes = Math.Max(1024, _config.MaxBatchBytes);
             _bodyBuffer.Write(BatchPrefix, 0, BatchPrefix.Length);
 
@@ -1582,7 +1608,7 @@ namespace OzxApm.Network
                 if (segment.Legacy)
                     break;
                 if (s > 0 && segment.EventCount >= 0 &&
-                    (batch.EventCount + segment.EventCount > batchSize ||
+                    (batch.EventCount + segment.EventCount > maxEvents ||
                      _bodyBuffer.Length + segment.Bytes > maxBytes))
                     break;
 
@@ -1609,7 +1635,7 @@ namespace OzxApm.Network
                     }
                     break;
                 }
-                if (s > 0 && (batch.EventCount + added > batchSize || _bodyBuffer.Length + BatchSuffix.Length > maxBytes))
+                if (s > 0 && (batch.EventCount + added > maxEvents || _bodyBuffer.Length + BatchSuffix.Length > maxBytes))
                 {
                     _bodyBuffer.SetLength(mark); // would overflow the request
                     break;
@@ -1647,7 +1673,8 @@ namespace OzxApm.Network
                     {
                         gzip.Write(_bodyBuffer.GetBuffer(), 0, length);
                     }
-                    batch.Payload = _gzipBuffer.ToArray();
+                    batch.PayloadBuffer = _gzipBuffer.GetBuffer();
+                    batch.PayloadLength = (int)_gzipBuffer.Length;
                     batch.Compressed = true;
                 }
                 catch (Exception ex)
@@ -1655,8 +1682,11 @@ namespace OzxApm.Network
                     Warn($"Compression failed: {ex.Message}");
                 }
             }
-            if (batch.Payload == null)
-                batch.Payload = _bodyBuffer.ToArray();
+            if (batch.PayloadBuffer == null)
+            {
+                batch.PayloadBuffer = _bodyBuffer.GetBuffer();
+                batch.PayloadLength = length;
+            }
 
             TrimPooledBuffers();
             return batch;
@@ -1709,7 +1739,9 @@ namespace OzxApm.Network
                 if (segment.Path == null)
                     return false;
 
-                using (var fs = new FileStream(segment.Path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                // bufferSize 1: we read straight into the pooled buffer, so skip
+                // FileStream's own 4KB buffer (one per segment read).
+                using (var fs = new FileStream(segment.Path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite, 1))
                 {
                     long size = fs.Length;
                     if (size > int.MaxValue / 2)

@@ -1,5 +1,7 @@
 using System;
 using System.Globalization;
+using System.Text;
+using Unity.Collections;
 using Unity.Profiling;
 using UnityEngine;
 using UnityEngine.Networking;
@@ -31,13 +33,21 @@ namespace OzxApm.Network
         string Error { get; }
         string ResponseBody { get; }
         string RetryAfter { get; }
+        /// <summary>Copies up to dst.Length bytes of the response body into dst (no allocation). Returns the count.</summary>
+        int CopyResponse(byte[] dst);
+        /// <summary>Starts the request (UnityWebRequest.SendWebRequest).</summary>
+        void Start();
         void Abort();
     }
 
     /// <summary>Starts upload requests. The default implementation uses UnityWebRequest.</summary>
     public interface IUploadTransport
     {
-        IUploadRequest Send(string url, byte[] payload, bool compressed, string appKey, int timeoutSeconds);
+        /// <summary>
+        /// Builds (does not start) a request for the first <paramref name="length"/> bytes
+        /// of <paramref name="payload"/>; the buffer may be reused afterwards. Start() sends it.
+        /// </summary>
+        IUploadRequest Create(string url, byte[] payload, int length, bool compressed, string appKey, int timeoutSeconds);
     }
 
     /// <summary>
@@ -47,7 +57,8 @@ namespace OzxApm.Network
     /// - Uploads start InitialUploadDelaySeconds after Initialize, or earlier
     ///   when the game marks TTI or calls Flush, so they stay out of the way of
     ///   the game's own loading.
-    /// - The backlog is drained at most one request per UploadIntervalSeconds.
+    /// - A backlog is sent in merged requests of up to MaxBatchBytes, at most one
+    ///   per UploadIntervalSeconds and on average UploadBytesPerSecond.
     /// - Failures are retried with exponential backoff with full jitter
     ///   (RetryBaseDelaySeconds doubling up to RetryMaxDelaySeconds), honouring
     ///   Retry-After, and immediately when the network comes back or the app
@@ -58,11 +69,15 @@ namespace OzxApm.Network
     /// </summary>
     public class EventReporter
     {
+        // Each request's main-thread work is spread over separate frames
+        // (create, start, read result, dispose), so no single frame carries all of it.
         private enum State
         {
             Idle,
             WaitingForBatch,
-            Sending
+            Created,
+            Sending,
+            Disposing
         }
 
         // How often to look for newly sealed batches when there is nothing to send.
@@ -73,6 +88,13 @@ namespace OzxApm.Network
         private static readonly ProfilerMarker s_sendMarker = new ProfilerMarker("OzxApm.Upload.Send");
         private static readonly ProfilerMarker s_completeMarker = new ProfilerMarker("OzxApm.Upload.Complete");
         private static readonly ProfilerMarker s_pollMarker = new ProfilerMarker("OzxApm.Upload.Poll");
+        private static readonly ProfilerMarker s_readMarker = new ProfilerMarker("OzxApm.Upload.Complete.Read");
+        private static readonly ProfilerMarker s_disposeMarker = new ProfilerMarker("OzxApm.Upload.Dispose");
+        private static readonly ProfilerMarker s_startMarker = new ProfilerMarker("OzxApm.Upload.Start");
+
+        private static readonly byte[] RetryKey = Encoding.ASCII.GetBytes("\"retry\"");
+        private static readonly byte[] RejectCodeKey = Encoding.ASCII.GetBytes("\"reject_code\"");
+        private static readonly byte[] TrueLiteral = Encoding.ASCII.GetBytes("true");
 
         private readonly ApmConfig _config;
         private readonly OfflineStorage _storage;
@@ -89,6 +111,9 @@ namespace OzxApm.Network
         private int _consecutiveFailures;
 
         private IUploadRequest _request;
+        private IUploadRequest _finished; // completed request, disposed on the next frame
+        // Response bodies are small JSON objects; the verdict fields come first.
+        private readonly byte[] _responseBuffer = new byte[1024];
         private UploadBatch _batch;
         private float _requestStartTime;
 
@@ -98,7 +123,9 @@ namespace OzxApm.Network
         public int ConsecutiveFailures => _consecutiveFailures;
         /// <summary>Main-thread cost of the last request start / completion (Stopwatch ticks).</summary>
         public long LastSendTicks { get; private set; }
+        public long LastStartTicks { get; private set; }
         public long LastCompleteTicks { get; private set; }
+        public long LastDisposeTicks { get; private set; }
         public bool IsSending => _state == State.Sending;
         /// <summary>Time (on the reporter's clock) of the next upload attempt.</summary>
         public float NextAttemptTime => Mathf.Max(_nextAttemptTime, _uploadsAllowedAt);
@@ -186,6 +213,15 @@ namespace OzxApm.Network
                     }
                     break;
 
+                case State.Created:
+                    {
+                        long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+                        using (s_startMarker.Auto())
+                            StartRequest(now);
+                        LastStartTicks = System.Diagnostics.Stopwatch.GetTimestamp() - t0;
+                    }
+                    break;
+
                 case State.Sending:
                     if (_request != null && _request.IsDone)
                     {
@@ -193,6 +229,16 @@ namespace OzxApm.Network
                         using (s_completeMarker.Auto())
                             OnRequestDone(now);
                         LastCompleteTicks = System.Diagnostics.Stopwatch.GetTimestamp() - t0;
+                    }
+                    break;
+
+                case State.Disposing:
+                    {
+                        long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+                        using (s_disposeMarker.Auto())
+                            DisposeFinished();
+                        LastDisposeTicks = System.Diagnostics.Stopwatch.GetTimestamp() - t0;
+                        _state = State.Idle;
                     }
                     break;
             }
@@ -222,6 +268,7 @@ namespace OzxApm.Network
         /// </summary>
         public void Shutdown()
         {
+            DisposeFinished();
             if (_request != null)
             {
                 try
@@ -253,13 +300,13 @@ namespace OzxApm.Network
                 if (_networkLogger != null && _networkLogger.IsEnabled)
                 {
                     if (batch.Compressed)
-                        _networkLogger.LogCompression(batch.UncompressedBytes, batch.Payload.Length);
-                    _networkLogger.LogRequest(_ingestUrl, "POST", null, batch.DebugJson, batch.Payload.Length, batch.Compressed);
+                        _networkLogger.LogCompression(batch.UncompressedBytes, batch.PayloadLength);
+                    _networkLogger.LogRequest(_ingestUrl, "POST", null, batch.DebugJson, batch.PayloadLength, batch.Compressed);
                 }
 
-                _request = _transport.Send(_ingestUrl, batch.Payload, batch.Compressed, _config.AppKey,
-                    Mathf.Max(1, (int)_config.RequestTimeoutSeconds));
-                _state = State.Sending;
+                _request = _transport.Create(_ingestUrl, batch.PayloadBuffer, batch.PayloadLength, batch.Compressed,
+                    _config.AppKey, Mathf.Max(1, (int)_config.RequestTimeoutSeconds));
+                _state = State.Created; // started on the next frame
             }
             catch (Exception ex)
             {
@@ -267,6 +314,30 @@ namespace OzxApm.Network
                 _request = null;
                 Finish(UploadOutcome.Retry, now, 0f);
             }
+        }
+
+        private void StartRequest(float now)
+        {
+            try
+            {
+                _request.Start();
+                _state = State.Sending;
+            }
+            catch (Exception ex)
+            {
+                ApmClient.Log(LogLevel.Warning, $"Failed to start upload: {ex.Message}");
+                try { _request.Dispose(); } catch { }
+                _request = null;
+                Finish(UploadOutcome.Retry, now, 0f);
+            }
+        }
+
+        private void DisposeFinished()
+        {
+            if (_finished == null)
+                return;
+            try { _finished.Dispose(); } catch { }
+            _finished = null;
         }
 
         private void OnRequestDone(float now)
@@ -279,29 +350,36 @@ namespace OzxApm.Network
             string body = null;
             string error = null;
             float retryAfter = 0f;
+            bool wantText = _networkLogger != null && _networkLogger.IsEnabled;
             try
             {
-                code = request.ResponseCode;
-                body = request.ResponseBody;
-                error = request.Error;
-                outcome = Classify(code, request.TransportError, body);
-                if (code == 429 || code == 503)
-                    retryAfter = ParseRetryAfter(request.RetryAfter);
+                using (s_readMarker.Auto())
+                {
+                    // Classify from the raw response bytes: no strings unless they are logged.
+                    code = request.ResponseCode;
+                    int length = request.CopyResponse(_responseBuffer);
+                    outcome = Classify(code, request.TransportError, _responseBuffer, length);
+                    if (code == 429 || code == 503)
+                        retryAfter = ParseRetryAfter(request.RetryAfter);
+                    if (wantText)
+                    {
+                        body = request.ResponseBody;
+                        error = request.Error;
+                    }
+                }
             }
             catch (Exception ex)
             {
                 error = ex.Message;
                 outcome = UploadOutcome.Retry;
             }
-            finally
-            {
-                try { request.Dispose(); } catch { }
-            }
+            _finished = request; // disposed on the next frame
 
             double elapsedMs = (now - _requestStartTime) * 1000.0;
             int eventCount = _batch != null ? _batch.EventCount : 0;
 
             Finish(outcome, now, retryAfter);
+            _state = State.Disposing;
 
             if (outcome == UploadOutcome.Delivered)
             {
@@ -321,6 +399,7 @@ namespace OzxApm.Network
 
         private void Finish(UploadOutcome outcome, float now, float retryAfterSeconds)
         {
+            int batchBytes = _batch != null ? _batch.UncompressedBytes : 0;
             if (_batch != null)
             {
                 _storage.CompleteUpload(_batch, outcome);
@@ -330,9 +409,13 @@ namespace OzxApm.Network
 
             if (outcome == UploadOutcome.Delivered)
             {
-                // Pace the backlog drain.
+                // Pace the backlog drain by volume: a backlog goes out in large
+                // merged requests (up to MaxBatchBytes), spaced so the average rate
+                // stays at UploadBytesPerSecond. Each request costs two main-thread
+                // frames (start, finish); fewer, larger requests keep those frames
+                // rare without slowing the drain.
                 _consecutiveFailures = 0;
-                _nextAttemptTime = now + Mathf.Max(0f, _config.UploadIntervalSeconds);
+                _nextAttemptTime = now + ComputeUploadGapSeconds(batchBytes, _config.UploadIntervalSeconds, _config.UploadBytesPerSecond);
                 return;
             }
 
@@ -343,6 +426,18 @@ namespace OzxApm.Network
                 _config.RetryMaxDelaySeconds, (float)_random.NextDouble());
             delay = Mathf.Max(delay, Mathf.Max(_config.UploadIntervalSeconds, retryAfterSeconds));
             _nextAttemptTime = now + delay;
+        }
+
+        /// <summary>
+        /// Time until the next request after a delivered one carrying
+        /// <paramref name="bytes"/> uncompressed bytes.
+        /// </summary>
+        public static float ComputeUploadGapSeconds(int bytes, float minIntervalSeconds, int bytesPerSecond)
+        {
+            float gap = Mathf.Max(0f, minIntervalSeconds);
+            if (bytesPerSecond > 0)
+                gap = Mathf.Max(gap, (float)bytes / bytesPerSecond);
+            return gap;
         }
 
         /// <summary>
@@ -372,14 +467,21 @@ namespace OzxApm.Network
         /// </summary>
         public static UploadOutcome Classify(long httpStatus, bool transportError, string responseBody)
         {
+            var bytes = responseBody != null ? Encoding.UTF8.GetBytes(responseBody) : null;
+            return Classify(httpStatus, transportError, bytes, bytes != null ? bytes.Length : 0);
+        }
+
+        /// <summary>Allocation-free variant on the raw response bytes.</summary>
+        public static UploadOutcome Classify(long httpStatus, bool transportError, byte[] body, int length)
+        {
             if (transportError || httpStatus == 0)
                 return UploadOutcome.Retry;
 
             if (httpStatus >= 200 && httpStatus < 300)
-                return BoolField(responseBody, "retry") ? UploadOutcome.Retry : UploadOutcome.Delivered;
+                return IsTrueField(body, length, RetryKey) ? UploadOutcome.Retry : UploadOutcome.Delivered;
 
             if (httpStatus >= 400 && httpStatus < 500 && httpStatus != 408 && httpStatus != 429 &&
-                HasNonEmptyStringField(responseBody, "reject_code"))
+                IsNonEmptyStringField(body, length, RejectCodeKey))
                 return UploadOutcome.Rejected;
 
             return UploadOutcome.Retry;
@@ -395,57 +497,100 @@ namespace OzxApm.Network
             return 0f;
         }
 
-        private static int ValueStart(string json, string field)
+        /// <summary>Index of the first byte of the value of "key": in body, or -1.</summary>
+        private static int ValueStart(byte[] body, int length, byte[] key)
         {
-            if (string.IsNullOrEmpty(json))
+            if (body == null)
                 return -1;
-            int i = json.IndexOf("\"" + field + "\"", StringComparison.Ordinal);
-            if (i < 0)
-                return -1;
-            i += field.Length + 2;
-            while (i < json.Length && char.IsWhiteSpace(json[i])) i++;
-            if (i >= json.Length || json[i] != ':')
-                return -1;
-            i++;
-            while (i < json.Length && char.IsWhiteSpace(json[i])) i++;
-            return i < json.Length ? i : -1;
+            for (int i = 0; i <= length - key.Length; i++)
+            {
+                int k = 0;
+                while (k < key.Length && body[i + k] == key[k])
+                    k++;
+                if (k != key.Length)
+                    continue;
+                int j = SkipSpace(body, i + key.Length, length);
+                if (j >= length || body[j] != (byte)':')
+                    continue;
+                j = SkipSpace(body, j + 1, length);
+                return j < length ? j : -1;
+            }
+            return -1;
         }
 
-        private static bool BoolField(string json, string field)
+        private static int SkipSpace(byte[] b, int i, int length)
         {
-            int i = ValueStart(json, field);
-            return i >= 0 && string.CompareOrdinal(json, i, "true", 0, 4) == 0;
+            while (i < length && (b[i] == (byte)' ' || b[i] == (byte)'\t' || b[i] == (byte)'\r' || b[i] == (byte)'\n'))
+                i++;
+            return i;
         }
 
-        private static bool HasNonEmptyStringField(string json, string field)
+        private static bool IsTrueField(byte[] body, int length, byte[] key)
         {
-            int i = ValueStart(json, field);
-            return i >= 0 && i + 1 < json.Length && json[i] == '"' && json[i + 1] != '"';
+            int i = ValueStart(body, length, key);
+            if (i < 0 || i + TrueLiteral.Length > length)
+                return false;
+            for (int k = 0; k < TrueLiteral.Length; k++)
+            {
+                if (body[i + k] != TrueLiteral[k])
+                    return false;
+            }
+            return true;
+        }
+
+        private static bool IsNonEmptyStringField(byte[] body, int length, byte[] key)
+        {
+            int i = ValueStart(body, length, key);
+            return i >= 0 && i + 1 < length && body[i] == (byte)'"' && body[i + 1] != (byte)'"';
         }
     }
 
     /// <summary>
     /// UnityWebRequest-based transport. DNS and connect happen off the main thread.
+    /// The payload is copied once into a NativeArray whose ownership passes to the
+    /// upload handler (no managed copy per request), and the response is read from
+    /// the download handler's native buffer.
     /// </summary>
     internal sealed class UnityWebRequestTransport : IUploadTransport
     {
-        public IUploadRequest Send(string url, byte[] payload, bool compressed, string appKey, int timeoutSeconds)
+        private static readonly ProfilerMarker s_createMarker = new ProfilerMarker("OzxApm.Upload.Send.Create");
+        private static readonly ProfilerMarker s_headersMarker = new ProfilerMarker("OzxApm.Upload.Send.Headers");
+        private static readonly ProfilerMarker s_sendMarker = new ProfilerMarker("OzxApm.Upload.Send.SendWebRequest");
+
+        public IUploadRequest Create(string url, byte[] payload, int length, bool compressed, string appKey, int timeoutSeconds)
         {
-            var request = new UnityWebRequest(url, UnityWebRequest.kHttpVerbPOST)
+            UnityWebRequest request;
+            using (s_createMarker.Auto())
             {
-                uploadHandler = new UploadHandlerRaw(payload),
-                downloadHandler = new DownloadHandlerBuffer(),
-                timeout = timeoutSeconds
-            };
+                var data = new NativeArray<byte>(length, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
+                try
+                {
+                    NativeArray<byte>.Copy(payload, 0, data, 0, length);
+                    request = new UnityWebRequest(url, UnityWebRequest.kHttpVerbPOST)
+                    {
+                        uploadHandler = new UploadHandlerRaw(data, true), // takes ownership of data
+                        downloadHandler = new DownloadHandlerBuffer(),
+                        timeout = timeoutSeconds
+                    };
+                }
+                catch
+                {
+                    if (data.IsCreated)
+                        data.Dispose();
+                    throw;
+                }
+            }
             try
             {
-                request.SetRequestHeader("Content-Type", "application/json");
-                request.SetRequestHeader(ApmClient.SdkVersionHeader, ApmClient.SdkVersion);
-                if (!string.IsNullOrEmpty(appKey))
-                    request.SetRequestHeader("X-App-Key", appKey);
-                if (compressed)
-                    request.SetRequestHeader("Content-Encoding", "gzip");
-                request.SendWebRequest();
+                using (s_headersMarker.Auto())
+                {
+                    request.SetRequestHeader("Content-Type", "application/json");
+                    request.SetRequestHeader(ApmClient.SdkVersionHeader, ApmClient.SdkVersion);
+                    if (!string.IsNullOrEmpty(appKey))
+                        request.SetRequestHeader("X-App-Key", appKey);
+                    if (compressed)
+                        request.SetRequestHeader("Content-Encoding", "gzip");
+                }
                 return new Request(request);
             }
             catch
@@ -470,6 +615,25 @@ namespace OzxApm.Network
             public string Error => _request.error;
             public string ResponseBody => _request.downloadHandler != null ? _request.downloadHandler.text : null;
             public string RetryAfter => _request.GetResponseHeader("Retry-After");
+
+            public int CopyResponse(byte[] dst)
+            {
+                var handler = _request.downloadHandler;
+                if (handler == null)
+                    return 0;
+                var data = handler.nativeData;
+                int n = Math.Min(dst.Length, data.Length);
+                for (int i = 0; i < n; i++)
+                    dst[i] = data[i];
+                return n;
+            }
+
+            public void Start()
+            {
+                using (s_sendMarker.Auto())
+                    _request.SendWebRequest(); // async: DNS/connect happen off the main thread
+            }
+
             public void Abort() => _request.Abort();
             public void Dispose() => _request.Dispose();
         }

@@ -54,6 +54,21 @@ namespace OzxApm.Tests
         }
 
         [Test]
+        public void Classify_FromBytes_HandlesWhitespaceAndCutOffBodies()
+        {
+            Func<string, byte[]> b = System.Text.Encoding.ASCII.GetBytes;
+            var retry = b("{\"stored\":false,\"retry\" : true}");
+            Assert.AreEqual(UploadOutcome.Retry, EventReporter.Classify(200, false, retry, retry.Length));
+            var cut = b("{\"retry\":tru"); // cut off
+            Assert.AreEqual(UploadOutcome.Delivered, EventReporter.Classify(200, false, cut, cut.Length));
+            var reject = b("{\"reject_code\":\"x\"}");
+            Assert.AreEqual(UploadOutcome.Rejected, EventReporter.Classify(400, false, reject, reject.Length));
+            Assert.AreEqual(UploadOutcome.Retry, EventReporter.Classify(400, false, reject, 0));
+            // A length shorter than the buffer is honoured (pooled buffer with stale bytes).
+            Assert.AreEqual(UploadOutcome.Delivered, EventReporter.Classify(200, false, retry, 10));
+        }
+
+        [Test]
         public void Classify_TransientFailures_AreRetried()
         {
             Assert.AreEqual(UploadOutcome.Retry, EventReporter.Classify(0, true, null));
@@ -71,6 +86,14 @@ namespace OzxApm.Tests
             Assert.AreEqual(20f, EventReporter.ComputeBackoffSeconds(4, 5f, 300f, 0.5f), 0.001f);
             Assert.AreEqual(1f, EventReporter.ComputeBackoffSeconds(4, 5f, 300f, 0f), 0.001f); // floor
             Assert.AreEqual(300f, EventReporter.ComputeBackoffSeconds(1000, 5f, 300f, 1f), 0.001f);
+        }
+
+        [Test]
+        public void UploadGap_ScalesWithRequestSize()
+        {
+            Assert.AreEqual(1f, EventReporter.ComputeUploadGapSeconds(900, 1f, 8192), 0.001f, "small requests: min interval");
+            Assert.AreEqual(8f, EventReporter.ComputeUploadGapSeconds(64 * 1024, 1f, 8192), 0.001f, "64KB at 8KB/s");
+            Assert.AreEqual(1f, EventReporter.ComputeUploadGapSeconds(64 * 1024, 1f, 0), 0.001f, "rate limit disabled");
         }
 
         [Test]
@@ -112,7 +135,17 @@ namespace OzxApm.Tests
             public bool Aborted;
             public byte[] Payload;
             public bool Compressed;
+            public bool Started;
+            public void Start() { Started = true; }
             public void Abort() { Aborted = true; }
+            public int CopyResponse(byte[] dst)
+            {
+                if (ResponseBody == null) return 0;
+                var bytes = System.Text.Encoding.UTF8.GetBytes(ResponseBody);
+                int n = Math.Min(dst.Length, bytes.Length);
+                Array.Copy(bytes, dst, n);
+                return n;
+            }
             public void Dispose() { }
 
             public void Respond(long code, string body = null, string retryAfter = null)
@@ -136,10 +169,12 @@ namespace OzxApm.Tests
             public readonly List<FakeRequest> Requests = new List<FakeRequest>();
             public string LastAppKey;
 
-            public IUploadRequest Send(string url, byte[] payload, bool compressed, string appKey, int timeoutSeconds)
+            public IUploadRequest Create(string url, byte[] payload, int length, bool compressed, string appKey, int timeoutSeconds)
             {
                 LastAppKey = appKey;
-                var request = new FakeRequest { Payload = payload, Compressed = compressed };
+                var copy = new byte[length]; // the caller's buffer is reused
+                Array.Copy(payload, copy, length);
+                var request = new FakeRequest { Payload = copy, Compressed = compressed };
                 Requests.Add(request);
                 return request;
             }
@@ -161,7 +196,8 @@ namespace OzxApm.Tests
             {
                 ServerUrl = "http://test",
                 AppKey = "key",
-                BatchSize = 1, // one event per request, so batches are countable
+                BatchSize = 1,
+                MaxBatchBytes = 1024, // with ~900-byte events: one event per request, so requests are countable
                 FlushIntervalSeconds = 3600f,
                 EnableCompression = false,
                 InitialUploadDelaySeconds = 10f,
@@ -201,7 +237,7 @@ namespace OzxApm.Tests
                 {
                     event_id = Guid.NewGuid().ToString("N"),
                     timestamp = 1700000000000,
-                    app_version = "1",
+                    app_version = new string('v', 800), // see MaxBatchBytes above
                     platform = "Android",
                     session_id = "s",
                     device_id = "d"

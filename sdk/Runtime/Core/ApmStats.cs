@@ -27,5 +27,8 @@ namespace OzxApm.Core
         /// <summary>Main-thread cost of the last upload start / completion, in milliseconds.</summary>
         public double LastUploadSendMs;
         public double LastUploadCompleteMs;
+        /// <summary>Main-thread cost of the last SendWebRequest call / request dispose, in milliseconds.</summary>
+        public double LastUploadStartMs;
+        public double LastUploadDisposeMs;
     }
 }

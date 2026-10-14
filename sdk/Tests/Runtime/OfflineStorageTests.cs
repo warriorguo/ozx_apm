@@ -72,6 +72,14 @@ namespace OzxApm.Tests
             };
         }
 
+        // ~900-byte event: with MaxBatchBytes = 1024 every request carries exactly one.
+        private static PerfSampleEvent BigPerf(float fps)
+        {
+            var e = Perf(fps);
+            e.app_version = new string('v', 800);
+            return e;
+        }
+
         private string[] SegmentFiles()
         {
             if (!Directory.Exists(_dir))
@@ -229,9 +237,10 @@ namespace OzxApm.Tests
         public void OnlyOneBatchIsInFlight()
         {
             _config.BatchSize = 1;
+            _config.MaxBatchBytes = 1024; // one event per request
             var store = NewStore();
-            store.Enqueue(Perf(1));
-            store.Enqueue(Perf(2));
+            store.Enqueue(BigPerf(1));
+            store.Enqueue(BigPerf(2));
             store.Pump();
 
             var first = TakeUpload(store);
@@ -840,18 +849,42 @@ namespace OzxApm.Tests
         }
 
         [Test]
-        public void MergedUpload_RespectsBatchSize()
+        public void Backlog_IsMergedUpToMaxBatchBytes_NotBatchSize()
         {
-            _config.BatchSize = 5;
+            _config.BatchSize = 5; // segments seal at 5 events...
             var store = NewStore();
-            for (int s = 0; s < 3; s++)
+            for (int i = 0; i < 40; i++) store.Enqueue(Perf(i));
+            store.Pump();
+            Assert.AreEqual(8, SegmentFiles().Length);
+
+            var batch = TakeUpload(store);
+            Assert.AreEqual(40, batch.EventCount, "...but a backlog goes out in one request of up to 64KB");
+            store.CompleteUpload(batch, UploadOutcome.Delivered);
+            store.Pump();
+            Assert.AreEqual(0, SegmentFiles().Length);
+        }
+
+        [Test]
+        public void MergedUpload_NeverExceedsMaxBatchBytes()
+        {
+            _config.BatchSize = 2;
+            _config.MaxBatchBytes = 2048;
+            var store = NewStore();
+            for (int i = 0; i < 60; i++) store.Enqueue(Perf(i));
+            store.Pump();
+
+            int total = 0;
+            for (int guard = 0; guard < 100; guard++)
             {
-                for (int i = 0; i < 2; i++) store.Enqueue(Perf(i));
-                store.Flush();
+                var batch = TakeUpload(store);
+                if (batch == null) break;
+                Assert.LessOrEqual(batch.UncompressedBytes, 2048);
+                Assert.Greater(batch.EventCount, 2, "merges more than one segment");
+                total += batch.EventCount;
+                store.CompleteUpload(batch, UploadOutcome.Delivered);
                 store.Pump();
             }
-            var batch = TakeUpload(store);
-            Assert.AreEqual(4, batch.EventCount, "2+2 fit, the third segment would exceed 5");
+            Assert.AreEqual(60, total);
         }
 
         [Test]
@@ -963,9 +996,10 @@ namespace OzxApm.Tests
         public void ConsentWithdrawnMidUpload_CompletesButStartsNothing()
         {
             _config.BatchSize = 1;
+            _config.MaxBatchBytes = 1024; // one event per request
             var store = NewStore();
-            store.Enqueue(Perf(1));
-            store.Enqueue(Perf(2));
+            store.Enqueue(BigPerf(1));
+            store.Enqueue(BigPerf(2));
             store.Pump();
             var batch = TakeUpload(store);
 

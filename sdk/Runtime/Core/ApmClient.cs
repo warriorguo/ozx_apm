@@ -414,6 +414,8 @@ namespace OzxApm.Core
                 stats.UploadFailures = client._reporter.ConsecutiveFailures;
                 stats.LastUploadSendMs = client._reporter.LastSendTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
                 stats.LastUploadCompleteMs = client._reporter.LastCompleteTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+                stats.LastUploadStartMs = client._reporter.LastStartTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+                stats.LastUploadDisposeMs = client._reporter.LastDisposeTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
             }
             stats.LastUpdateMs = client._lastUpdateTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
             return stats;

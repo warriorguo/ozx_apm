@@ -141,6 +141,15 @@ namespace OzxApm.Core
         public float UploadIntervalSeconds { get; set; } = 1.0f;
 
         /// <summary>
+        /// Average upload rate (uncompressed bytes per second) while a stored backlog
+        /// is drained. The backlog goes out in merged requests of up to MaxBatchBytes,
+        /// spaced by their size: a 64KB request is followed by an 8 s pause at the
+        /// default, so a full 5MB backlog drains in about 11 minutes and each request's
+        /// main-thread work stays in well under 1% of frames.
+        /// </summary>
+        public int UploadBytesPerSecond { get; set; } = 8 * 1024;
+
+        /// <summary>
         /// Player consent. Nothing is enqueued, written to disk or uploaded unless Granted.
         /// Defaults to Granted (pre-APM-14 behaviour). Change at runtime with ApmClient.SetConsent.
         /// </summary>
