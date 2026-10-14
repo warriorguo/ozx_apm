@@ -1,8 +1,11 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
+	"io"
 	"net/http"
+	"strconv"
 	"time"
 
 	"go.uber.org/zap"
@@ -12,14 +15,49 @@ import (
 	"github.com/warriorguo/ozx_apm/server/internal/storage"
 )
 
+const (
+	// SDKVersionHeader is sent by SDKs that understand IngestResponse.Retry
+	// and keep batches until the server confirms them.
+	SDKVersionHeader = "X-Apm-Sdk-Version"
+
+	// RejectInvalidJSON: the body is not JSON at all; resending it can never succeed.
+	RejectInvalidJSON = "invalid_json"
+	// RejectTooLarge: the body exceeds maxIngestBodyBytes.
+	RejectTooLarge = "payload_too_large"
+
+	maxIngestBodyBytes = 8 << 20
+	// Seconds a client should wait before retrying after a storage failure.
+	storageRetryAfterSeconds = 30
+)
+
+// insertRetryDelays is the pause before each extra attempt of a failed table
+// insert. A failed insert is retried here before answering, so a transient
+// ClickHouse error does not make the client resend the whole batch (and
+// duplicate the tables that did succeed).
+var insertRetryDelays = []time.Duration{50 * time.Millisecond, 250 * time.Millisecond}
+
+// EventStore is the subset of the repository the ingest handler writes to.
+type EventStore interface {
+	InsertPerfSamples(ctx context.Context, samples []models.PerfSample) error
+	InsertJanks(ctx context.Context, janks []models.Jank) error
+	InsertStartups(ctx context.Context, startups []models.Startup) error
+	InsertSceneLoads(ctx context.Context, loads []models.SceneLoad) error
+	InsertExceptions(ctx context.Context, exceptions []models.Exception) error
+	InsertCrashes(ctx context.Context, crashes []models.Crash) error
+}
+
 type IngestHandler struct {
-	repo      *storage.Repository
+	repo      EventStore
 	validator *processor.Validator
 	enricher  *processor.Enricher
 	logger    *zap.Logger
 }
 
 func NewIngestHandler(repo *storage.Repository, logger *zap.Logger) *IngestHandler {
+	return newIngestHandler(repo, logger)
+}
+
+func newIngestHandler(repo EventStore, logger *zap.Logger) *IngestHandler {
 	return &IngestHandler{
 		repo:      repo,
 		validator: processor.NewValidator(),
@@ -37,24 +75,64 @@ type EventRequest struct {
 type EventWrapper struct {
 	Type      string `json:"type"`
 	Timestamp int64  `json:"timestamp"` // Unix milliseconds
+	EventID   string `json:"event_id"`  // set by SDKs that can de-duplicate retries
 }
 
+// IngestResponse tells the client what happened to the batch.
+//
+//   - Stored: every event that passed validation was written.
+//   - Retry: the client should keep the batch and send it again later
+//     (only set for clients whose events carry event_id, see below).
+//   - RejectCode: set, with HTTP 400, when the payload itself can never be
+//     accepted. Clients may discard the batch only on an explicit RejectCode,
+//     never on a bare 4xx from a proxy or middleware.
+//
+// Events rejected by validation are counted in Rejected and are not worth
+// retrying, so they do not make Stored false.
 type IngestResponse struct {
-	Accepted int      `json:"accepted"`
-	Rejected int      `json:"rejected"`
-	Errors   []string `json:"errors,omitempty"`
+	Accepted   int      `json:"accepted"`
+	Rejected   int      `json:"rejected"`
+	Failed     int      `json:"failed"`
+	Stored     bool     `json:"stored"`
+	Retry      bool     `json:"retry"`
+	RejectCode string   `json:"reject_code,omitempty"`
+	Errors     []string `json:"errors,omitempty"`
+}
+
+func writeIngestResponse(w http.ResponseWriter, status int, resp IngestResponse) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(resp)
 }
 
 func (h *IngestHandler) IngestEvents(w http.ResponseWriter, r *http.Request) {
-	var req EventRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+	if r.Body == nil {
+		http.Error(w, "missing body", http.StatusBadRequest)
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxIngestBodyBytes+1))
+	if err != nil {
+		// Truncated upload, broken gzip stream, ...: not provably the client's
+		// data, so no reject code and the client retries.
+		http.Error(w, "failed to read body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if len(body) > maxIngestBodyBytes {
+		writeIngestResponse(w, http.StatusRequestEntityTooLarge, IngestResponse{RejectCode: RejectTooLarge})
 		return
 	}
 
-	if len(req.Events) == 0 {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(IngestResponse{Accepted: 0})
+	rawEvents, salvaged, err := decodeEventBatch(body)
+	if err != nil {
+		writeIngestResponse(w, http.StatusBadRequest, IngestResponse{
+			RejectCode: RejectInvalidJSON,
+			Errors:     []string{"invalid JSON: " + err.Error()},
+		})
+		return
+	}
+
+	if len(rawEvents) == 0 {
+		writeIngestResponse(w, http.StatusOK, IngestResponse{Accepted: 0, Stored: true})
 		return
 	}
 
@@ -68,16 +146,23 @@ func (h *IngestHandler) IngestEvents(w http.ResponseWriter, r *http.Request) {
 		crashes     []models.Crash
 		errors      []string
 		rejected    int
+		hasEventIDs bool
+		reject      = func(i int, reason string) { rejected++; errors = append(errors, "event "+strconv.Itoa(i)+": "+reason) }
+		sdkVersion  = r.Header.Get(SDKVersionHeader)
+		clientIP    = r.RemoteAddr // In production, extract from X-Forwarded-For
 	)
+	if salvaged {
+		errors = append(errors, "batch was not valid JSON; salvaged the well-formed events")
+	}
 
-	clientIP := r.RemoteAddr // In production, extract from X-Forwarded-For
-
-	for i, rawEvent := range req.Events {
+	for i, rawEvent := range rawEvents {
 		var wrapper EventWrapper
 		if err := json.Unmarshal(rawEvent, &wrapper); err != nil {
-			errors = append(errors, "event "+string(rune(i))+": invalid format")
-			rejected++
+			reject(i, "invalid format")
 			continue
+		}
+		if wrapper.EventID != "" {
+			hasEventIDs = true
 		}
 
 		timestamp := time.UnixMilli(wrapper.Timestamp)
@@ -89,14 +174,14 @@ func (h *IngestHandler) IngestEvents(w http.ResponseWriter, r *http.Request) {
 		case models.EventTypePerfSample:
 			var event models.PerfSample
 			if err := json.Unmarshal(rawEvent, &event); err != nil {
-				rejected++
+				reject(i, "invalid fields")
 				continue
 			}
 			event.Timestamp = timestamp
 			event.Platform = h.enricher.NormalizePlatform(event.Platform)
 			event.DeviceModel = h.enricher.NormalizeDeviceModel(event.DeviceModel)
 			if err := h.validator.ValidatePerfSample(&event); err != nil {
-				rejected++
+				reject(i, err.Error())
 				continue
 			}
 			perfSamples = append(perfSamples, event)
@@ -104,14 +189,14 @@ func (h *IngestHandler) IngestEvents(w http.ResponseWriter, r *http.Request) {
 		case models.EventTypeJank:
 			var event models.Jank
 			if err := json.Unmarshal(rawEvent, &event); err != nil {
-				rejected++
+				reject(i, "invalid fields")
 				continue
 			}
 			event.Timestamp = timestamp
 			event.Platform = h.enricher.NormalizePlatform(event.Platform)
 			event.DeviceModel = h.enricher.NormalizeDeviceModel(event.DeviceModel)
 			if err := h.validator.ValidateJank(&event); err != nil {
-				rejected++
+				reject(i, err.Error())
 				continue
 			}
 			janks = append(janks, event)
@@ -119,14 +204,14 @@ func (h *IngestHandler) IngestEvents(w http.ResponseWriter, r *http.Request) {
 		case models.EventTypeStartup:
 			var event models.Startup
 			if err := json.Unmarshal(rawEvent, &event); err != nil {
-				rejected++
+				reject(i, "invalid fields")
 				continue
 			}
 			event.Timestamp = timestamp
 			event.Platform = h.enricher.NormalizePlatform(event.Platform)
 			event.DeviceModel = h.enricher.NormalizeDeviceModel(event.DeviceModel)
 			if err := h.validator.ValidateStartup(&event); err != nil {
-				rejected++
+				reject(i, err.Error())
 				continue
 			}
 			startups = append(startups, event)
@@ -134,14 +219,14 @@ func (h *IngestHandler) IngestEvents(w http.ResponseWriter, r *http.Request) {
 		case models.EventTypeSceneLoad:
 			var event models.SceneLoad
 			if err := json.Unmarshal(rawEvent, &event); err != nil {
-				rejected++
+				reject(i, "invalid fields")
 				continue
 			}
 			event.Timestamp = timestamp
 			event.Platform = h.enricher.NormalizePlatform(event.Platform)
 			event.DeviceModel = h.enricher.NormalizeDeviceModel(event.DeviceModel)
 			if err := h.validator.ValidateSceneLoad(&event); err != nil {
-				rejected++
+				reject(i, err.Error())
 				continue
 			}
 			sceneLoads = append(sceneLoads, event)
@@ -149,14 +234,14 @@ func (h *IngestHandler) IngestEvents(w http.ResponseWriter, r *http.Request) {
 		case models.EventTypeException:
 			var event models.Exception
 			if err := json.Unmarshal(rawEvent, &event); err != nil {
-				rejected++
+				reject(i, "invalid fields")
 				continue
 			}
 			event.Timestamp = timestamp
 			event.Platform = h.enricher.NormalizePlatform(event.Platform)
 			event.DeviceModel = h.enricher.NormalizeDeviceModel(event.DeviceModel)
 			if err := h.validator.ValidateException(&event); err != nil {
-				rejected++
+				reject(i, err.Error())
 				continue
 			}
 			exceptions = append(exceptions, event)
@@ -164,69 +249,98 @@ func (h *IngestHandler) IngestEvents(w http.ResponseWriter, r *http.Request) {
 		case models.EventTypeCrash:
 			var event models.Crash
 			if err := json.Unmarshal(rawEvent, &event); err != nil {
-				rejected++
+				reject(i, "invalid fields")
 				continue
 			}
 			event.Timestamp = timestamp
 			event.Platform = h.enricher.NormalizePlatform(event.Platform)
 			event.DeviceModel = h.enricher.NormalizeDeviceModel(event.DeviceModel)
 			if err := h.validator.ValidateCrash(&event); err != nil {
-				rejected++
+				reject(i, err.Error())
 				continue
 			}
 			crashes = append(crashes, event)
 
 		default:
-			rejected++
+			reject(i, "unknown type")
 		}
 	}
 
-	// Insert events into ClickHouse
+	// Insert events into ClickHouse. Each table insert is retried here
+	// before answering. Only events whose insert succeeded count as accepted.
 	ctx := r.Context()
+	var accepted, failed int
 
-	if len(perfSamples) > 0 {
-		if err := h.repo.InsertPerfSamples(ctx, perfSamples); err != nil {
-			h.logger.Error("failed to insert perf samples", zap.Error(err))
+	insert := func(kind string, n int, fn func() error) {
+		if n == 0 {
+			return
 		}
-	}
-	if len(janks) > 0 {
-		if err := h.repo.InsertJanks(ctx, janks); err != nil {
-			h.logger.Error("failed to insert janks", zap.Error(err))
+		if err := h.insertWithRetry(ctx, fn); err != nil {
+			h.logger.Error("failed to insert "+kind, zap.Error(err), zap.Int("count", n), zap.String("sdk_version", sdkVersion))
+			failed += n
+			errors = append(errors, "storage error: "+kind)
+			return
 		}
-	}
-	if len(startups) > 0 {
-		if err := h.repo.InsertStartups(ctx, startups); err != nil {
-			h.logger.Error("failed to insert startups", zap.Error(err))
-		}
-	}
-	if len(sceneLoads) > 0 {
-		if err := h.repo.InsertSceneLoads(ctx, sceneLoads); err != nil {
-			h.logger.Error("failed to insert scene loads", zap.Error(err))
-		}
-	}
-	if len(exceptions) > 0 {
-		if err := h.repo.InsertExceptions(ctx, exceptions); err != nil {
-			h.logger.Error("failed to insert exceptions", zap.Error(err))
-		}
-	}
-	if len(crashes) > 0 {
-		if err := h.repo.InsertCrashes(ctx, crashes); err != nil {
-			h.logger.Error("failed to insert crashes", zap.Error(err))
-		}
+		accepted += n
 	}
 
-	accepted := len(perfSamples) + len(janks) + len(startups) + len(sceneLoads) + len(exceptions) + len(crashes)
+	insert("perf samples", len(perfSamples), func() error { return h.repo.InsertPerfSamples(ctx, perfSamples) })
+	insert("janks", len(janks), func() error { return h.repo.InsertJanks(ctx, janks) })
+	insert("startups", len(startups), func() error { return h.repo.InsertStartups(ctx, startups) })
+	insert("scene loads", len(sceneLoads), func() error { return h.repo.InsertSceneLoads(ctx, sceneLoads) })
+	insert("exceptions", len(exceptions), func() error { return h.repo.InsertExceptions(ctx, exceptions) })
+	insert("crashes", len(crashes), func() error { return h.repo.InsertCrashes(ctx, crashes) })
+
+	resp := IngestResponse{
+		Accepted: accepted,
+		Rejected: rejected,
+		Failed:   failed,
+		Stored:   failed == 0,
+		Errors:   errors,
+	}
+	status := http.StatusOK
+
+	if failed > 0 {
+		if hasEventIDs || sdkVersion != "" {
+			// The client keeps the batch and resends it. Tables that did
+			// succeed are written again; their events carry event_id, so the
+			// duplicates can be removed (APM-12).
+			resp.Retry = true
+			status = http.StatusServiceUnavailable
+			w.Header().Set("Retry-After", strconv.Itoa(storageRetryAfterSeconds))
+		} else {
+			// Old SDK: no event_id, so a resend could never be de-duplicated,
+			// and old clients only look at the status code. Keep the previous
+			// behaviour (200, client drops the batch) and make the loss visible.
+			h.logger.Error("dropping events from a legacy client after storage failure",
+				zap.Int("failed", failed), zap.Int("accepted", accepted), zap.String("client_ip", clientIP))
+		}
+	}
 
 	h.logger.Info("ingested events",
 		zap.Int("accepted", accepted),
 		zap.Int("rejected", rejected),
+		zap.Int("failed", failed),
+		zap.String("sdk_version", sdkVersion),
 		zap.String("client_ip", clientIP),
 	)
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(IngestResponse{
-		Accepted: accepted,
-		Rejected: rejected,
-		Errors:   errors,
-	})
+	writeIngestResponse(w, status, resp)
+}
+
+func (h *IngestHandler) insertWithRetry(ctx context.Context, fn func() error) error {
+	err := fn()
+	for _, delay := range insertRetryDelays {
+		if err == nil {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return err
+		case <-time.After(delay):
+		}
+		h.logger.Warn("retrying insert", zap.Error(err))
+		err = fn()
+	}
+	return err
 }

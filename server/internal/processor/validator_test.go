@@ -79,9 +79,22 @@ func TestValidator_ValidatePerfSample(t *testing.T) {
 			wantErr: true,
 		},
 		{
+			// Offline players upload late; anything inside the 30-day
+			// retention window must still be accepted.
+			name: "late upload within retention window",
+			sample: &models.PerfSample{
+				Timestamp:  time.Now().Add(-20 * 24 * time.Hour),
+				AppVersion: "1.0.0",
+				Platform:   "Android",
+				DeviceID:   "device123",
+				SessionID:  "session123",
+			},
+			wantErr: false,
+		},
+		{
 			name: "timestamp too old",
 			sample: &models.PerfSample{
-				Timestamp:  time.Now().Add(-8 * 24 * time.Hour),
+				Timestamp:  time.Now().Add(-31 * 24 * time.Hour),
 				AppVersion: "1.0.0",
 				Platform:   "Android",
 				DeviceID:   "device123",
@@ -336,5 +349,34 @@ func TestNewValidator(t *testing.T) {
 	v := NewValidator()
 	if v == nil {
 		t.Error("expected non-nil validator")
+	}
+}
+
+func TestValidator_AgeBoundary(t *testing.T) {
+	v := NewValidator()
+	sample := func(age time.Duration) *models.PerfSample {
+		return &models.PerfSample{
+			Timestamp:  time.Now().Add(-age),
+			AppVersion: "1.0.0",
+			Platform:   "Android",
+			DeviceID:   "device123",
+			SessionID:  "session123",
+		}
+	}
+
+	if MaxEventAge != 30*24*time.Hour {
+		t.Fatalf("MaxEventAge = %v, want 30 days (detail retention)", MaxEventAge)
+	}
+	if err := v.ValidatePerfSample(sample(MaxEventAge - time.Minute)); err != nil {
+		t.Errorf("event just inside the window rejected: %v", err)
+	}
+	if err := v.ValidatePerfSample(sample(MaxEventAge + time.Minute)); err == nil {
+		t.Error("event just outside the window accepted")
+	}
+	if err := v.ValidatePerfSample(sample(-59 * time.Minute)); err != nil {
+		t.Errorf("small forward clock skew rejected: %v", err)
+	}
+	if err := v.ValidatePerfSample(sample(-61 * time.Minute)); err == nil {
+		t.Error("timestamp more than 1h in the future accepted")
 	}
 }
