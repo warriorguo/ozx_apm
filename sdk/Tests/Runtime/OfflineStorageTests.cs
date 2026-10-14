@@ -685,6 +685,98 @@ namespace OzxApm.Tests
             Assert.Greater(store.DroppedEventCount, 0);
         }
 
+        private static ExceptionEvent Exc(int i)
+        {
+            return new ExceptionEvent
+            {
+                event_id = Guid.NewGuid().ToString("N"), timestamp = 1, app_version = "1", platform = "Android",
+                session_id = "s", device_id = "d", fingerprint = "f" + i, message = "boom " + i, count = 1
+            };
+        }
+
+        [Test]
+        public void Cap_KeepsExceptions_EvenWhenTheyArriveContinuously()
+        {
+            // One exception every 10 events: with mixed segments every segment would
+            // contain one and the cap could not prefer anything.
+            _config.MaxOfflineStorageBytes = 16 * 1024;
+            var store = NewStore();
+            var excIds = new List<string>();
+            for (int i = 0; i < 600; i++)
+            {
+                if (i % 10 == 0)
+                {
+                    var e = Exc(i);
+                    excIds.Add(e.event_id);
+                    store.Enqueue(e);
+                }
+                else
+                {
+                    store.Enqueue(Perf(i));
+                }
+                if (i % 20 == 0) store.Pump();
+            }
+            store.Flush();
+            store.Pump();
+
+            string all = string.Concat(SegmentFiles().Select(File.ReadAllText));
+            Assert.LessOrEqual(store.GetStorageSize(), 16 * 1024);
+            Assert.Greater(store.DroppedEventCount, 0, "the cap was hit");
+            CollectionAssert.IsSubsetOf(excIds, EventIds(all), "every exception survives; perf samples are evicted");
+        }
+
+        [Test]
+        public void WriteFailure_WithBothSegmentKinds_LosesAndDuplicatesNothing()
+        {
+            var store = NewStore();
+            var ids = new List<string>();
+            int calls = 0;
+            OfflineStorage.BeforeWriteHook = stream =>
+            {
+                if (++calls == 2) // the second commit of this pump fails mid-write
+                {
+                    var partial = Encoding.UTF8.GetBytes("{\"type\":\"perf_sa");
+                    stream.Write(partial, 0, partial.Length);
+                    throw new IOException("Disk full");
+                }
+            };
+            for (int i = 0; i < 30; i++)
+            {
+                BaseEvent e = i % 3 == 0 ? (BaseEvent)Exc(i) : Perf(i);
+                ids.Add(e.event_id);
+                store.Enqueue(e);
+            }
+            store.Pump();
+            OfflineStorage.BeforeWriteHook = null;
+            store.ResetWriteBackoffForTests();
+            store.Pump();
+
+            foreach (var f in SegmentFiles())
+                AssertEveryLineIsValidJson(f);
+            var stored = EventIds(string.Concat(SegmentFiles().Select(File.ReadAllText)));
+            CollectionAssert.AreEquivalent(ids, stored, "every event exactly once");
+            var seqs = SegmentFiles().SelectMany(f => Seqs(File.ReadAllText(f))).ToList();
+            Assert.AreEqual(seqs.Count, seqs.Distinct().Count());
+        }
+
+        [Test]
+        public void Seq_LostSeqFile_WithInterleavedSegmentKinds_NeverReused()
+        {
+            var first = NewStore();
+            first.Enqueue(Exc(0));                     // high-value segment opened first...
+            for (int i = 0; i < 45; i++) first.Enqueue(Perf(i)); // ...low-value segments roll after it
+            first.Enqueue(Exc(1));                     // newest seq lands in the older (high) segment
+            first.Pump();
+            first.SimulateCrashForTests();
+            long maxBefore = SegmentFiles().SelectMany(f => Seqs(File.ReadAllText(f))).Max();
+            File.Delete(Path.Combine(_dir, "seq"));
+
+            var second = NewStore();
+            second.Enqueue(Perf(99));
+            second.Pump();
+            Assert.Greater(second.LastSeq, maxBefore);
+        }
+
         [Test]
         public void Cap_CountsDroppedEventsOfSegmentsFromEarlierLaunches()
         {

@@ -135,11 +135,27 @@ namespace OzxApm.Network
         private readonly List<Completion> _completionDrain = new List<Completion>();
         private readonly List<Segment> _segments = new List<Segment>(); // sealed, oldest first
         private readonly HashSet<string> _inFlight = new HashSet<string>(StringComparer.Ordinal);
-        private Segment _open;
-        private FileStream _openStream;
-        private readonly MemoryStream _lineBuffer = new MemoryStream(16 * 1024);
-        private int _lineBufferEvents;
-        private bool _lineBufferHighValue;
+        // Two open segments: exceptions/crashes/startup go to their own segments so
+        // the storage cap can evict perf samples first even when exceptions arrive
+        // continuously (a mixed segment would always count as high value).
+        private readonly SegmentWriter _lowWriter = new SegmentWriter(false);
+        private readonly SegmentWriter _highWriter = new SegmentWriter(true);
+
+        private sealed class SegmentWriter
+        {
+            public readonly bool High;
+            public Segment Open;
+            public FileStream Stream;
+            public readonly MemoryStream Buffer = new MemoryStream(16 * 1024);
+            public readonly List<BaseEvent> Buffered = new List<BaseEvent>(32); // in Buffer, not yet on disk
+
+            public SegmentWriter(bool high)
+            {
+                High = high;
+            }
+
+            public int OpenEvents => (Open != null ? Open.EventCount : 0) + Buffered.Count;
+        }
         private long _totalBytes;
         private long _seq;
         private long _seqReserved;
@@ -427,7 +443,7 @@ namespace OzxApm.Network
             else
             {
                 Pump();
-                try { CloseOpenStream(); } catch { }
+                try { CloseOpenStreams(); } catch { }
                 ReleaseDirectory();
             }
         }
@@ -477,7 +493,7 @@ namespace OzxApm.Network
         /// <summary>Test seam: drop the instance as if the process died (no flush, no seal).</summary>
         internal void SimulateCrashForTests()
         {
-            CloseOpenStream();
+            CloseOpenStreams();
             ReleaseDirectory();
         }
 
@@ -524,7 +540,7 @@ namespace OzxApm.Network
             }
             finally
             {
-                try { CloseOpenStream(); } catch { }
+                try { CloseOpenStreams(); } catch { }
                 ReleaseDirectory();
                 lock (_lock)
                 {
@@ -551,12 +567,13 @@ namespace OzxApm.Network
                     return persist;
                 }
             }
-            if (_open != null && _open.EventCount > 0)
+            double wait = IdleWaitMs;
+            foreach (var w in Writers)
             {
-                double ms = (_open.CreatedUtc.AddSeconds(_config.FlushIntervalSeconds) - now).TotalMilliseconds;
-                return (int)Math.Max(10, Math.Min(IdleWaitMs, ms));
+                if (w.Open != null && w.Open.EventCount > 0)
+                    wait = Math.Min(wait, (w.Open.CreatedUtc.AddSeconds(_config.FlushIntervalSeconds) - now).TotalMilliseconds);
             }
-            return IdleWaitMs;
+            return (int)Math.Max(10, wait);
         }
 
         private void PumpInternal()
@@ -601,15 +618,18 @@ namespace OzxApm.Network
                 if (_drain.Count > 0)
                     WriteEvents(_drain);
 
-                if (_open != null && _open.EventCount > 0 &&
-                    (flush || (DateTime.UtcNow - _open.CreatedUtc).TotalSeconds >= _config.FlushIntervalSeconds))
+                foreach (var w in Writers)
                 {
-                    SealOpen();
+                    if (w.Open != null && w.Open.EventCount > 0 &&
+                        (flush || (DateTime.UtcNow - w.Open.CreatedUtc).TotalSeconds >= _config.FlushIntervalSeconds))
+                    {
+                        SealOpen(w);
+                    }
                 }
 
                 EnforceCap();
 
-                if (flush && _lineBuffer.Length == 0)
+                if (flush && _lowWriter.Buffered.Count == 0 && _highWriter.Buffered.Count == 0)
                 {
                     bool nothingPending;
                     lock (_lock)
@@ -724,7 +744,7 @@ namespace OzxApm.Network
                 return string.CompareOrdinal(a.Name, b.Name);
             });
 
-            _seq = Math.Max(ReadSeqFile(), MaxSeqInNewestSegment());
+            _seq = Math.Max(ReadSeqFile(), MaxSeqInNewestSegments());
             _seqReserved = _seq;
 
             SweepQuarantine();
@@ -786,20 +806,35 @@ namespace OzxApm.Network
         }
 
         /// <summary>
-        /// Highest "seq" in the newest stored segment. Protects monotonicity when
-        /// the seq file was lost or is stale (seq only grows, so the newest
-        /// segment holds the highest number).
+        /// Highest "seq" in the most recent segments. Protects monotonicity when the
+        /// seq file was lost or is stale. Seq only grows, but high- and low-value
+        /// events go to different segments that are open at the same time, so the
+        /// newest segment alone is not enough: scan every segment created within
+        /// one seal interval (plus margin) of the newest one.
         /// </summary>
-        private long MaxSeqInNewestSegment()
+        private long MaxSeqInNewestSegments()
         {
+            long newestMs = -1;
+            for (int s = _segments.Count - 1; s >= 0 && newestMs < 0; s--)
+            {
+                if (!_segments[s].Legacy)
+                    newestMs = SegmentCreatedMs(_segments[s].Name);
+            }
+            if (newestMs < 0)
+                return 0;
+
+            long windowMs = (long)(Math.Max(1f, _config.FlushIntervalSeconds) * 1000) + 60000;
+            long max = 0;
             for (int s = _segments.Count - 1; s >= 0; s--)
             {
-                if (_segments[s].Legacy)
+                var segment = _segments[s];
+                if (segment.Legacy)
                     continue;
-                int length;
-                if (!ReadSegment(_segments[s], out length))
+                long created = SegmentCreatedMs(segment.Name);
+                if (created >= 0 && created < newestMs - windowMs)
                     continue;
-                long max = 0;
+                if (!ReadSegment(segment, out int length))
+                    continue;
                 for (int i = IndexOf(_readBuffer, 0, length, SeqMarker); i >= 0; i = IndexOf(_readBuffer, i + 1, length, SeqMarker))
                 {
                     long value = 0;
@@ -812,9 +847,17 @@ namespace OzxApm.Network
                     if (value > max)
                         max = value;
                 }
-                return max;
             }
-            return 0;
+            return max;
+        }
+
+        /// <summary>Creation time (Unix ms) encoded in a segment name, or -1.</summary>
+        private static long SegmentCreatedMs(string name)
+        {
+            int dash = name.IndexOf('-');
+            if (dash <= 0)
+                return -1;
+            return long.TryParse(name.Substring(0, dash), NumberStyles.None, CultureInfo.InvariantCulture, out long ms) ? ms : -1;
         }
 
         // ------------------------------------------------------------------
@@ -829,7 +872,8 @@ namespace OzxApm.Network
 
             int batchSize = Math.Max(1, _config.BatchSize);
             int maxBytes = Math.Max(1024, _config.MaxBatchBytes);
-            int committed = 0; // events[0..committed) are safely on disk (or dropped as unserializable)
+            int next = 0;                 // index of the event being written
+            bool currentBuffered = false; // events[next] already sits in a writer buffer
 
             try
             {
@@ -842,10 +886,10 @@ namespace OzxApm.Network
                 // Do not hand out sequence numbers unless their reservation is durable.
                 ReserveSeq(needSeq);
 
-                int bufferStart = 0;
-                for (int i = 0; i < events.Count; i++)
+                for (; next < events.Count; next++)
                 {
-                    var evt = events[i];
+                    currentBuffered = false;
+                    var evt = events[next];
                     if (evt.seq == 0)
                         evt.seq = ++_seq; // kept if the write is retried
                     if (string.IsNullOrEmpty(evt.event_id))
@@ -859,78 +903,87 @@ namespace OzxApm.Network
                     catch (Exception ex)
                     {
                         Warn($"Failed to serialize {evt.type} event: {ex.Message}");
-                        if (bufferStart == i)
-                        {
-                            bufferStart++;
-                            committed = bufferStart;
-                        }
                         continue;
                     }
 
+                    var w = IsHighValueEvent(evt) ? _highWriter : _lowWriter;
                     int lineBytes = Encoding.UTF8.GetByteCount(line) + 1;
-                    if (_open != null && _open.EventCount + _lineBufferEvents > 0 &&
-                        _open.Bytes + _lineBuffer.Length + lineBytes > maxBytes)
+                    if (w.OpenEvents > 0 && w.Open.Bytes + w.Buffer.Length + lineBytes > maxBytes)
                     {
-                        CommitLineBuffer();
-                        committed = i;
-                        bufferStart = i;
-                        SealOpen();
+                        CommitLineBuffer(w);
+                        SealOpen(w);
                     }
 
-                    if (_open == null)
-                        OpenSegment();
+                    if (w.Open == null)
+                        OpenSegment(w);
 
                     var bytes = Encoding.UTF8.GetBytes(line);
-                    _lineBuffer.Write(bytes, 0, bytes.Length);
-                    _lineBuffer.WriteByte((byte)'\n');
-                    _lineBufferEvents++;
-                    if (evt is ExceptionEvent || evt is CrashEvent || evt is StartupEvent)
-                        _lineBufferHighValue = true;
+                    w.Buffer.Write(bytes, 0, bytes.Length);
+                    w.Buffer.WriteByte((byte)'\n');
+                    w.Buffered.Add(evt);
+                    currentBuffered = true;
 
-                    if (_open.EventCount + _lineBufferEvents >= batchSize)
+                    if (w.OpenEvents >= batchSize)
                     {
-                        CommitLineBuffer();
-                        committed = i + 1;
-                        bufferStart = i + 1;
-                        SealOpen();
+                        CommitLineBuffer(w);
+                        SealOpen(w);
                     }
                 }
 
-                CommitLineBuffer();
-                committed = events.Count;
+                CommitLineBuffer(_highWriter);
+                CommitLineBuffer(_lowWriter);
                 _writeFailures = 0;
             }
             catch (Exception ex)
             {
-                OnWriteFailure(ex, events, committed);
+                // Events still in a writer buffer are retried from there; the
+                // rest start at the first event that was never buffered.
+                OnWriteFailure(ex, events, currentBuffered ? next + 1 : next);
             }
+        }
+
+        private SegmentWriter[] _writers;
+        private SegmentWriter[] Writers => _writers ?? (_writers = new[] { _highWriter, _lowWriter });
+
+        private static bool IsHighValueEvent(BaseEvent evt)
+        {
+            return evt is ExceptionEvent || evt is CrashEvent || evt is StartupEvent;
         }
 
         /// <summary>
         /// A write failed (disk full, I/O error, seq reservation not durable).
-        /// The open segment was truncated back to its last complete line (or, if
-        /// that failed too, is abandoned so nothing is ever appended to a cut-off
+        /// Open segments were truncated back to their last complete line (or, if
+        /// that failed too, are abandoned so nothing is ever appended to a cut-off
         /// line). Events that did not reach the disk go back to the front of the
         /// queue with their sequence numbers, and writing is retried with backoff.
         /// </summary>
-        private void OnWriteFailure(Exception ex, List<BaseEvent> events, int committed)
+        private void OnWriteFailure(Exception ex, List<BaseEvent> events, int notBuffered)
         {
-            _lineBuffer.SetLength(0);
-            _lineBufferEvents = 0;
-            _lineBufferHighValue = false;
-            AbandonOpen();
+            // Not on disk: whatever is still buffered in either writer, then the
+            // events that were never buffered.
+            var retry = new List<BaseEvent>();
+            foreach (var w in Writers)
+            {
+                retry.AddRange(w.Buffered);
+                w.Buffered.Clear();
+                w.Buffer.SetLength(0);
+                AbandonOpen(w);
+            }
+            retry.Sort((a, b) => a.seq.CompareTo(b.seq));
+            if (notBuffered < events.Count)
+                retry.AddRange(events.GetRange(notBuffered, events.Count - notBuffered));
 
             _writeFailures++;
             double delay = Math.Min(30.0, 0.5 * Math.Pow(2, Math.Min(_writeFailures - 1, 6)));
             _writeRetryAtUtc = DateTime.UtcNow.AddSeconds(delay);
             Warn($"Failed to write events ({ex.GetType().Name}: {ex.Message}); retrying in {delay:F1}s");
 
-            if (committed >= events.Count)
+            if (retry.Count == 0)
                 return;
 
             lock (_lock)
             {
-                _pending.InsertRange(0, events.GetRange(committed, events.Count - committed));
+                _pending.InsertRange(0, retry);
                 int max = Math.Max(1, _config.MaxQueueSize);
                 if (_pending.Count > max)
                 {
@@ -994,13 +1047,13 @@ namespace OzxApm.Network
             File.Move(tmp, path);
         }
 
-        private void OpenSegment()
+        private void OpenSegment(SegmentWriter w)
         {
             var now = DateTime.UtcNow;
             long ms = new DateTimeOffset(now).ToUnixTimeMilliseconds();
             string baseName = SegmentBaseName(ms);
 
-            var segment = new Segment { CreatedUtc = now, EventCount = 0, HighValue = 0 };
+            var segment = new Segment { CreatedUtc = now, EventCount = 0, HighValue = w.High ? 1 : 0 };
 
             if (_persistToDisk)
             {
@@ -1013,16 +1066,16 @@ namespace OzxApm.Network
                 }
                 segment.Name = baseName + SegmentExtension;
                 segment.Path = Path.Combine(_storagePath, baseName + OpenExtension);
-                // Unbuffered (we batch in _lineBuffer): a failed write cannot leave
+                // Unbuffered (we batch in w.Buffer): a failed write cannot leave
                 // bytes in a FileStream buffer that a later Dispose would flush.
-                _openStream = new FileStream(segment.Path, FileMode.CreateNew, FileAccess.Write, FileShare.Read, 1);
+                w.Stream = new FileStream(segment.Path, FileMode.CreateNew, FileAccess.Write, FileShare.Read, 1);
             }
             else
             {
                 segment.Name = baseName + SegmentExtension;
                 segment.Mem = new MemoryStream();
             }
-            _open = segment;
+            w.Open = segment;
         }
 
         private string SegmentBaseName(long unixMs)
@@ -1032,59 +1085,57 @@ namespace OzxApm.Network
         }
 
         /// <summary>
-        /// Appends the buffered lines to the open segment. On failure the file is
-        /// truncated back to the last committed length and the exception rethrown.
+        /// Appends the buffered lines to the writer's open segment. On failure the
+        /// file is truncated back to the last committed length and the exception rethrown.
         /// </summary>
-        private void CommitLineBuffer()
+        private void CommitLineBuffer(SegmentWriter w)
         {
-            if (_lineBuffer.Length == 0 || _open == null)
+            if (w.Buffer.Length == 0 || w.Open == null)
                 return;
 
-            int length = (int)_lineBuffer.Length;
-            long committedLength = _open.Bytes;
+            var open = w.Open;
+            int length = (int)w.Buffer.Length;
+            long committedLength = open.Bytes;
             try
             {
-                BeforeWriteHook?.Invoke(_open.Mem != null ? (Stream)_open.Mem : _openStream);
-                if (_open.Mem != null)
+                BeforeWriteHook?.Invoke(open.Mem != null ? (Stream)open.Mem : w.Stream);
+                if (open.Mem != null)
                 {
-                    _open.Mem.Write(_lineBuffer.GetBuffer(), 0, length);
+                    open.Mem.Write(w.Buffer.GetBuffer(), 0, length);
                 }
                 else
                 {
-                    _openStream.Write(_lineBuffer.GetBuffer(), 0, length);
+                    w.Stream.Write(w.Buffer.GetBuffer(), 0, length);
                     // Hand the bytes to the OS so they survive the process being killed.
-                    _openStream.Flush();
+                    w.Stream.Flush();
                 }
             }
             catch
             {
-                TruncateOpen(committedLength);
+                TruncateOpen(w, committedLength);
                 throw;
             }
 
-            _open.Bytes += length;
+            open.Bytes += length;
             _totalBytes += length;
-            _open.EventCount += _lineBufferEvents;
-            if (_lineBufferHighValue)
-                _open.HighValue = 1;
-            _lineBuffer.SetLength(0);
-            _lineBufferEvents = 0;
-            _lineBufferHighValue = false;
+            open.EventCount += w.Buffered.Count;
+            w.Buffer.SetLength(0);
+            w.Buffered.Clear();
         }
 
-        private void TruncateOpen(long length)
+        private static void TruncateOpen(SegmentWriter w, long length)
         {
             try
             {
-                if (_open.Mem != null)
+                if (w.Open.Mem != null)
                 {
-                    _open.Mem.SetLength(length);
+                    w.Open.Mem.SetLength(length);
                 }
-                else if (_openStream != null)
+                else if (w.Stream != null)
                 {
-                    _openStream.Flush();
-                    _openStream.SetLength(length);
-                    _openStream.Flush();
+                    w.Stream.Flush();
+                    w.Stream.SetLength(length);
+                    w.Stream.Flush();
                 }
             }
             catch
@@ -1094,32 +1145,32 @@ namespace OzxApm.Network
         }
 
         /// <summary>
-        /// Stops writing to the open segment: keeps what it holds (sealed), or
-        /// deletes it if empty.
+        /// Stops writing to the writer's open segment: keeps what it holds
+        /// (sealed), or deletes it if empty.
         /// </summary>
-        private void AbandonOpen()
+        private void AbandonOpen(SegmentWriter w)
         {
-            if (_open == null)
+            if (w.Open == null)
                 return;
             try
             {
-                SealOpen();
+                SealOpen(w);
             }
             catch
             {
-                CloseOpenStream();
-                _open = null;
+                CloseStream(w);
+                w.Open = null;
             }
         }
 
-        private void SealOpen()
+        private void SealOpen(SegmentWriter w)
         {
-            if (_open == null)
+            if (w.Open == null)
                 return;
 
-            var segment = _open;
-            _open = null;
-            CloseOpenStream();
+            var segment = w.Open;
+            w.Open = null;
+            CloseStream(w);
 
             if (segment.EventCount == 0)
             {
@@ -1143,15 +1194,25 @@ namespace OzxApm.Network
                 }
             }
 
-            _segments.Add(segment);
+            // Keep _segments in creation order (oldest first), as after a restart.
+            int at = _segments.Count;
+            while (at > 0 && !_segments[at - 1].Legacy && string.CompareOrdinal(_segments[at - 1].Name, segment.Name) > 0)
+                at--;
+            _segments.Insert(at, segment);
         }
 
-        private void CloseOpenStream()
+        private static void CloseStream(SegmentWriter w)
         {
-            if (_openStream == null)
+            if (w.Stream == null)
                 return;
-            try { _openStream.Dispose(); } catch { }
-            _openStream = null;
+            try { w.Stream.Dispose(); } catch { }
+            w.Stream = null;
+        }
+
+        private void CloseOpenStreams()
+        {
+            CloseStream(_lowWriter);
+            CloseStream(_highWriter);
         }
 
         private void EnsureDirectory()
@@ -1355,19 +1416,22 @@ namespace OzxApm.Network
 
         private void DeleteAll()
         {
-            CloseOpenStream();
-            if (_open != null)
+            CloseOpenStreams();
+            foreach (var w in Writers)
             {
-                DeleteSegmentData(_open);
-                _open = null;
+                if (w.Open != null)
+                {
+                    DeleteSegmentData(w.Open);
+                    w.Open = null;
+                }
+                w.Buffer.SetLength(0);
+                w.Buffered.Clear();
             }
             for (int i = 0; i < _segments.Count; i++)
                 DeleteSegmentData(_segments[i]);
             _segments.Clear();
             _inFlight.Clear();
             _totalBytes = 0;
-            _lineBuffer.SetLength(0);
-            _lineBufferEvents = 0;
 
             try
             {
