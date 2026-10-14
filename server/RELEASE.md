@@ -91,3 +91,29 @@ defaults. Verified on ClickHouse 23.8 and 24.1.
   ALTER TABLE apm_crashes      DROP COLUMN IF EXISTS event_id, DROP COLUMN IF EXISTS seq;
   ```
   This loses the stored `event_id`/`seq` values. Prefer rolling back to phase 1.
+
+## APM-2: optional `clickhouse.async_insert` (no schema change)
+
+Off by default. When `clickhouse.async_insert: true`, ingest inserts are sent
+as `INSERT ... VALUES` with `async_insert=1, wait_for_async_insert=1`.
+ClickHouse then buffers concurrent requests into one part instead of one part
+per request, which caps part creation when many clients drain an offline
+backlog at once. The request still returns only after the data is written, so
+the ingest response stays truthful. Cost: up to `async_insert_busy_timeout_ms`
+(200ms by default) of extra latency per request.
+
+Measured (40-50 concurrent single-row inserts, merges stopped):
+
+| path                                   | 23.8.16 | 24.1.8 |
+|----------------------------------------|---------|--------|
+| native batch (default)                 | 50 parts | 50 parts |
+| native batch + async_insert settings   | 50 parts (setting ignored) | 5 parts |
+| `INSERT ... VALUES` + async (this flag) | 4-5 parts | 4-5 parts |
+
+The native-protocol batch silently ignores `async_insert` on 23.8, which is
+why the flag uses the `VALUES` path. Both paths store identical values
+(integration test `TestInsertPaths_RoundTripIdentically`, run on 23.8 and 24.1).
+
+Suggested rollout: enable after phase 2 has settled, on one instance first,
+and watch insert latency and `system.asynchronous_inserts`. Rollback: set it
+back to `false` and restart; no schema action.

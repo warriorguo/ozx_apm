@@ -13,8 +13,9 @@ import (
 )
 
 type ClickHouseClient struct {
-	conn   driver.Conn
-	logger *zap.Logger
+	conn        driver.Conn
+	logger      *zap.Logger
+	asyncInsert bool
 }
 
 func NewClickHouseClient(cfg *config.ClickHouseConfig, logger *zap.Logger) (*ClickHouseClient, error) {
@@ -52,8 +53,9 @@ func NewClickHouseClient(cfg *config.ClickHouseConfig, logger *zap.Logger) (*Cli
 				zap.String("database", cfg.Database),
 			)
 			return &ClickHouseClient{
-				conn:   conn,
-				logger: logger,
+				conn:        conn,
+				logger:      logger,
+				asyncInsert: cfg.AsyncInsert,
 			}, nil
 		}
 		lastErr = err

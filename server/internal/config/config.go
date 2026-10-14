@@ -42,6 +42,10 @@ type ClickHouseConfig struct {
 	Database string `mapstructure:"database"`
 	Username string `mapstructure:"username"`
 	Password string `mapstructure:"password"`
+	// AsyncInsert sends ingest inserts with async_insert=1 and
+	// wait_for_async_insert=1 so concurrent requests share parts.
+	// Off by default; see storage/insert.go for measurements.
+	AsyncInsert bool `mapstructure:"async_insert"`
 }
 
 type AuthConfig struct {
@@ -85,6 +89,7 @@ func Load() (*Config, error) {
 	viper.SetDefault("clickhouse.database", "ozx_apm")
 	viper.SetDefault("clickhouse.username", "default")
 	viper.SetDefault("clickhouse.password", "")
+	viper.SetDefault("clickhouse.async_insert", false)
 
 	viper.SetDefault("auth.enabled", false)
 	viper.SetDefault("ratelimit.enabled", true)

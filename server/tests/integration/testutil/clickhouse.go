@@ -3,6 +3,8 @@ package testutil
 import (
 	"context"
 	"fmt"
+	"os"
+	"strconv"
 	"time"
 
 	"go.uber.org/zap"
@@ -11,11 +13,16 @@ import (
 	"github.com/warriorguo/ozx_apm/server/internal/storage"
 )
 
-// TestClickHouseConfig returns a config for testing
+// TestClickHouseConfig returns a config for testing. OZX_TEST_CH_PORT
+// selects another native port (e.g. a second ClickHouse version).
 func TestClickHouseConfig() *config.ClickHouseConfig {
+	port := 9000
+	if p, err := strconv.Atoi(os.Getenv("OZX_TEST_CH_PORT")); err == nil && p > 0 {
+		port = p
+	}
 	return &config.ClickHouseConfig{
 		Host:     "localhost",
-		Port:     9000,
+		Port:     port,
 		Database: "ozx_apm_test",
 		Username: "default",
 		Password: "",

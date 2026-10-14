@@ -29,6 +29,10 @@ clickhouse:
   database: "ozx_apm"
   username: "default"
   password: ""
+  # Batch concurrent ingest requests into fewer parts (async_insert=1,
+  # wait_for_async_insert=1). Adds up to ~200ms latency per request.
+  # Verified on ClickHouse 23.8 and 24.1. See RELEASE.md.
+  async_insert: false
 
 auth:
   enabled: false
