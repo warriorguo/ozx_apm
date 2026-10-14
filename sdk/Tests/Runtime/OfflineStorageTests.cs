@@ -580,6 +580,28 @@ namespace OzxApm.Tests
         // ---------------------------------------------------------------
 
         [Test]
+        public void Seq_IsContinuous_AcrossCleanRestart_AndOnlyGapsAfterACrash()
+        {
+            var first = NewStore();
+            for (int i = 0; i < 3; i++) first.Enqueue(Perf(i));
+            first.Pump();
+            first.Shutdown(0); // flush gives the unused reservation back
+
+            var second = NewStore();
+            second.Enqueue(Perf(3));
+            second.Pump();
+            Assert.AreEqual(4, second.LastSeq, "clean restart continues at the next number");
+            second.SimulateCrashForTests(); // killed in the foreground
+
+            var third = NewStore();
+            third.Enqueue(Perf(4));
+            third.Pump();
+            var seqs = SegmentFiles().SelectMany(f => Seqs(File.ReadAllText(f))).OrderBy(x => x).ToList();
+            Assert.AreEqual(5, seqs.Distinct().Count(), "never reused");
+            Assert.Greater(third.LastSeq, 5, "a crash leaves a gap (the reservation is not reused)");
+        }
+
+        [Test]
         public void Seq_StaysMonotonic_WhenSeqFileIsLost()
         {
             var first = NewStore();

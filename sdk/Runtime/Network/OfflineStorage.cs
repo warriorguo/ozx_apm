@@ -216,6 +216,21 @@ namespace OzxApm.Network
         /// <summary>Events dropped because the in-memory hand-off or the storage cap overflowed.</summary>
         public long DroppedEventCount => Interlocked.Read(ref _droppedPendingEvents) + Interlocked.Read(ref _droppedByCap);
 
+        /// <summary>Highest sequence number assigned so far.</summary>
+        public long LastSeq => Interlocked.Read(ref _seq);
+
+        /// <summary>Events enqueued but not yet written by the worker.</summary>
+        public int PendingEventCount
+        {
+            get
+            {
+                lock (_lock)
+                {
+                    return _pending.Count;
+                }
+            }
+        }
+
         private long CapBytes => _persistToDisk
             ? Math.Max(4096, (long)_config.MaxOfflineStorageBytes)
             : Math.Min(MemoryOnlyMaxBytes, Math.Max(4096, (long)_config.MaxOfflineStorageBytes));
@@ -594,6 +609,17 @@ namespace OzxApm.Network
 
                 EnforceCap();
 
+                if (flush && _lineBuffer.Length == 0)
+                {
+                    bool nothingPending;
+                    lock (_lock)
+                    {
+                        nothingPending = _pending.Count == 0;
+                    }
+                    if (nothingPending)
+                        ShrinkSeqReservation();
+                }
+
                 if (upload)
                     PrepareUpload();
             }
@@ -923,20 +949,47 @@ namespace OzxApm.Network
             {
                 // Make the reservation durable before any event uses it, so a crash
                 // can only create gaps, never reuse a number. Throws on failure.
-                EnsureDirectory();
-                string path = Path.Combine(_storagePath, SeqFileName);
-                string tmp = path + ".tmp";
-                var bytes = Encoding.ASCII.GetBytes(reserved.ToString(CultureInfo.InvariantCulture));
-                using (var fs = new FileStream(tmp, FileMode.Create, FileAccess.Write, FileShare.None))
-                {
-                    fs.Write(bytes, 0, bytes.Length);
-                    fs.Flush(true);
-                }
-                if (File.Exists(path))
-                    File.Delete(path);
-                File.Move(tmp, path);
+                WriteSeqFile(reserved);
             }
             _seqReserved = reserved;
+        }
+
+        /// <summary>
+        /// On Flush (app paused, quit, explicit flush) give back the unused part of
+        /// the reservation, so the next launch continues at exactly the next number.
+        /// Then a gap in seq only appears after the process died in the foreground
+        /// (crash, kill) with events still reserved.
+        /// </summary>
+        private void ShrinkSeqReservation()
+        {
+            if (!_persistToDisk || _seqReserved <= _seq || !_directoryReady)
+                return;
+            try
+            {
+                WriteSeqFile(_seq);
+                _seqReserved = _seq;
+            }
+            catch (Exception ex)
+            {
+                // Keeping the larger reservation is safe.
+                Warn($"Failed to update event sequence file: {ex.Message}");
+            }
+        }
+
+        private void WriteSeqFile(long value)
+        {
+            EnsureDirectory();
+            string path = Path.Combine(_storagePath, SeqFileName);
+            string tmp = path + ".tmp";
+            var bytes = Encoding.ASCII.GetBytes(value.ToString(CultureInfo.InvariantCulture));
+            using (var fs = new FileStream(tmp, FileMode.Create, FileAccess.Write, FileShare.None))
+            {
+                fs.Write(bytes, 0, bytes.Length);
+                fs.Flush(true);
+            }
+            if (File.Exists(path))
+                File.Delete(path);
+            File.Move(tmp, path);
         }
 
         private void OpenSegment()

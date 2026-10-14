@@ -377,11 +377,46 @@ namespace OzxApm.Core
             }
         }
 
+        /// <summary>
+        /// Current SDK state (queue, local storage, sequence, upload failures,
+        /// main-thread cost). Allocation-free; main thread.
+        /// </summary>
+        public static ApmStats GetStats()
+        {
+            var stats = new ApmStats { Initialized = _isInitialized, Consent = Consent };
+            if (!_isInitialized || ReferenceEquals(_instance, null))
+                return stats;
+
+            var client = _instance;
+            if (client._offlineStorage != null)
+            {
+                stats.PendingEvents = client._offlineStorage.PendingEventCount;
+                stats.StoredBytes = client._offlineStorage.GetStorageSize();
+                stats.DroppedEvents = client._offlineStorage.DroppedEventCount;
+                stats.LastSeq = client._offlineStorage.LastSeq;
+                stats.PersistsToDisk = client._offlineStorage.PersistsToDisk;
+                stats.HasWorkerThread = client._offlineStorage.HasWorkerThread;
+            }
+            if (client._reporter != null)
+                stats.UploadFailures = client._reporter.ConsecutiveFailures;
+            stats.LastUpdateMs = client._lastUpdateTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+            return stats;
+        }
+
+        private long _lastUpdateTicks;
+
         private void Update()
         {
             if (!_isInitialized || !_config.Enabled)
                 return;
 
+            long start = System.Diagnostics.Stopwatch.GetTimestamp();
+            UpdateInternal();
+            _lastUpdateTicks = System.Diagnostics.Stopwatch.GetTimestamp() - start;
+        }
+
+        private void UpdateInternal()
+        {
             // Update collectors
             for (int i = 0; i < _collectors.Count; i++)
             {
