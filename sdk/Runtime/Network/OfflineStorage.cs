@@ -118,7 +118,7 @@ namespace OzxApm.Network
         private UploadBatch _preparedUpload;
         private readonly List<Completion> _completions = new List<Completion>();
         private bool _stopRequested;
-        private bool _isIdle = true;
+        private long _busyGen;              // bumped (under _lock) whenever new work is requested
         private long _droppedPendingEvents;
 
         private struct Completion
@@ -129,7 +129,11 @@ namespace OzxApm.Network
 
         // ---- Worker-only state ----
         private readonly AutoResetEvent _wake = new AutoResetEvent(false);
-        private readonly ManualResetEvent _idleSignal = new ManualResetEvent(true);
+        // WaitIdle: generation of work the worker has fully finished. Separate lock and
+        // Monitor (no OS wait handle) so Enqueue never makes a kernel call for it and
+        // nothing slow runs while _lock is held.
+        private readonly object _idleLock = new object();
+        private long _idleGen;
         private Thread _thread;
         private List<BaseEvent> _drain = new List<BaseEvent>(64);
         private readonly List<Completion> _completionDrain = new List<Completion>();
@@ -342,7 +346,24 @@ namespace OzxApm.Network
                 Pump();
                 return true;
             }
-            return _idleSignal.WaitOne(timeoutMs);
+
+            long target;
+            lock (_lock)
+            {
+                target = _busyGen;
+            }
+            var deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs);
+            lock (_idleLock)
+            {
+                while (_idleGen < target)
+                {
+                    int left = (int)(deadline - DateTime.UtcNow).TotalMilliseconds;
+                    if (left <= 0)
+                        return false;
+                    Monitor.Wait(_idleLock, left);
+                }
+                return true;
+            }
         }
 
         /// <summary>
@@ -497,22 +518,23 @@ namespace OzxApm.Network
             ReleaseDirectory();
         }
 
-        // Called under _lock. Only touches the wait handle on a state change, so a
-        // steady stream of Enqueue calls costs no kernel call per event.
+        // Called under _lock: just a counter, no kernel call on the main thread.
         private void MarkBusy()
         {
-            if (!_isIdle)
-                return;
-            _isIdle = false;
-            _idleSignal.Reset();
+            _busyGen++;
         }
 
-        private void MarkIdle()
+        // Called by the worker WITHOUT holding _lock: everything up to generation
+        // `gen` is done.
+        private void SignalIdle(long gen)
         {
-            if (_isIdle)
-                return;
-            _isIdle = true;
-            _idleSignal.Set();
+            lock (_idleLock)
+            {
+                if (gen <= _idleGen)
+                    return;
+                _idleGen = gen;
+                Monitor.PulseAll(_idleLock);
+            }
         }
 
         private void WorkerLoop()
@@ -542,10 +564,12 @@ namespace OzxApm.Network
             {
                 try { CloseOpenStreams(); } catch { }
                 ReleaseDirectory();
+                long gen;
                 lock (_lock)
                 {
-                    MarkIdle();
+                    gen = _busyGen;
                 }
+                SignalIdle(gen); // stopped: nothing more will happen
             }
         }
 
@@ -647,13 +671,16 @@ namespace OzxApm.Network
             {
                 _drain.Clear();
                 _completionDrain.Clear();
+                long idleGen = -1;
                 lock (_lock)
                 {
                     if (upload && _uploadState == UploadPoll.Pending && _preparedUpload == null)
                         _uploadState = UploadPoll.Empty; // PrepareUpload threw
                     if (_pending.Count == 0 && !_flushRequested && !_clearRequested && _completions.Count == 0)
-                        MarkIdle();
+                        idleGen = _busyGen;
                 }
+                if (idleGen >= 0)
+                    SignalIdle(idleGen);
             }
         }
 

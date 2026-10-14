@@ -435,6 +435,7 @@ namespace OzxApm.Core
         private static readonly ProfilerMarker s_collectorsMarker = new ProfilerMarker("OzxApm.Collectors");
         private static readonly ProfilerMarker s_uploadMarker = new ProfilerMarker("OzxApm.Upload");
         private readonly List<ProfilerMarker> _collectorMarkers = new List<ProfilerMarker>();
+        private static readonly ProfilerMarker s_enqueueMarker = new ProfilerMarker("OzxApm.Enqueue");
 
         private void UpdateInternal()
         {
@@ -611,7 +612,8 @@ namespace OzxApm.Core
                 evt.device_id = _sessionManager.DeviceId;
                 evt.scene = _currentScene;
 
-                _offlineStorage.Enqueue(evt);
+                using (s_enqueueMarker.Auto())
+                    _offlineStorage.Enqueue(evt);
             }
             catch (Exception ex)
             {
