@@ -13,11 +13,12 @@ using OzxApm.Utils;
 namespace OzxApm.Network
 {
     /// <summary>
-    /// A batch read from local storage and ready to upload.
+    /// One upload request read from local storage: one legacy file, or one or
+    /// more consecutive segments merged up to BatchSize / MaxBatchBytes.
     /// </summary>
     public sealed class UploadBatch
     {
-        /// <summary>Identifies the stored segment; pass the batch back to CompleteUpload.</summary>
+        /// <summary>Name of the first (oldest) segment in the batch.</summary>
         public string SegmentName;
         /// <summary>Request body, gzip-compressed when Compressed is true.</summary>
         public byte[] Payload;
@@ -26,6 +27,8 @@ namespace OzxApm.Network
         public int UncompressedBytes;
         /// <summary>Uncompressed JSON for the network log; only filled when LogLevel is Debug.</summary>
         public string DebugJson;
+
+        internal readonly List<string> SegmentNames = new List<string>(4);
     }
 
     public enum UploadPoll
@@ -42,43 +45,68 @@ namespace OzxApm.Network
     /// Durable event queue. Events are persisted when they are enqueued and
     /// deleted only after the server confirms them.
     ///
-    /// Layout: one directory of segment files. Each segment holds up to
-    /// BatchSize events / MaxBatchBytes as JSON Lines (one event per line, the
-    /// exact JSON that is uploaded), and each segment is one upload request.
-    ///   NNNNNNNNNNNNN-NNNNNN.open  segment currently being appended to
+    /// Layout of the storage directory:
+    ///   NNNNNNNNNNNNN-NNNNNN.open  segment being appended to (one event per line,
+    ///                              the exact JSON that is uploaded)
     ///   NNNNNNNNNNNNN-NNNNNN.seg   sealed segment, waiting for upload
     ///   seq                        reserved high-water mark of the event sequence
     ///   ozx_apm_offline_*.json     legacy (pre-APM-2) batch files, uploaded as-is
-    /// A segment is sealed when it is full, older than FlushIntervalSeconds, on
-    /// Flush() and at startup (".open" files left by a crash or kill).
+    ///   quarantine/                batches the server explicitly rejected (capped)
+    /// A segment is sealed when it holds BatchSize events / MaxBatchBytes, is
+    /// older than FlushIntervalSeconds, on Flush(), after a write error and at
+    /// startup (".open" files left by a crash or kill). Consecutive small
+    /// segments are merged into one upload.
     ///
     /// Threading: all file I/O happens on one background worker thread. The
-    /// main thread only appends to an in-memory list under a lock. Pending
-    /// events are written at least every PersistIntervalMs, and immediately for
-    /// exceptions and crashes, so a crash or kill loses at most that window.
-    /// Uploads never re-parse events: lines are concatenated into the request
-    /// body, so reading old files does not depend on culture or JsonUtility.
+    /// main thread only appends to an in-memory list under a lock. An event is
+    /// written as soon as the worker wakes (immediately when the queue goes from
+    /// empty to non-empty, at most PersistIntervalMs later in a burst).
+    /// If the thread cannot be created the caller drives the worker with Tick().
     ///
     /// Nothing is written (no file, no directory) unless consent is Granted.
+    /// Only one instance may own a directory at a time; a second instance on
+    /// the same directory (e.g. re-initialising while the old worker is still
+    /// running) falls back to memory-only mode.
     /// </summary>
     public class OfflineStorage
     {
         private const string SegmentExtension = ".seg";
         private const string OpenExtension = ".open";
         private const string SeqFileName = "seq";
+        private const string QuarantineDirName = "quarantine";
         private const string LegacyFilePrefix = "ozx_apm_offline_";
         private const string LegacyFileExtension = ".json";
         private const long SeqReserveBlock = 1000;
         private const int CompressThresholdBytes = 1024;
+        private const int IdleWaitMs = 60000;
+        private const float WarningIntervalSeconds = 60f;
+        private const int MaxPooledBufferBytes = 256 * 1024;
+
+        /// <summary>Memory-only mode keeps at most this much (CLAUDE.md: &lt; 5MB resident in total).</summary>
+        public const long MemoryOnlyMaxBytes = 1024 * 1024;
+        /// <summary>Rejected batches kept for inspection.</summary>
+        public const long MaxQuarantineBytes = 512 * 1024;
+        public static readonly TimeSpan QuarantineTtl = TimeSpan.FromDays(7);
 
         private static readonly byte[] BatchPrefix = Encoding.UTF8.GetBytes("{\"events\":[");
         private static readonly byte[] BatchSuffix = Encoding.UTF8.GetBytes("]}");
         private static readonly byte[] LegacyEventMarker = Encoding.UTF8.GetBytes("{\"type\":\"");
+        private static readonly byte[][] HighValueMarkers =
+        {
+            Encoding.UTF8.GetBytes("\"type\":\"exception\""),
+            Encoding.UTF8.GetBytes("\"type\":\"crash\""),
+            Encoding.UTF8.GetBytes("\"type\":\"startup\"")
+        };
+        private static readonly byte[] SeqMarker = Encoding.UTF8.GetBytes("\"seq\":");
+
+        // Directories owned by a live instance in this process.
+        private static readonly HashSet<string> s_ownedDirectories = new HashSet<string>(StringComparer.Ordinal);
 
         private readonly ApmConfig _config;
         private readonly string _storagePath;
-        private readonly bool _persistToDisk;
-        private readonly bool _useWorkerThread;
+        private readonly string _quarantinePath;
+        private bool _persistToDisk;
+        private bool _useWorkerThread;
 
         // ---- Shared between main thread and worker; guarded by _lock ----
         private readonly object _lock = new object();
@@ -88,31 +116,56 @@ namespace OzxApm.Network
         private bool _uploadRequested;
         private UploadPoll _uploadState = UploadPoll.Empty;
         private UploadBatch _preparedUpload;
-        private readonly List<string> _segmentsToDelete = new List<string>();
-        private bool _releaseInFlight;
+        private readonly List<Completion> _completions = new List<Completion>();
         private bool _stopRequested;
+        private bool _isIdle = true;
         private long _droppedPendingEvents;
+
+        private struct Completion
+        {
+            public UploadBatch Batch;
+            public UploadOutcome Outcome;
+        }
 
         // ---- Worker-only state ----
         private readonly AutoResetEvent _wake = new AutoResetEvent(false);
         private readonly ManualResetEvent _idleSignal = new ManualResetEvent(true);
-        private bool _isIdle = true; // mirrors _idleSignal; guarded by _lock
         private Thread _thread;
         private List<BaseEvent> _drain = new List<BaseEvent>(64);
-        private readonly List<string> _deleteDrain = new List<string>();
+        private readonly List<Completion> _completionDrain = new List<Completion>();
         private readonly List<Segment> _segments = new List<Segment>(); // sealed, oldest first
+        private readonly HashSet<string> _inFlight = new HashSet<string>(StringComparer.Ordinal);
         private Segment _open;
         private FileStream _openStream;
         private readonly MemoryStream _lineBuffer = new MemoryStream(16 * 1024);
-        private string _inFlight;
+        private int _lineBufferEvents;
+        private bool _lineBufferHighValue;
         private long _totalBytes;
         private long _seq;
         private long _seqReserved;
         private int _segmentCounter;
         private bool _loaded;
+        private bool _ownsDirectory;
         private bool _directoryReady;
         private long _droppedByCap;
         private int _lastSyncPumpTicks;
+        private DateTime _writeRetryAtUtc = DateTime.MinValue;
+        private int _writeFailures;
+        private DateTime _lastWarningUtc = DateTime.MinValue;
+        private int _suppressedWarnings;
+
+        // Pooled buffers for the upload path.
+        private byte[] _readBuffer = new byte[16 * 1024];
+        private readonly MemoryStream _bodyBuffer = new MemoryStream(16 * 1024);
+        private readonly MemoryStream _gzipBuffer = new MemoryStream(8 * 1024);
+
+        /// <summary>
+        /// Test seam: called with the segment stream before every append; may
+        /// write partial data and throw to simulate a failing disk.
+        /// </summary>
+        internal static Action<Stream> BeforeWriteHook;
+        /// <summary>Test seam: makes thread creation fail.</summary>
+        internal static bool FailThreadStartForTests;
 
         private sealed class Segment
         {
@@ -120,8 +173,9 @@ namespace OzxApm.Network
             public string Path;      // null in memory-only mode
             public MemoryStream Mem; // memory-only mode
             public long Bytes;
-            public int EventCount;
+            public int EventCount = -1; // -1: unknown (loaded from a previous launch)
             public bool Legacy;
+            public int HighValue = -1;  // -1 unknown, 0 no, 1 has exceptions/crashes/startup
             public DateTime CreatedUtc;
         }
 
@@ -130,21 +184,31 @@ namespace OzxApm.Network
                    Path.Combine(Application.persistentDataPath, "ozx_apm_offline"),
                    Application.platform != RuntimePlatform.WebGLPlayer)
         {
+            // WebGL has no threads and no reliable file system: memory-only.
+            if (Application.platform == RuntimePlatform.WebGLPlayer)
+                _persistToDisk = false;
         }
 
         /// <param name="storagePath">Directory for segment files.</param>
         /// <param name="useWorkerThread">
-        /// false: the caller drives the worker with Pump() (tests, platforms without threads).
+        /// false: the caller drives the worker with Tick()/Pump() (tests, platforms without threads).
         /// </param>
         public OfflineStorage(ApmConfig config, string storagePath, bool useWorkerThread)
         {
             _config = config;
-            _storagePath = storagePath;
+            _storagePath = Path.GetFullPath(storagePath);
+            _quarantinePath = Path.Combine(_storagePath, QuarantineDirName);
             _persistToDisk = config.EnableOfflineStorage;
             _useWorkerThread = useWorkerThread;
         }
 
         public string StoragePath => _storagePath;
+
+        /// <summary>True when events go to disk (false in memory-only mode).</summary>
+        public bool PersistsToDisk => _persistToDisk;
+
+        /// <summary>True when a background worker thread is running.</summary>
+        public bool HasWorkerThread => _thread != null;
 
         /// <summary>Bytes currently held in local storage (worker's view).</summary>
         public long GetStorageSize() => Interlocked.Read(ref _totalBytes);
@@ -152,22 +216,47 @@ namespace OzxApm.Network
         /// <summary>Events dropped because the in-memory hand-off or the storage cap overflowed.</summary>
         public long DroppedEventCount => Interlocked.Read(ref _droppedPendingEvents) + Interlocked.Read(ref _droppedByCap);
 
+        private long CapBytes => _persistToDisk
+            ? Math.Max(4096, (long)_config.MaxOfflineStorageBytes)
+            : Math.Min(MemoryOnlyMaxBytes, Math.Max(4096, (long)_config.MaxOfflineStorageBytes));
+
         /// <summary>
-        /// Starts the background worker. Does no I/O on the calling thread:
-        /// scanning old files happens on the worker.
+        /// Starts the background worker. Does no I/O on the calling thread. If
+        /// the thread cannot be created, falls back to synchronous mode driven
+        /// by Tick().
         /// </summary>
         public void Start()
         {
             if (!_useWorkerThread || _thread != null)
                 return;
 
-            _thread = new Thread(WorkerLoop)
+            try
             {
-                IsBackground = true,
-                Name = "OzxApm.Storage",
-                Priority = System.Threading.ThreadPriority.BelowNormal
-            };
-            _thread.Start();
+                if (FailThreadStartForTests)
+                    throw new NotSupportedException("thread creation disabled for tests");
+
+                var thread = new Thread(WorkerLoop)
+                {
+                    IsBackground = true,
+                    Name = "OzxApm.Storage"
+                };
+                try
+                {
+                    thread.Priority = System.Threading.ThreadPriority.BelowNormal;
+                }
+                catch
+                {
+                    // Not supported everywhere; the default priority is fine.
+                }
+                thread.Start();
+                _thread = thread;
+            }
+            catch (Exception ex)
+            {
+                _thread = null;
+                _useWorkerThread = false;
+                ApmClient.Log(LogLevel.Warning, $"Storage worker thread unavailable ({ex.Message}); writing from the main thread");
+            }
         }
 
         /// <summary>
@@ -178,7 +267,7 @@ namespace OzxApm.Network
             if (evt == null || _config.Consent != ConsentState.Granted)
                 return;
 
-            bool urgent = evt is ExceptionEvent || evt is CrashEvent;
+            bool wake;
             lock (_lock)
             {
                 if (_stopRequested)
@@ -190,11 +279,12 @@ namespace OzxApm.Network
                     _pending.RemoveAt(0);
                     _droppedPendingEvents++;
                 }
+                wake = _pending.Count == 0 || evt is ExceptionEvent || evt is CrashEvent;
                 _pending.Add(evt);
                 MarkBusy();
             }
 
-            if (urgent)
+            if (wake)
                 _wake.Set();
         }
 
@@ -216,7 +306,7 @@ namespace OzxApm.Network
         /// </summary>
         public bool WaitIdle(int timeoutMs)
         {
-            if (!_useWorkerThread || _thread == null)
+            if (_thread == null)
             {
                 Pump();
                 return true;
@@ -225,7 +315,8 @@ namespace OzxApm.Network
         }
 
         /// <summary>
-        /// Deletes all locally stored events (async). Entry point for APM-14 (consent revoked).
+        /// Deletes all locally stored events, including quarantined batches
+        /// (async). Entry point for APM-14 (consent revoked).
         /// </summary>
         public void Clear()
         {
@@ -239,8 +330,7 @@ namespace OzxApm.Network
         }
 
         /// <summary>
-        /// Asks the worker to prepare the oldest sealed segment for upload.
-        /// Poll the result with PollUpload. Main thread.
+        /// Asks the worker to prepare the next upload. Poll the result with PollUpload. Main thread.
         /// </summary>
         public void RequestUpload()
         {
@@ -260,7 +350,7 @@ namespace OzxApm.Network
         /// </summary>
         public UploadPoll PollUpload(out UploadBatch batch)
         {
-            if (!_useWorkerThread)
+            if (_thread == null)
                 Pump();
 
             lock (_lock)
@@ -278,22 +368,26 @@ namespace OzxApm.Network
         }
 
         /// <summary>
-        /// Reports the outcome of an upload. delete=true only when the server
-        /// confirmed the batch (or rejected it as permanently invalid); otherwise
-        /// the segment stays on disk and is retried.
+        /// Reports the outcome of an upload. Delivered deletes the batch,
+        /// Rejected moves it to the quarantine directory, Retry keeps it.
         /// </summary>
-        public void CompleteUpload(UploadBatch batch, bool delete)
+        public void CompleteUpload(UploadBatch batch, UploadOutcome outcome)
         {
             if (batch == null)
                 return;
 
             lock (_lock)
             {
-                if (delete)
-                    _segmentsToDelete.Add(batch.SegmentName);
-                _releaseInFlight = true;
+                _completions.Add(new Completion { Batch = batch, Outcome = outcome });
+                MarkBusy();
             }
             _wake.Set();
+        }
+
+        /// <summary>delivered=true: Delivered; false: Retry.</summary>
+        public void CompleteUpload(UploadBatch batch, bool delivered)
+        {
+            CompleteUpload(batch, delivered ? UploadOutcome.Delivered : UploadOutcome.Retry);
         }
 
         /// <summary>
@@ -309,24 +403,27 @@ namespace OzxApm.Network
             }
             _wake.Set();
 
-            if (_thread != null)
+            var thread = _thread;
+            if (thread != null)
             {
-                try { _thread.Join(timeoutMs); } catch { }
-                _thread = null;
+                try { thread.Join(timeoutMs); } catch { }
+                // If the join timed out the worker releases the directory when it exits.
             }
             else
             {
                 Pump();
+                try { CloseOpenStream(); } catch { }
+                ReleaseDirectory();
             }
         }
 
         /// <summary>
-        /// Call once per frame from the main thread. Only does work on platforms
-        /// without a worker thread, where it pumps the worker every PersistIntervalMs.
+        /// Call once per frame from the main thread. Only does work when there is
+        /// no worker thread, where it pumps the worker every PersistIntervalMs.
         /// </summary>
         public void Tick()
         {
-            if (_useWorkerThread)
+            if (_thread != null)
                 return;
 
             int now = Environment.TickCount;
@@ -349,8 +446,24 @@ namespace OzxApm.Network
             catch (Exception ex)
             {
                 // Never let a storage problem escape into the game.
-                ApmClient.Log(LogLevel.Warning, $"Storage worker error: {ex.GetType().Name}: {ex.Message}");
+                Warn($"Storage worker error: {ex.GetType().Name}: {ex.Message}");
             }
+        }
+
+        /// <summary>Warnings actually logged (after rate limiting).</summary>
+        internal int WarningsLogged { get; private set; }
+
+        /// <summary>Test seam: allow the next write attempt now.</summary>
+        internal void ResetWriteBackoffForTests()
+        {
+            _writeRetryAtUtc = DateTime.MinValue;
+        }
+
+        /// <summary>Test seam: drop the instance as if the process died (no flush, no seal).</summary>
+        internal void SimulateCrashForTests()
+        {
+            CloseOpenStream();
+            ReleaseDirectory();
         }
 
         // Called under _lock. Only touches the wait handle on a state change, so a
@@ -373,26 +486,62 @@ namespace OzxApm.Network
 
         private void WorkerLoop()
         {
-            while (true)
+            try
             {
-                Pump();
+                while (true)
+                {
+                    Pump();
 
-                bool stop;
+                    bool stop;
+                    lock (_lock)
+                    {
+                        stop = _stopRequested && _pending.Count == 0;
+                    }
+                    if (stop)
+                        break;
+
+                    _wake.WaitOne(ComputeWaitMs());
+                }
+            }
+            catch (Exception ex)
+            {
+                Warn($"Storage worker stopped: {ex.Message}");
+            }
+            finally
+            {
+                try { CloseOpenStream(); } catch { }
+                ReleaseDirectory();
                 lock (_lock)
                 {
-                    stop = _stopRequested && _pending.Count == 0;
+                    MarkIdle();
                 }
-                if (stop)
-                    break;
-
-                _wake.WaitOne(Math.Max(10, _config.PersistIntervalMs));
             }
+        }
 
-            try { CloseOpenStream(); } catch { }
+        /// <summary>
+        /// How long the worker may sleep: briefly while events are pending, until
+        /// the open segment's seal deadline, otherwise a long idle wait (any
+        /// Enqueue/Flush/upload request wakes it immediately).
+        /// </summary>
+        private int ComputeWaitMs()
+        {
+            int persist = Math.Max(10, _config.PersistIntervalMs);
+            var now = DateTime.UtcNow;
             lock (_lock)
             {
-                MarkIdle();
+                if (_pending.Count > 0 || _flushRequested || _clearRequested || _uploadRequested || _completions.Count > 0)
+                {
+                    if (_writeRetryAtUtc > now && _pending.Count > 0)
+                        return (int)Math.Min(IdleWaitMs, Math.Max(persist, (_writeRetryAtUtc - now).TotalMilliseconds));
+                    return persist;
+                }
             }
+            if (_open != null && _open.EventCount > 0)
+            {
+                double ms = (_open.CreatedUtc.AddSeconds(_config.FlushIntervalSeconds) - now).TotalMilliseconds;
+                return (int)Math.Max(10, Math.Min(IdleWaitMs, ms));
+            }
+            return IdleWaitMs;
         }
 
         private void PumpInternal()
@@ -403,33 +552,33 @@ namespace OzxApm.Network
                 LoadExisting();
             }
 
-            bool flush, clear, upload, release;
+            bool flush, clear, upload;
+            bool writeAllowed = DateTime.UtcNow >= _writeRetryAtUtc;
             lock (_lock)
             {
-                var swap = _drain;
-                _drain = _pending;
-                _pending = swap;
+                if (writeAllowed)
+                {
+                    var swap = _drain;
+                    _drain = _pending;
+                    _pending = swap;
+                }
 
                 flush = _flushRequested;
                 clear = _clearRequested;
                 upload = _uploadRequested;
-                release = _releaseInFlight;
                 _flushRequested = false;
                 _clearRequested = false;
                 _uploadRequested = false;
-                _releaseInFlight = false;
 
-                _deleteDrain.Clear();
-                _deleteDrain.AddRange(_segmentsToDelete);
-                _segmentsToDelete.Clear();
+                _completionDrain.Clear();
+                _completionDrain.AddRange(_completions);
+                _completions.Clear();
             }
 
             try
             {
-                for (int i = 0; i < _deleteDrain.Count; i++)
-                    DeleteSegment(_deleteDrain[i]);
-                if (release)
-                    _inFlight = null;
+                for (int i = 0; i < _completionDrain.Count; i++)
+                    ApplyCompletion(_completionDrain[i]);
 
                 if (clear)
                     DeleteAll();
@@ -451,14 +600,32 @@ namespace OzxApm.Network
             finally
             {
                 _drain.Clear();
+                _completionDrain.Clear();
                 lock (_lock)
                 {
-                    if (_pending.Count == 0 && !_flushRequested && !_clearRequested && _segmentsToDelete.Count == 0)
-                    {
+                    if (upload && _uploadState == UploadPoll.Pending && _preparedUpload == null)
+                        _uploadState = UploadPoll.Empty; // PrepareUpload threw
+                    if (_pending.Count == 0 && !_flushRequested && !_clearRequested && _completions.Count == 0)
                         MarkIdle();
-                    }
                 }
             }
+        }
+
+        private void Warn(string message)
+        {
+            // Rate limited: a full disk must not flood the log.
+            var now = DateTime.UtcNow;
+            if ((now - _lastWarningUtc).TotalSeconds < WarningIntervalSeconds)
+            {
+                _suppressedWarnings++;
+                return;
+            }
+            if (_suppressedWarnings > 0)
+                message += $" ({_suppressedWarnings} similar warnings suppressed)";
+            _suppressedWarnings = 0;
+            _lastWarningUtc = now;
+            WarningsLogged++;
+            ApmClient.Log(LogLevel.Warning, message);
         }
 
         // ------------------------------------------------------------------
@@ -467,7 +634,22 @@ namespace OzxApm.Network
 
         private void LoadExisting()
         {
-            if (!_persistToDisk || !Directory.Exists(_storagePath))
+            if (!_persistToDisk)
+                return;
+
+            lock (s_ownedDirectories)
+            {
+                if (!s_ownedDirectories.Add(_storagePath))
+                {
+                    _persistToDisk = false;
+                    ApmClient.Log(LogLevel.Warning,
+                        "Another APM storage instance is still using " + _storagePath + "; this one keeps events in memory only");
+                    return;
+                }
+                _ownsDirectory = true;
+            }
+
+            if (!Directory.Exists(_storagePath))
                 return;
 
             _directoryReady = true;
@@ -486,26 +668,26 @@ namespace OzxApm.Network
                         try
                         {
                             File.Move(file, sealedPath);
-                            AddSegment(sealedPath, false);
+                            AddLoadedSegment(sealedPath, false);
                         }
                         catch (IOException)
                         {
-                            AddSegment(file, false);
+                            AddLoadedSegment(file, false);
                         }
                     }
                     else if (name.EndsWith(SegmentExtension, StringComparison.Ordinal))
                     {
-                        AddSegment(file, false);
+                        AddLoadedSegment(file, false);
                     }
                     else if (name.StartsWith(LegacyFilePrefix, StringComparison.Ordinal) &&
                              name.EndsWith(LegacyFileExtension, StringComparison.Ordinal))
                     {
-                        AddSegment(file, true);
+                        AddLoadedSegment(file, true);
                     }
                 }
                 catch (Exception ex)
                 {
-                    ApmClient.Log(LogLevel.Warning, $"Skipping unreadable event file {name}: {ex.Message}");
+                    Warn($"Skipping unreadable event file {name}: {ex.Message}");
                 }
             }
 
@@ -516,14 +698,27 @@ namespace OzxApm.Network
                 return string.CompareOrdinal(a.Name, b.Name);
             });
 
-            _seq = ReadSeqHighWater();
+            _seq = Math.Max(ReadSeqFile(), MaxSeqInNewestSegment());
             _seqReserved = _seq;
+
+            SweepQuarantine();
 
             if (_segments.Count > 0)
                 ApmClient.Log(LogLevel.Info, $"Found {_segments.Count} stored event batches ({_totalBytes} bytes) to upload");
         }
 
-        private void AddSegment(string path, bool legacy)
+        private void ReleaseDirectory()
+        {
+            if (!_ownsDirectory)
+                return;
+            lock (s_ownedDirectories)
+            {
+                s_ownedDirectories.Remove(_storagePath);
+            }
+            _ownsDirectory = false;
+        }
+
+        private void AddLoadedSegment(string path, bool legacy)
         {
             long bytes = new FileInfo(path).Length;
             if (bytes == 0)
@@ -537,13 +732,12 @@ namespace OzxApm.Network
                 Name = Path.GetFileName(path),
                 Path = path,
                 Bytes = bytes,
-                Legacy = legacy,
-                EventCount = -1
+                Legacy = legacy
             });
             _totalBytes += bytes;
         }
 
-        private long ReadSeqHighWater()
+        private long ReadSeqFile()
         {
             long best = 0;
             foreach (var name in new[] { SeqFileName, SeqFileName + ".tmp" })
@@ -559,10 +753,42 @@ namespace OzxApm.Network
                 }
                 catch
                 {
-                    // Unreadable: fall back to what we have.
+                    // Unreadable: the segment scan below covers it.
                 }
             }
             return best;
+        }
+
+        /// <summary>
+        /// Highest "seq" in the newest stored segment. Protects monotonicity when
+        /// the seq file was lost or is stale (seq only grows, so the newest
+        /// segment holds the highest number).
+        /// </summary>
+        private long MaxSeqInNewestSegment()
+        {
+            for (int s = _segments.Count - 1; s >= 0; s--)
+            {
+                if (_segments[s].Legacy)
+                    continue;
+                int length;
+                if (!ReadSegment(_segments[s], out length))
+                    continue;
+                long max = 0;
+                for (int i = IndexOf(_readBuffer, 0, length, SeqMarker); i >= 0; i = IndexOf(_readBuffer, i + 1, length, SeqMarker))
+                {
+                    long value = 0;
+                    int j = i + SeqMarker.Length;
+                    while (j < length && _readBuffer[j] >= (byte)'0' && _readBuffer[j] <= (byte)'9' && value < long.MaxValue / 10)
+                    {
+                        value = value * 10 + (_readBuffer[j] - (byte)'0');
+                        j++;
+                    }
+                    if (value > max)
+                        max = value;
+                }
+                return max;
+            }
+            return 0;
         }
 
         // ------------------------------------------------------------------
@@ -577,49 +803,114 @@ namespace OzxApm.Network
 
             int batchSize = Math.Max(1, _config.BatchSize);
             int maxBytes = Math.Max(1024, _config.MaxBatchBytes);
+            int committed = 0; // events[0..committed) are safely on disk (or dropped as unserializable)
 
-            ReserveSeq(events.Count);
-
-            for (int i = 0; i < events.Count; i++)
+            try
             {
-                var evt = events[i];
-                evt.seq = ++_seq;
-
-                string line;
-                try
+                int needSeq = 0;
+                for (int i = 0; i < events.Count; i++)
                 {
-                    line = JsonSerializer.SerializeEvent(evt);
+                    if (events[i].seq == 0)
+                        needSeq++;
                 }
-                catch (Exception ex)
+                // Do not hand out sequence numbers unless their reservation is durable.
+                ReserveSeq(needSeq);
+
+                int bufferStart = 0;
+                for (int i = 0; i < events.Count; i++)
                 {
-                    ApmClient.Log(LogLevel.Warning, $"Failed to serialize {evt.type} event: {ex.Message}");
-                    continue;
+                    var evt = events[i];
+                    if (evt.seq == 0)
+                        evt.seq = ++_seq; // kept if the write is retried
+
+                    string line;
+                    try
+                    {
+                        line = JsonSerializer.SerializeEvent(evt);
+                    }
+                    catch (Exception ex)
+                    {
+                        Warn($"Failed to serialize {evt.type} event: {ex.Message}");
+                        if (bufferStart == i)
+                        {
+                            bufferStart++;
+                            committed = bufferStart;
+                        }
+                        continue;
+                    }
+
+                    int lineBytes = Encoding.UTF8.GetByteCount(line) + 1;
+                    if (_open != null && _open.EventCount + _lineBufferEvents > 0 &&
+                        _open.Bytes + _lineBuffer.Length + lineBytes > maxBytes)
+                    {
+                        CommitLineBuffer();
+                        committed = i;
+                        bufferStart = i;
+                        SealOpen();
+                    }
+
+                    if (_open == null)
+                        OpenSegment();
+
+                    var bytes = Encoding.UTF8.GetBytes(line);
+                    _lineBuffer.Write(bytes, 0, bytes.Length);
+                    _lineBuffer.WriteByte((byte)'\n');
+                    _lineBufferEvents++;
+                    if (evt is ExceptionEvent || evt is CrashEvent || evt is StartupEvent)
+                        _lineBufferHighValue = true;
+
+                    if (_open.EventCount + _lineBufferEvents >= batchSize)
+                    {
+                        CommitLineBuffer();
+                        committed = i + 1;
+                        bufferStart = i + 1;
+                        SealOpen();
+                    }
                 }
 
-                int lineBytes = Encoding.UTF8.GetByteCount(line) + 1;
-                if (_open != null && _open.EventCount > 0 &&
-                    _open.Bytes + _lineBuffer.Length + lineBytes > maxBytes)
+                CommitLineBuffer();
+                committed = events.Count;
+                _writeFailures = 0;
+            }
+            catch (Exception ex)
+            {
+                OnWriteFailure(ex, events, committed);
+            }
+        }
+
+        /// <summary>
+        /// A write failed (disk full, I/O error, seq reservation not durable).
+        /// The open segment was truncated back to its last complete line (or, if
+        /// that failed too, is abandoned so nothing is ever appended to a cut-off
+        /// line). Events that did not reach the disk go back to the front of the
+        /// queue with their sequence numbers, and writing is retried with backoff.
+        /// </summary>
+        private void OnWriteFailure(Exception ex, List<BaseEvent> events, int committed)
+        {
+            _lineBuffer.SetLength(0);
+            _lineBufferEvents = 0;
+            _lineBufferHighValue = false;
+            AbandonOpen();
+
+            _writeFailures++;
+            double delay = Math.Min(30.0, 0.5 * Math.Pow(2, Math.Min(_writeFailures - 1, 6)));
+            _writeRetryAtUtc = DateTime.UtcNow.AddSeconds(delay);
+            Warn($"Failed to write events ({ex.GetType().Name}: {ex.Message}); retrying in {delay:F1}s");
+
+            if (committed >= events.Count)
+                return;
+
+            lock (_lock)
+            {
+                _pending.InsertRange(0, events.GetRange(committed, events.Count - committed));
+                int max = Math.Max(1, _config.MaxQueueSize);
+                if (_pending.Count > max)
                 {
-                    FlushLineBuffer();
-                    SealOpen();
-                }
-
-                if (_open == null)
-                    OpenSegment();
-
-                var bytes = Encoding.UTF8.GetBytes(line);
-                _lineBuffer.Write(bytes, 0, bytes.Length);
-                _lineBuffer.WriteByte((byte)'\n');
-                _open.EventCount++;
-
-                if (_open.EventCount >= batchSize)
-                {
-                    FlushLineBuffer();
-                    SealOpen();
+                    int drop = _pending.Count - max;
+                    _pending.RemoveRange(0, drop);
+                    _droppedPendingEvents += drop;
                 }
             }
-
-            FlushLineBuffer();
         }
 
         private void ReserveSeq(int count)
@@ -627,26 +918,25 @@ namespace OzxApm.Network
             if (_seq + count <= _seqReserved)
                 return;
 
-            _seqReserved = _seq + count + SeqReserveBlock;
-            if (!_persistToDisk)
-                return;
-
-            // Persist the reservation before any event uses it, so a crash can
-            // only create gaps, never reuse a sequence number.
-            try
+            long reserved = _seq + count + SeqReserveBlock;
+            if (_persistToDisk)
             {
+                // Make the reservation durable before any event uses it, so a crash
+                // can only create gaps, never reuse a number. Throws on failure.
                 EnsureDirectory();
                 string path = Path.Combine(_storagePath, SeqFileName);
                 string tmp = path + ".tmp";
-                File.WriteAllText(tmp, _seqReserved.ToString(CultureInfo.InvariantCulture));
+                var bytes = Encoding.ASCII.GetBytes(reserved.ToString(CultureInfo.InvariantCulture));
+                using (var fs = new FileStream(tmp, FileMode.Create, FileAccess.Write, FileShare.None))
+                {
+                    fs.Write(bytes, 0, bytes.Length);
+                    fs.Flush(true);
+                }
                 if (File.Exists(path))
                     File.Delete(path);
                 File.Move(tmp, path);
             }
-            catch (Exception ex)
-            {
-                ApmClient.Log(LogLevel.Warning, $"Failed to persist event sequence: {ex.Message}");
-            }
+            _seqReserved = reserved;
         }
 
         private void OpenSegment()
@@ -655,7 +945,7 @@ namespace OzxApm.Network
             long ms = new DateTimeOffset(now).ToUnixTimeMilliseconds();
             string baseName = SegmentBaseName(ms);
 
-            _open = new Segment { CreatedUtc = now };
+            var segment = new Segment { CreatedUtc = now, EventCount = 0, HighValue = 0 };
 
             if (_persistToDisk)
             {
@@ -666,15 +956,18 @@ namespace OzxApm.Network
                 {
                     baseName = SegmentBaseName(ms);
                 }
-                _open.Name = baseName + SegmentExtension;
-                _open.Path = Path.Combine(_storagePath, baseName + OpenExtension);
-                _openStream = new FileStream(_open.Path, FileMode.Append, FileAccess.Write, FileShare.Read, 4096);
+                segment.Name = baseName + SegmentExtension;
+                segment.Path = Path.Combine(_storagePath, baseName + OpenExtension);
+                // Unbuffered (we batch in _lineBuffer): a failed write cannot leave
+                // bytes in a FileStream buffer that a later Dispose would flush.
+                _openStream = new FileStream(segment.Path, FileMode.CreateNew, FileAccess.Write, FileShare.Read, 1);
             }
             else
             {
-                _open.Name = baseName + SegmentExtension;
-                _open.Mem = new MemoryStream();
+                segment.Name = baseName + SegmentExtension;
+                segment.Mem = new MemoryStream();
             }
+            _open = segment;
         }
 
         private string SegmentBaseName(long unixMs)
@@ -683,14 +976,20 @@ namespace OzxApm.Network
                    (_segmentCounter++ % 1000000).ToString("D6", CultureInfo.InvariantCulture);
         }
 
-        private void FlushLineBuffer()
+        /// <summary>
+        /// Appends the buffered lines to the open segment. On failure the file is
+        /// truncated back to the last committed length and the exception rethrown.
+        /// </summary>
+        private void CommitLineBuffer()
         {
             if (_lineBuffer.Length == 0 || _open == null)
                 return;
 
             int length = (int)_lineBuffer.Length;
+            long committedLength = _open.Bytes;
             try
             {
+                BeforeWriteHook?.Invoke(_open.Mem != null ? (Stream)_open.Mem : _openStream);
                 if (_open.Mem != null)
                 {
                     _open.Mem.Write(_lineBuffer.GetBuffer(), 0, length);
@@ -701,12 +1000,60 @@ namespace OzxApm.Network
                     // Hand the bytes to the OS so they survive the process being killed.
                     _openStream.Flush();
                 }
-                _open.Bytes += length;
-                _totalBytes += length;
             }
-            finally
+            catch
             {
-                _lineBuffer.SetLength(0);
+                TruncateOpen(committedLength);
+                throw;
+            }
+
+            _open.Bytes += length;
+            _totalBytes += length;
+            _open.EventCount += _lineBufferEvents;
+            if (_lineBufferHighValue)
+                _open.HighValue = 1;
+            _lineBuffer.SetLength(0);
+            _lineBufferEvents = 0;
+            _lineBufferHighValue = false;
+        }
+
+        private void TruncateOpen(long length)
+        {
+            try
+            {
+                if (_open.Mem != null)
+                {
+                    _open.Mem.SetLength(length);
+                }
+                else if (_openStream != null)
+                {
+                    _openStream.Flush();
+                    _openStream.SetLength(length);
+                    _openStream.Flush();
+                }
+            }
+            catch
+            {
+                // AbandonOpen() makes sure nothing is appended to a cut-off line.
+            }
+        }
+
+        /// <summary>
+        /// Stops writing to the open segment: keeps what it holds (sealed), or
+        /// deletes it if empty.
+        /// </summary>
+        private void AbandonOpen()
+        {
+            if (_open == null)
+                return;
+            try
+            {
+                SealOpen();
+            }
+            catch
+            {
+                CloseOpenStream();
+                _open = null;
             }
         }
 
@@ -761,34 +1108,173 @@ namespace OzxApm.Network
         }
 
         // ------------------------------------------------------------------
-        // Cap and deletion (worker thread)
+        // Cap, completion and deletion (worker thread)
         // ------------------------------------------------------------------
 
+        /// <summary>
+        /// Keeps local storage under the cap by dropping the oldest segments,
+        /// low-value ones (no exception/crash/startup events) first. Segments
+        /// currently being uploaded and the open segment are never evicted.
+        /// </summary>
         private void EnforceCap()
         {
-            long cap = Math.Max(1024, (long)_config.MaxOfflineStorageBytes);
-            while (_totalBytes > cap && _segments.Count > 0)
+            long cap = CapBytes;
+            while (_totalBytes > cap)
             {
-                var oldest = _segments[0];
-                _segments.RemoveAt(0);
-                if (oldest.EventCount > 0)
-                    _droppedByCap += oldest.EventCount;
+                int victim = -1;
+                for (int pass = 0; pass < 2 && victim < 0; pass++)
+                {
+                    for (int i = 0; i < _segments.Count; i++)
+                    {
+                        var s = _segments[i];
+                        if (_inFlight.Contains(s.Name))
+                            continue;
+                        if (pass == 0 && IsHighValue(s))
+                            continue;
+                        victim = i;
+                        break;
+                    }
+                }
+                if (victim < 0)
+                    break;
+
+                var oldest = _segments[victim];
+                _segments.RemoveAt(victim);
+                _droppedByCap += CountEvents(oldest);
                 DeleteSegmentData(oldest);
-                ApmClient.Log(LogLevel.Debug, $"Storage full, dropped oldest batch {oldest.Name}");
+                ApmClient.Log(LogLevel.Debug, $"Storage full, dropped batch {oldest.Name}");
             }
         }
 
-        private void DeleteSegment(string name)
+        private bool IsHighValue(Segment s)
+        {
+            if (s.HighValue < 0)
+            {
+                s.HighValue = 0;
+                if (ReadSegment(s, out int length))
+                {
+                    for (int m = 0; m < HighValueMarkers.Length; m++)
+                    {
+                        if (IndexOf(_readBuffer, 0, length, HighValueMarkers[m]) >= 0)
+                        {
+                            s.HighValue = 1;
+                            break;
+                        }
+                    }
+                }
+            }
+            return s.HighValue == 1;
+        }
+
+        private int CountEvents(Segment s)
+        {
+            if (s.EventCount >= 0)
+                return s.EventCount;
+            if (!ReadSegment(s, out int length))
+                return 0;
+            if (s.Legacy)
+                return CountOccurrences(_readBuffer, length, LegacyEventMarker);
+            int lines = 0;
+            for (int i = 0; i < length; i++)
+            {
+                if (_readBuffer[i] == (byte)'\n')
+                    lines++;
+            }
+            return lines;
+        }
+
+        private void ApplyCompletion(Completion completion)
+        {
+            var names = completion.Batch.SegmentNames;
+            for (int n = 0; n < names.Count; n++)
+            {
+                _inFlight.Remove(names[n]);
+                if (completion.Outcome == UploadOutcome.Retry)
+                    continue;
+
+                int index = FindSegment(names[n]);
+                if (index < 0)
+                    continue;
+                var segment = _segments[index];
+                _segments.RemoveAt(index);
+                if (completion.Outcome == UploadOutcome.Rejected)
+                    Quarantine(segment);
+                else
+                    DeleteSegmentData(segment);
+            }
+        }
+
+        private int FindSegment(string name)
         {
             for (int i = 0; i < _segments.Count; i++)
             {
                 if (_segments[i].Name == name)
-                {
-                    var segment = _segments[i];
-                    _segments.RemoveAt(i);
-                    DeleteSegmentData(segment);
+                    return i;
+            }
+            return -1;
+        }
+
+        /// <summary>
+        /// Moves a batch the server explicitly rejected out of the upload queue
+        /// into quarantine/ (kept for inspection, capped by size and age).
+        /// </summary>
+        private void Quarantine(Segment segment)
+        {
+            if (segment.Path == null)
+            {
+                DeleteSegmentData(segment);
+                return;
+            }
+            try
+            {
+                Directory.CreateDirectory(_quarantinePath);
+                string target = Path.Combine(_quarantinePath, segment.Name);
+                if (File.Exists(target))
+                    File.Delete(target);
+                File.Move(segment.Path, target);
+                _totalBytes -= segment.Bytes;
+                if (_totalBytes < 0) _totalBytes = 0;
+                Warn($"Server rejected batch {segment.Name}; moved to quarantine");
+            }
+            catch (Exception ex)
+            {
+                Warn($"Failed to quarantine {segment.Name}: {ex.Message}");
+                DeleteSegmentData(segment);
+            }
+            SweepQuarantine();
+        }
+
+        private void SweepQuarantine()
+        {
+            try
+            {
+                if (!Directory.Exists(_quarantinePath))
                     return;
+                var files = Directory.GetFiles(_quarantinePath);
+                Array.Sort(files, StringComparer.Ordinal); // oldest first (names start with the creation time)
+                var infos = new List<FileInfo>(files.Length);
+                long total = 0;
+                var cutoff = DateTime.UtcNow - QuarantineTtl;
+                foreach (var f in files)
+                {
+                    var info = new FileInfo(f);
+                    if (info.LastWriteTimeUtc < cutoff)
+                    {
+                        info.Delete();
+                        continue;
+                    }
+                    infos.Add(info);
+                    total += info.Length;
                 }
+                for (int i = 0; i < infos.Count && total > MaxQuarantineBytes; i++)
+                {
+                    total -= infos[i].Length;
+                    infos[i].Delete();
+                }
+            }
+            catch (Exception ex)
+            {
+                Warn($"Failed to clean quarantine: {ex.Message}");
             }
         }
 
@@ -806,7 +1292,7 @@ namespace OzxApm.Network
                 }
                 catch (Exception ex)
                 {
-                    ApmClient.Log(LogLevel.Warning, $"Failed to delete {segment.Name}: {ex.Message}");
+                    Warn($"Failed to delete {segment.Name}: {ex.Message}");
                 }
             }
             segment.Mem = null;
@@ -823,8 +1309,20 @@ namespace OzxApm.Network
             for (int i = 0; i < _segments.Count; i++)
                 DeleteSegmentData(_segments[i]);
             _segments.Clear();
-            _inFlight = null;
+            _inFlight.Clear();
             _totalBytes = 0;
+            _lineBuffer.SetLength(0);
+            _lineBufferEvents = 0;
+
+            try
+            {
+                if (Directory.Exists(_quarantinePath))
+                    Directory.Delete(_quarantinePath, true);
+            }
+            catch (Exception ex)
+            {
+                Warn($"Failed to clear quarantine: {ex.Message}");
+            }
 
             lock (_lock)
             {
@@ -842,23 +1340,19 @@ namespace OzxApm.Network
         {
             UploadBatch batch = null;
 
-            if (_config.Consent == ConsentState.Granted && _inFlight == null)
+            if (_config.Consent == ConsentState.Granted && _inFlight.Count == 0)
             {
                 while (_segments.Count > 0 && batch == null)
                 {
-                    var segment = _segments[0];
-                    batch = BuildBatch(segment);
-                    if (batch == null)
-                    {
-                        // Nothing valid inside (e.g. only a torn line): drop it.
-                        _segments.RemoveAt(0);
-                        DeleteSegmentData(segment);
-                    }
+                    batch = BuildBatch();
                 }
             }
 
             if (batch != null)
-                _inFlight = batch.SegmentName;
+            {
+                for (int i = 0; i < batch.SegmentNames.Count; i++)
+                    _inFlight.Add(batch.SegmentNames[i]);
+            }
 
             lock (_lock)
             {
@@ -867,61 +1361,221 @@ namespace OzxApm.Network
             }
         }
 
-        private UploadBatch BuildBatch(Segment segment)
+        /// <summary>
+        /// Builds one request from the oldest segment(s). Returns null after
+        /// dropping a segment with no valid event, so the caller tries the next.
+        /// </summary>
+        private UploadBatch BuildBatch()
         {
-            byte[] raw;
-            try
+            var first = _segments[0];
+            var batch = new UploadBatch { SegmentName = first.Name };
+
+            _bodyBuffer.SetLength(0);
+
+            if (first.Legacy)
             {
-                raw = segment.Mem != null ? segment.Mem.ToArray() : File.ReadAllBytes(segment.Path);
-            }
-            catch (Exception ex)
-            {
-                ApmClient.Log(LogLevel.Warning, $"Failed to read {segment.Name}: {ex.Message}");
-                return null;
+                if (!ReadSegment(first, out int length) || !LooksLikeObject(_readBuffer, length))
+                {
+                    DropUnreadable(0);
+                    return null;
+                }
+                // Pre-APM-2 files already are a full {"events":[...]} body; the
+                // server salvages the well-formed events if some are broken.
+                _bodyBuffer.Write(_readBuffer, 0, length);
+                batch.EventCount = Math.Max(1, CountOccurrences(_readBuffer, length, LegacyEventMarker));
+                batch.SegmentNames.Add(first.Name);
+                return FinishBatch(batch);
             }
 
-            byte[] body;
-            int eventCount;
-            if (segment.Legacy)
+            int batchSize = Math.Max(1, _config.BatchSize);
+            int maxBytes = Math.Max(1024, _config.MaxBatchBytes);
+            _bodyBuffer.Write(BatchPrefix, 0, BatchPrefix.Length);
+
+            for (int s = 0; s < _segments.Count; s++)
             {
-                body = BuildLegacyBody(raw, out eventCount);
-            }
-            else
-            {
-                body = BuildBatchBody(raw, out eventCount);
+                var segment = _segments[s];
+                if (segment.Legacy)
+                    break;
+                if (s > 0 && segment.EventCount >= 0 &&
+                    (batch.EventCount + segment.EventCount > batchSize ||
+                     _bodyBuffer.Length + segment.Bytes > maxBytes))
+                    break;
+
+                if (!ReadSegment(segment, out int length))
+                {
+                    if (s == 0)
+                    {
+                        DropUnreadable(0);
+                        return null;
+                    }
+                    break;
+                }
+
+                long mark = _bodyBuffer.Length;
+                int added = AppendValidLines(_readBuffer, length, batch.EventCount > 0);
+                if (added == 0)
+                {
+                    _bodyBuffer.SetLength(mark);
+                    if (s == 0)
+                    {
+                        // Nothing valid inside (e.g. only a cut-off line): drop it.
+                        DropUnreadable(0);
+                        return null;
+                    }
+                    break;
+                }
+                if (s > 0 && (batch.EventCount + added > batchSize || _bodyBuffer.Length + BatchSuffix.Length > maxBytes))
+                {
+                    _bodyBuffer.SetLength(mark); // would overflow the request
+                    break;
+                }
+                batch.EventCount += added;
+                batch.SegmentNames.Add(segment.Name);
             }
 
-            if (body == null || eventCount == 0)
-                return null;
+            _bodyBuffer.Write(BatchSuffix, 0, BatchSuffix.Length);
+            return FinishBatch(batch);
+        }
 
-            var batch = new UploadBatch
-            {
-                SegmentName = segment.Name,
-                EventCount = eventCount,
-                UncompressedBytes = body.Length,
-                Payload = body
-            };
+        private void DropUnreadable(int index)
+        {
+            var segment = _segments[index];
+            _segments.RemoveAt(index);
+            _droppedByCap += Math.Max(0, segment.EventCount);
+            DeleteSegmentData(segment);
+        }
+
+        private UploadBatch FinishBatch(UploadBatch batch)
+        {
+            int length = (int)_bodyBuffer.Length;
+            batch.UncompressedBytes = length;
 
             if (_config.LogLevel >= LogLevel.Debug)
-                batch.DebugJson = Encoding.UTF8.GetString(body);
+                batch.DebugJson = Encoding.UTF8.GetString(_bodyBuffer.GetBuffer(), 0, length);
 
-            if (_config.EnableCompression && body.Length > CompressThresholdBytes)
+            if (_config.EnableCompression && length > CompressThresholdBytes)
             {
-                var compressed = Gzip(body);
-                if (compressed != null)
+                try
                 {
-                    batch.Payload = compressed;
+                    _gzipBuffer.SetLength(0);
+                    using (var gzip = new GZipStream(_gzipBuffer, CompressionMode.Compress, true))
+                    {
+                        gzip.Write(_bodyBuffer.GetBuffer(), 0, length);
+                    }
+                    batch.Payload = _gzipBuffer.ToArray();
                     batch.Compressed = true;
                 }
+                catch (Exception ex)
+                {
+                    Warn($"Compression failed: {ex.Message}");
+                }
             }
+            if (batch.Payload == null)
+                batch.Payload = _bodyBuffer.ToArray();
 
+            TrimPooledBuffers();
             return batch;
         }
 
         /// <summary>
-        /// Wraps complete JSON lines into {"events":[...]}. A last line without a
-        /// trailing newline was cut off by a crash and is skipped, as is any line
-        /// that is not a JSON object.
+        /// Appends every complete, well-formed JSON-object line to the body. A last
+        /// line without a newline was cut off by a crash; a line that is not a
+        /// valid object (e.g. a cut-off line that later data was appended to) is
+        /// dropped so it cannot invalidate the whole request.
+        /// </summary>
+        private int AppendValidLines(byte[] raw, int length, bool needComma)
+        {
+            int added = 0;
+            int lineStart = 0;
+            for (int i = 0; i < length; i++)
+            {
+                if (raw[i] != (byte)'\n')
+                    continue;
+
+                int start = lineStart;
+                int end = i;
+                lineStart = i + 1;
+                if (end > start && raw[end - 1] == (byte)'\r')
+                    end--;
+                if (!JsonValidator.IsObject(raw, start, end))
+                    continue;
+
+                if (needComma || added > 0)
+                    _bodyBuffer.WriteByte((byte)',');
+                _bodyBuffer.Write(raw, start, end - start);
+                added++;
+            }
+            return added;
+        }
+
+        /// <summary>Reads a segment into the pooled read buffer.</summary>
+        private bool ReadSegment(Segment segment, out int length)
+        {
+            length = 0;
+            try
+            {
+                if (segment.Mem != null)
+                {
+                    length = (int)segment.Mem.Length;
+                    EnsureReadBuffer(length);
+                    Buffer.BlockCopy(segment.Mem.GetBuffer(), 0, _readBuffer, 0, length);
+                    return true;
+                }
+                if (segment.Path == null)
+                    return false;
+
+                using (var fs = new FileStream(segment.Path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                {
+                    long size = fs.Length;
+                    if (size > int.MaxValue / 2)
+                        return false;
+                    EnsureReadBuffer((int)size);
+                    int read;
+                    while (length < size && (read = fs.Read(_readBuffer, length, (int)size - length)) > 0)
+                        length += read;
+                }
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Warn($"Failed to read {segment.Name}: {ex.Message}");
+                return false;
+            }
+        }
+
+        private void EnsureReadBuffer(int size)
+        {
+            if (_readBuffer.Length < size)
+                _readBuffer = new byte[Math.Max(size, _readBuffer.Length * 2)];
+        }
+
+        private void TrimPooledBuffers()
+        {
+            // Keep steady-state buffers; release one-off large ones (e.g. a big legacy file).
+            if (_readBuffer.Length > MaxPooledBufferBytes)
+                _readBuffer = new byte[16 * 1024];
+            if (_bodyBuffer.Capacity > MaxPooledBufferBytes)
+            {
+                _bodyBuffer.SetLength(0);
+                _bodyBuffer.Capacity = 16 * 1024;
+            }
+            if (_gzipBuffer.Capacity > MaxPooledBufferBytes)
+            {
+                _gzipBuffer.SetLength(0);
+                _gzipBuffer.Capacity = 8 * 1024;
+            }
+        }
+
+        private static bool LooksLikeObject(byte[] data, int length)
+        {
+            int i = 0;
+            while (i < length && data[i] <= (byte)' ')
+                i++;
+            return i < length && data[i] == (byte)'{';
+        }
+
+        /// <summary>
+        /// Wraps complete JSON lines into {"events":[...]}. Exposed for tests.
         /// </summary>
         internal static byte[] BuildBatchBody(byte[] raw, out int eventCount)
         {
@@ -929,434 +1583,47 @@ namespace OzxApm.Network
             using (var output = new MemoryStream(raw.Length + BatchPrefix.Length + BatchSuffix.Length))
             {
                 output.Write(BatchPrefix, 0, BatchPrefix.Length);
-
                 int lineStart = 0;
                 for (int i = 0; i < raw.Length; i++)
                 {
                     if (raw[i] != (byte)'\n')
                         continue;
-
                     int start = lineStart;
-                    int end = i; // exclusive
+                    int end = i;
                     lineStart = i + 1;
-
                     if (end > start && raw[end - 1] == (byte)'\r')
                         end--;
-                    if (end - start < 2 || raw[start] != (byte)'{' || raw[end - 1] != (byte)'}')
+                    if (!JsonValidator.IsObject(raw, start, end))
                         continue;
-
                     if (eventCount > 0)
                         output.WriteByte((byte)',');
                     output.Write(raw, start, end - start);
                     eventCount++;
                 }
-
                 output.Write(BatchSuffix, 0, BatchSuffix.Length);
                 return eventCount > 0 ? output.ToArray() : null;
             }
         }
 
-        /// <summary>
-        /// Pre-APM-2 files already contain a full {"events":[...]} body; send them
-        /// unchanged. If the old serializer wrote invalid JSON (e.g. "59,50" under
-        /// de-DE) the server answers 400 and the file is dropped.
-        /// </summary>
-        private static byte[] BuildLegacyBody(byte[] raw, out int eventCount)
-        {
-            eventCount = 0;
-            int first = 0;
-            while (first < raw.Length && raw[first] <= (byte)' ')
-                first++;
-            if (first >= raw.Length || raw[first] != (byte)'{')
-                return null;
-
-            eventCount = CountOccurrences(raw, LegacyEventMarker);
-            if (eventCount == 0)
-                eventCount = 1; // unknown, but non-empty
-            return raw;
-        }
-
-        private static int CountOccurrences(byte[] data, byte[] pattern)
+        private static int CountOccurrences(byte[] data, int length, byte[] pattern)
         {
             int count = 0;
-            for (int i = 0; i <= data.Length - pattern.Length; i++)
+            for (int i = IndexOf(data, 0, length, pattern); i >= 0; i = IndexOf(data, i + pattern.Length, length, pattern))
+                count++;
+            return count;
+        }
+
+        private static int IndexOf(byte[] data, int start, int length, byte[] pattern)
+        {
+            for (int i = start; i <= length - pattern.Length; i++)
             {
                 int j = 0;
                 while (j < pattern.Length && data[i + j] == pattern[j])
                     j++;
                 if (j == pattern.Length)
-                {
-                    count++;
-                    i += pattern.Length - 1;
-                }
+                    return i;
             }
-            return count;
+            return -1;
         }
-
-        private static byte[] Gzip(byte[] data)
-        {
-            try
-            {
-                using (var output = new MemoryStream())
-                {
-                    using (var gzip = new GZipStream(output, CompressionMode.Compress))
-                    {
-                        gzip.Write(data, 0, data.Length);
-                    }
-                    return output.ToArray();
-                }
-            }
-            catch (Exception ex)
-            {
-                ApmClient.Log(LogLevel.Warning, $"Compression failed: {ex.Message}");
-                return null;
-            }
-        }
-    }
-
-    /// <summary>
-    /// Records all network communication with the server for debugging purposes.
-    /// Logs are persisted to file and can be retrieved for analysis.
-    /// </summary>
-    public class NetworkLogger
-    {
-        private readonly ApmConfig _config;
-        private readonly string _logFilePath;
-        private readonly object _lock = new object();
-        private readonly List<NetworkLogEntry> _recentLogs = new List<NetworkLogEntry>();
-
-        private const int MaxRecentLogs = 100;
-        private const string LogFileName = "ozx_apm_network.log";
-
-        public NetworkLogger(ApmConfig config)
-        {
-            _config = config;
-            _logFilePath = Path.Combine(Application.persistentDataPath, LogFileName);
-
-            // Output log file path to console
-            Debug.Log($"[OzxApm] Network log file: {_logFilePath}");
-
-            // Write session start marker
-            WriteLog(new NetworkLogEntry
-            {
-                Timestamp = DateTime.UtcNow,
-                Level = NetworkLogLevel.Info,
-                Message = $"=== Network logging session started === App: {config.AppVersion}, Server: {config.ServerUrl}"
-            });
-        }
-
-        /// <summary>
-        /// Logs a request being sent to the server
-        /// </summary>
-        public void LogRequest(string url, string method, Dictionary<string, string> headers, string body, int bodyBytes, bool isCompressed)
-        {
-            var entry = new NetworkLogEntry
-            {
-                Timestamp = DateTime.UtcNow,
-                Level = NetworkLogLevel.Info,
-                Type = NetworkLogType.Request,
-                Url = url,
-                Method = method,
-                Headers = headers,
-                Body = TruncateBody(body),
-                BodyBytes = bodyBytes,
-                IsCompressed = isCompressed,
-                Message = $"REQUEST: {method} {url} ({bodyBytes} bytes{(isCompressed ? ", gzip" : "")})"
-            };
-
-            WriteLog(entry);
-            LogToConsole(entry);
-        }
-
-        /// <summary>
-        /// Logs a successful response from the server
-        /// </summary>
-        public void LogResponse(string url, int statusCode, string responseBody, double elapsedMs, int eventCount)
-        {
-            var entry = new NetworkLogEntry
-            {
-                Timestamp = DateTime.UtcNow,
-                Level = NetworkLogLevel.Info,
-                Type = NetworkLogType.Response,
-                Url = url,
-                StatusCode = statusCode,
-                Body = TruncateBody(responseBody),
-                ElapsedMs = elapsedMs,
-                EventCount = eventCount,
-                Message = $"RESPONSE: {statusCode} OK from {url} ({elapsedMs:F0}ms, {eventCount} events)"
-            };
-
-            WriteLog(entry);
-            LogToConsole(entry);
-        }
-
-        /// <summary>
-        /// Logs a failed request
-        /// </summary>
-        public void LogFailure(string url, int statusCode, string error, string responseBody, double elapsedMs, int eventCount, int consecutiveFailures, float backoffMultiplier)
-        {
-            var entry = new NetworkLogEntry
-            {
-                Timestamp = DateTime.UtcNow,
-                Level = NetworkLogLevel.Error,
-                Type = NetworkLogType.Failure,
-                Url = url,
-                StatusCode = statusCode,
-                Error = error,
-                Body = TruncateBody(responseBody),
-                ElapsedMs = elapsedMs,
-                EventCount = eventCount,
-                ConsecutiveFailures = consecutiveFailures,
-                BackoffMultiplier = backoffMultiplier,
-                Message = $"FAILURE: {error} from {url} (status: {statusCode}, {elapsedMs:F0}ms, failures: {consecutiveFailures}, backoff: {backoffMultiplier}x)"
-            };
-
-            WriteLog(entry);
-            LogToConsole(entry);
-        }
-
-        /// <summary>
-        /// Logs when events are queued for offline storage
-        /// </summary>
-        public void LogOfflineQueue(int eventCount, string reason)
-        {
-            var entry = new NetworkLogEntry
-            {
-                Timestamp = DateTime.UtcNow,
-                Level = NetworkLogLevel.Warning,
-                Type = NetworkLogType.OfflineQueue,
-                EventCount = eventCount,
-                Message = $"OFFLINE_QUEUE: {eventCount} events queued - {reason}"
-            };
-
-            WriteLog(entry);
-            LogToConsole(entry);
-        }
-
-        /// <summary>
-        /// Logs when offline events are being retried
-        /// </summary>
-        public void LogOfflineRetry(int fileCount, int eventCount)
-        {
-            var entry = new NetworkLogEntry
-            {
-                Timestamp = DateTime.UtcNow,
-                Level = NetworkLogLevel.Info,
-                Type = NetworkLogType.OfflineRetry,
-                EventCount = eventCount,
-                Message = $"OFFLINE_RETRY: Processing {fileCount} offline files ({eventCount} events)"
-            };
-
-            WriteLog(entry);
-            LogToConsole(entry);
-        }
-
-        /// <summary>
-        /// Logs compression details
-        /// </summary>
-        public void LogCompression(int originalBytes, int compressedBytes)
-        {
-            float ratio = (float)compressedBytes / originalBytes;
-            var entry = new NetworkLogEntry
-            {
-                Timestamp = DateTime.UtcNow,
-                Level = NetworkLogLevel.Debug,
-                Type = NetworkLogType.Compression,
-                BodyBytes = compressedBytes,
-                Message = $"COMPRESSION: {originalBytes} -> {compressedBytes} bytes ({ratio:P0})"
-            };
-
-            WriteLog(entry);
-            LogToConsole(entry);
-        }
-
-        /// <summary>
-        /// Gets recent log entries (in-memory cache)
-        /// </summary>
-        public List<NetworkLogEntry> GetRecentLogs()
-        {
-            lock (_lock)
-            {
-                return new List<NetworkLogEntry>(_recentLogs);
-            }
-        }
-
-        /// <summary>
-        /// Gets the full log file path
-        /// </summary>
-        public string GetLogFilePath()
-        {
-            return _logFilePath;
-        }
-
-        /// <summary>
-        /// Clears the log file
-        /// </summary>
-        public void ClearLogs()
-        {
-            lock (_lock)
-            {
-                _recentLogs.Clear();
-                try
-                {
-                    if (File.Exists(_logFilePath))
-                    {
-                        File.Delete(_logFilePath);
-                    }
-                }
-                catch (Exception ex)
-                {
-                    ApmClient.Log(LogLevel.Warning, $"Failed to clear network log file: {ex.Message}");
-                }
-            }
-        }
-
-        private void WriteLog(NetworkLogEntry entry)
-        {
-            lock (_lock)
-            {
-                // Add to recent logs cache
-                _recentLogs.Add(entry);
-                if (_recentLogs.Count > MaxRecentLogs)
-                {
-                    _recentLogs.RemoveAt(0);
-                }
-
-                // Only write to file in debug builds or if log level is Debug
-                if (!Debug.isDebugBuild && _config.LogLevel > LogLevel.Debug)
-                    return;
-
-                // The log contains request bodies: no file without consent.
-                if (_config.Consent != ConsentState.Granted)
-                    return;
-
-                try
-                {
-                    string logLine = FormatLogEntry(entry);
-                    File.AppendAllText(_logFilePath, logLine + Environment.NewLine);
-                }
-                catch (Exception ex)
-                {
-                    // Silently fail - don't want logging to break the SDK
-                    Debug.LogWarning($"[OzxApm] Failed to write network log: {ex.Message}");
-                }
-            }
-        }
-
-        private void LogToConsole(NetworkLogEntry entry)
-        {
-            if (_config.LogLevel > LogLevel.Debug)
-                return;
-
-            // Never Debug.LogError: upload failures are expected (offline players)
-            // and an error-level log would be captured by ExceptionCollector and
-            // by the game's own error reporting.
-            string prefix = "[OzxApm] [Network] ";
-            switch (entry.Level)
-            {
-                case NetworkLogLevel.Error:
-                case NetworkLogLevel.Warning:
-                    Debug.LogWarning(prefix + entry.Message);
-                    break;
-                default:
-                    Debug.Log(prefix + entry.Message);
-                    break;
-            }
-        }
-
-        private string FormatLogEntry(NetworkLogEntry entry)
-        {
-            var sb = new StringBuilder();
-            sb.Append($"[{entry.Timestamp:yyyy-MM-dd HH:mm:ss.fff}] ");
-            sb.Append($"[{entry.Level}] ");
-            sb.Append(entry.Message);
-
-            // Add detailed info for requests and failures
-            if (entry.Type == NetworkLogType.Request && entry.Headers != null)
-            {
-                sb.Append(" | Headers: ");
-                foreach (var kv in entry.Headers)
-                {
-                    // Mask sensitive headers
-                    string value = kv.Key.ToLower().Contains("key") || kv.Key.ToLower().Contains("auth")
-                        ? MaskValue(kv.Value)
-                        : kv.Value;
-                    sb.Append($"{kv.Key}={value}, ");
-                }
-            }
-
-            if (!string.IsNullOrEmpty(entry.Body) && (entry.Type == NetworkLogType.Request || entry.Type == NetworkLogType.Failure))
-            {
-                sb.Append($" | Body: {entry.Body}");
-            }
-
-            if (!string.IsNullOrEmpty(entry.Error))
-            {
-                sb.Append($" | Error: {entry.Error}");
-            }
-
-            return sb.ToString();
-        }
-
-        private string TruncateBody(string body)
-        {
-            if (string.IsNullOrEmpty(body))
-                return null;
-
-            const int maxLength = 1000;
-            return body.Length > maxLength
-                ? body.Substring(0, maxLength) + "... (truncated)"
-                : body;
-        }
-
-        private string MaskValue(string value)
-        {
-            if (string.IsNullOrEmpty(value) || value.Length <= 4)
-                return "****";
-            return value.Substring(0, 4) + "****";
-        }
-    }
-
-    /// <summary>
-    /// Represents a single network log entry
-    /// </summary>
-    [Serializable]
-    public class NetworkLogEntry
-    {
-        public DateTime Timestamp;
-        public NetworkLogLevel Level;
-        public NetworkLogType Type;
-        public string Message;
-        public string Url;
-        public string Method;
-        public Dictionary<string, string> Headers;
-        public string Body;
-        public int BodyBytes;
-        public bool IsCompressed;
-        public int StatusCode;
-        public string Error;
-        public double ElapsedMs;
-        public int EventCount;
-        public int ConsecutiveFailures;
-        public float BackoffMultiplier;
-    }
-
-    public enum NetworkLogLevel
-    {
-        Debug,
-        Info,
-        Warning,
-        Error
-    }
-
-    public enum NetworkLogType
-    {
-        Request,
-        Response,
-        Failure,
-        OfflineQueue,
-        OfflineRetry,
-        Compression,
-        Other
     }
 }

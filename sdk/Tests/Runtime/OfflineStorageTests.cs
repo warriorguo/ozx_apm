@@ -42,6 +42,8 @@ namespace OzxApm.Tests
         [TearDown]
         public void TearDown()
         {
+            OfflineStorage.BeforeWriteHook = null;
+            OfflineStorage.FailThreadStartForTests = false;
             foreach (var store in _stores)
                 store.Shutdown(0);
             _stores.Clear();
@@ -259,6 +261,7 @@ namespace OzxApm.Tests
             crashed.Enqueue(a);
             crashed.Pump(); // written to a .open segment, then the process "dies"
             Assert.IsTrue(SegmentFiles()[0].EndsWith(".open", StringComparison.Ordinal));
+            crashed.SimulateCrashForTests();
 
             var next = NewStore();
             next.Pump();
@@ -465,6 +468,409 @@ namespace OzxApm.Tests
 
             Assert.AreEqual(1, SegmentFiles().Length);
             store.Shutdown(5000);
+        }
+
+        // ---------------------------------------------------------------
+        // Write failures (disk full, I/O errors)
+        // ---------------------------------------------------------------
+
+        private static List<string> EventIds(string text)
+        {
+            return Regex.Matches(text, "\"event_id\":\"([0-9a-f]{32})\"").Cast<Match>().Select(m => m.Groups[1].Value).ToList();
+        }
+
+        private static void AssertEveryLineIsValidJson(string file)
+        {
+            var bytes = File.ReadAllBytes(file);
+            int start = 0;
+            for (int i = 0; i < bytes.Length; i++)
+            {
+                if (bytes[i] != (byte)'\n') continue;
+                string line = Encoding.UTF8.GetString(bytes, start, i - start);
+                Assert.IsTrue(line.StartsWith("{") && line.EndsWith("}") && line.IndexOf("}{", StringComparison.Ordinal) < 0,
+                    "corrupt line in " + Path.GetFileName(file) + ": " + line);
+                start = i + 1;
+            }
+            Assert.AreEqual(bytes.Length, start, "file ends with an incomplete line: " + Path.GetFileName(file));
+        }
+
+        [Test]
+        public void PartialWriteThenFailure_IsTruncated_AndEventsAreRetried()
+        {
+            var store = NewStore();
+            var first = Perf(1);
+            store.Enqueue(first);
+            store.Pump(); // one good line on disk
+
+            // Disk fills up mid-write: half a line reaches the file, then the write throws.
+            OfflineStorage.BeforeWriteHook = stream =>
+            {
+                var partial = Encoding.UTF8.GetBytes("{\"type\":\"perf_sample\",\"event_id\":\"to");
+                stream.Write(partial, 0, partial.Length);
+                stream.Flush();
+                throw new IOException("Disk full");
+            };
+            var a = Perf(2);
+            var b = Perf(3);
+            store.Enqueue(a);
+            store.Enqueue(b);
+            store.Pump();
+
+            foreach (var f in SegmentFiles())
+                AssertEveryLineIsValidJson(f);
+            string onDisk = string.Concat(SegmentFiles().Select(File.ReadAllText));
+            CollectionAssert.AreEquivalent(new[] { first.event_id }, EventIds(onDisk));
+
+            // Space is back.
+            OfflineStorage.BeforeWriteHook = null;
+            store.ResetWriteBackoffForTests();
+            store.Pump();
+
+            foreach (var f in SegmentFiles())
+                AssertEveryLineIsValidJson(f);
+            onDisk = string.Concat(SegmentFiles().Select(File.ReadAllText));
+            CollectionAssert.AreEquivalent(new[] { first.event_id, a.event_id, b.event_id }, EventIds(onDisk));
+            var seqs = Seqs(onDisk);
+            Assert.AreEqual(seqs.Count, seqs.Distinct().Count(), "retried events keep their seq");
+        }
+
+        [Test]
+        public void DiskFull_KeepsEventsInMemory_AndRateLimitsWarnings()
+        {
+            var store = NewStore();
+            OfflineStorage.BeforeWriteHook = _ => throw new IOException("Disk full");
+
+            var ids = new List<string>();
+            for (int round = 0; round < 20; round++)
+            {
+                var e = Perf(round);
+                ids.Add(e.event_id);
+                store.Enqueue(e);
+                store.ResetWriteBackoffForTests();
+                store.Pump();
+            }
+            Assert.LessOrEqual(store.WarningsLogged, 1, "a full disk must not flood the log");
+            Assert.AreEqual(0, EventIds(string.Concat(SegmentFiles().Select(File.ReadAllText))).Count);
+
+            OfflineStorage.BeforeWriteHook = null;
+            store.ResetWriteBackoffForTests();
+            store.Pump();
+            CollectionAssert.AreEquivalent(ids, EventIds(string.Concat(SegmentFiles().Select(File.ReadAllText))));
+        }
+
+        [Test]
+        public void TornLineFollowedByMoreData_IsDropped_BodyStaysValid()
+        {
+            Directory.CreateDirectory(_dir);
+            string good = "{\"type\":\"perf_sample\",\"event_id\":\"g1\",\"fps\":1.00}";
+            string merged = "{\"type\":\"perf_sample\",\"event_id\":\"torn\",\"se" + "{\"type\":\"perf_sample\",\"event_id\":\"g2\",\"fps\":2.00}";
+            string good3 = "{\"type\":\"jank\",\"event_id\":\"g3\",\"recent_events\":[\"a}{b\"]}";
+            File.WriteAllText(Path.Combine(_dir, "1700000000000-000000.seg"), good + "\n" + merged + "\n" + good3 + "\n");
+
+            var store = NewStore();
+            var batch = TakeUpload(store);
+
+            Assert.IsNotNull(batch);
+            Assert.AreEqual(2, batch.EventCount);
+            Assert.AreEqual("{\"events\":[" + good + "," + good3 + "]}", Body(batch));
+        }
+
+        // ---------------------------------------------------------------
+        // Sequence numbers
+        // ---------------------------------------------------------------
+
+        [Test]
+        public void Seq_StaysMonotonic_WhenSeqFileIsLost()
+        {
+            var first = NewStore();
+            for (int i = 0; i < 3; i++) first.Enqueue(Perf(i));
+            first.Pump();
+            first.Shutdown(0);
+            long maxBefore = SegmentFiles().SelectMany(f => Seqs(File.ReadAllText(f))).Max();
+
+            File.Delete(Path.Combine(_dir, "seq"));
+
+            var second = NewStore();
+            second.Enqueue(Perf(9));
+            second.Pump();
+            long newest = SegmentFiles().SelectMany(f => Seqs(File.ReadAllText(f))).Max();
+            Assert.Greater(newest, maxBefore);
+            Assert.AreEqual(4, SegmentFiles().SelectMany(f => Seqs(File.ReadAllText(f))).Distinct().Count());
+        }
+
+        // ---------------------------------------------------------------
+        // Cap
+        // ---------------------------------------------------------------
+
+        [Test]
+        public void Cap_NeverEvictsTheBatchInFlight_AndAccountingMatchesDisk()
+        {
+            _config.BatchSize = 1;
+            _config.MaxOfflineStorageBytes = 4096;
+            var store = NewStore();
+            store.Enqueue(Perf(1));
+            store.Pump();
+            var inFlight = TakeUpload(store);
+
+            for (int i = 2; i < 100; i++) store.Enqueue(Perf(i));
+            store.Pump();
+
+            Assert.IsTrue(File.Exists(Path.Combine(_dir, inFlight.SegmentName)), "in-flight batch was evicted");
+            long actual = SegmentFiles().Sum(f => new FileInfo(f).Length);
+            Assert.AreEqual(actual, store.GetStorageSize());
+            Assert.LessOrEqual(actual, 4096);
+
+            store.CompleteUpload(inFlight, false);
+            store.Pump();
+            Assert.AreEqual(SegmentFiles().Sum(f => new FileInfo(f).Length), store.GetStorageSize());
+        }
+
+        [Test]
+        public void Cap_EvictsPerfSamplesBeforeExceptions()
+        {
+            _config.BatchSize = 1;
+            _config.MaxOfflineStorageBytes = 4096;
+            var store = NewStore();
+            var exc = new ExceptionEvent
+            {
+                event_id = Guid.NewGuid().ToString("N"), timestamp = 1, app_version = "1", platform = "Android",
+                session_id = "s", device_id = "d", fingerprint = "f", message = "boom", count = 1
+            };
+            store.Enqueue(exc); // oldest
+            for (int i = 0; i < 80; i++) store.Enqueue(Perf(i));
+            store.Pump();
+
+            string all = string.Concat(SegmentFiles().Select(File.ReadAllText));
+            StringAssert.Contains(exc.event_id, all, "the exception survives while perf samples are evicted");
+            Assert.Greater(store.DroppedEventCount, 0);
+        }
+
+        [Test]
+        public void Cap_CountsDroppedEventsOfSegmentsFromEarlierLaunches()
+        {
+            Directory.CreateDirectory(_dir);
+            string line = "{\"type\":\"perf_sample\",\"event_id\":\"old\",\"fps\":1.00,\"pad\":\"" + new string('x', 900) + "\"}\n";
+            File.WriteAllText(Path.Combine(_dir, "1600000000000-000000.seg"), line + line + line);
+            _config.MaxOfflineStorageBytes = 4096;
+            _config.BatchSize = 1;
+            var store = NewStore();
+            for (int i = 0; i < 10; i++) store.Enqueue(Perf(i));
+            store.Pump();
+
+            Assert.IsFalse(File.Exists(Path.Combine(_dir, "1600000000000-000000.seg")));
+            Assert.GreaterOrEqual(store.DroppedEventCount, 3);
+        }
+
+        [Test]
+        public void MemoryOnlyMode_StaysUnderOneMegabyte()
+        {
+            _config.EnableOfflineStorage = false;
+            _config.MaxOfflineStorageBytes = 50 * 1024 * 1024;
+            _config.MaxQueueSize = 100000;
+            var store = NewStore();
+            for (int i = 0; i < 20000; i++) store.Enqueue(Perf(i));
+            store.Pump();
+
+            Assert.LessOrEqual(store.GetStorageSize(), OfflineStorage.MemoryOnlyMaxBytes);
+            Assert.IsFalse(Directory.Exists(_dir));
+        }
+
+        // ---------------------------------------------------------------
+        // Upload batching, quarantine, legacy files
+        // ---------------------------------------------------------------
+
+        [Test]
+        public void ConsecutiveSmallSegments_AreMergedIntoOneUpload_AndAllDeleted()
+        {
+            _config.BatchSize = 20;
+            var store = NewStore();
+            var ids = new List<string>();
+            for (int s = 0; s < 3; s++)
+            {
+                for (int i = 0; i < 2; i++)
+                {
+                    var e = Perf(i);
+                    ids.Add(e.event_id);
+                    store.Enqueue(e);
+                }
+                store.Flush();
+                store.Pump(); // seals a 2-event segment
+            }
+            Assert.AreEqual(3, SegmentFiles().Length);
+
+            var batch = TakeUpload(store);
+            Assert.AreEqual(6, batch.EventCount);
+            CollectionAssert.AreEquivalent(ids, EventIds(Body(batch)));
+
+            store.CompleteUpload(batch, UploadOutcome.Delivered);
+            store.Pump();
+            Assert.AreEqual(0, SegmentFiles().Length);
+        }
+
+        [Test]
+        public void MergedUpload_RespectsBatchSize()
+        {
+            _config.BatchSize = 5;
+            var store = NewStore();
+            for (int s = 0; s < 3; s++)
+            {
+                for (int i = 0; i < 2; i++) store.Enqueue(Perf(i));
+                store.Flush();
+                store.Pump();
+            }
+            var batch = TakeUpload(store);
+            Assert.AreEqual(4, batch.EventCount, "2+2 fit, the third segment would exceed 5");
+        }
+
+        [Test]
+        public void RejectedBatch_IsQuarantined_NotUploadedAgain()
+        {
+            var store = NewStore();
+            var e = Perf(1);
+            store.Enqueue(e);
+            store.Flush();
+            store.Pump();
+
+            var batch = TakeUpload(store);
+            store.CompleteUpload(batch, UploadOutcome.Rejected);
+            store.Pump();
+
+            Assert.AreEqual(0, SegmentFiles().Length);
+            Assert.IsNull(TakeUpload(store));
+            var quarantined = Directory.GetFiles(Path.Combine(_dir, "quarantine"));
+            Assert.AreEqual(1, quarantined.Length);
+            StringAssert.Contains(e.event_id, File.ReadAllText(quarantined[0]));
+            Assert.AreEqual(0, store.GetStorageSize());
+        }
+
+        [Test]
+        public void Quarantine_IsCapped()
+        {
+            Directory.CreateDirectory(Path.Combine(_dir, "quarantine"));
+            for (int i = 0; i < 10; i++)
+                File.WriteAllText(Path.Combine(_dir, "quarantine", "1600000000000-00000" + i + ".seg"), new string('x', 100 * 1024));
+            var old = Path.Combine(_dir, "quarantine", "1500000000000-000000.seg");
+            File.WriteAllText(old, "x");
+            File.SetLastWriteTimeUtc(old, DateTime.UtcNow.AddDays(-8));
+
+            var store = NewStore();
+            store.Pump();
+
+            var files = Directory.GetFiles(Path.Combine(_dir, "quarantine"));
+            Assert.LessOrEqual(files.Sum(f => new FileInfo(f).Length), OfflineStorage.MaxQuarantineBytes);
+            Assert.IsFalse(File.Exists(old), "expired quarantine files are removed");
+            Assert.IsTrue(File.Exists(Path.Combine(_dir, "quarantine", "1600000000000-000009.seg")), "newest kept");
+        }
+
+        [Test]
+        public void LegacyFilesAndNewSegments_AreUploadedSeparately_LegacyFirst()
+        {
+            Directory.CreateDirectory(_dir);
+            string legacy = "{\"events\":[{\"type\":\"jank\",\"timestamp\":1}]}";
+            File.WriteAllText(Path.Combine(_dir, "ozx_apm_offline_1700000000000.json"), legacy);
+            _config.BatchSize = 20;
+            var store = NewStore();
+            for (int s = 0; s < 2; s++)
+            {
+                store.Enqueue(Perf(s));
+                store.Flush();
+                store.Pump();
+            }
+
+            var first = TakeUpload(store);
+            Assert.AreEqual(legacy, Body(first), "legacy body is sent unchanged and alone");
+            store.CompleteUpload(first, UploadOutcome.Delivered);
+            store.Pump();
+
+            var second = TakeUpload(store);
+            Assert.AreEqual(2, second.EventCount, "new segments merged");
+            StringAssert.StartsWith("{\"events\":[{\"type\":\"perf_sample\"", Body(second));
+        }
+
+        // ---------------------------------------------------------------
+        // Lifecycle
+        // ---------------------------------------------------------------
+
+        [Test]
+        public void SecondInstanceOnSameDirectory_FallsBackToMemory()
+        {
+            var first = NewStore();
+            first.Pump();
+            var second = NewStore();
+            var e = Perf(1);
+            second.Enqueue(e);
+            second.Pump();
+
+            Assert.IsTrue(first.PersistsToDisk);
+            Assert.IsFalse(second.PersistsToDisk, "two writers on one directory would corrupt it");
+            StringAssert.DoesNotContain(e.event_id, string.Concat(SegmentFiles().Select(File.ReadAllText)));
+
+            // Once the first is gone, a new instance owns the directory again.
+            first.Shutdown(0);
+            var third = NewStore();
+            third.Pump();
+            Assert.IsTrue(third.PersistsToDisk);
+        }
+
+        [Test]
+        public void ThreadStartFailure_FallsBackToTick()
+        {
+            OfflineStorage.FailThreadStartForTests = true;
+            _config.PersistIntervalMs = 0;
+            var store = new OfflineStorage(_config, _dir, true);
+            _stores.Add(store);
+            store.Start();
+            Assert.IsFalse(store.HasWorkerThread);
+
+            store.Enqueue(Perf(1));
+            store.Tick();
+            Assert.AreEqual(1, SegmentFiles().Length);
+        }
+
+        [Test]
+        public void ConsentWithdrawnMidUpload_CompletesButStartsNothing()
+        {
+            _config.BatchSize = 1;
+            var store = NewStore();
+            store.Enqueue(Perf(1));
+            store.Enqueue(Perf(2));
+            store.Pump();
+            var batch = TakeUpload(store);
+
+            _config.Consent = ConsentState.Denied;
+            store.CompleteUpload(batch, UploadOutcome.Delivered);
+            store.Pump();
+            Assert.AreEqual(1, SegmentFiles().Length);
+            Assert.IsNull(TakeUpload(store));
+        }
+
+        [Test]
+        public void ShutdownWithBatchInFlight_KeepsItForNextLaunch()
+        {
+            var store = NewStore();
+            var e = Perf(1);
+            store.Enqueue(e);
+            store.Flush();
+            store.Pump();
+            Assert.IsNotNull(TakeUpload(store)); // never completed
+            store.Shutdown(0);
+
+            var next = NewStore();
+            var batch = TakeUpload(next);
+            Assert.IsNotNull(batch);
+            StringAssert.Contains(e.event_id, Body(batch));
+        }
+
+        [Test]
+        public void IdleWorker_DoesNotSpin()
+        {
+            var store = new OfflineStorage(_config, _dir, true);
+            _stores.Add(store);
+            store.Start();
+            store.Enqueue(Perf(1));
+            store.Flush();
+            Assert.IsTrue(store.WaitIdle(5000));
+            Assert.AreEqual(1, SegmentFiles().Length, "written right away, without waiting for a timer");
         }
     }
 }

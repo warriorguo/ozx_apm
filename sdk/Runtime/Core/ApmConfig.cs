@@ -95,7 +95,9 @@ namespace OzxApm.Core
         /// <summary>
         /// Persist events to disk as soon as they are enqueued and keep them until
         /// the server confirms receipt (survives crashes, kills and offline sessions).
-        /// When false, events are queued in memory only and are lost on exit.
+        /// When false, events are queued in memory only (at most 1MB) and are lost on exit.
+        /// WebGL is not a supported target: there the SDK always runs memory-only,
+        /// without threads, whatever this is set to.
         /// </summary>
         public bool EnableOfflineStorage { get; set; } = true;
 
@@ -105,9 +107,11 @@ namespace OzxApm.Core
         public int MaxOfflineStorageBytes { get; set; } = 5 * 1024 * 1024;
 
         /// <summary>
-        /// How often the background writer appends newly enqueued events to disk (ms).
-        /// This bounds how many events can be lost on a crash or kill. Exceptions and
-        /// crashes are written immediately.
+        /// Upper bound (ms) for how long an enqueued event waits before the background
+        /// writer appends it to disk, and so for how much can be lost on a crash or
+        /// kill. The writer wakes immediately when the queue goes from empty to
+        /// non-empty and for exceptions/crashes; this interval only coalesces bursts.
+        /// Without a worker thread it is also the main-thread write interval.
         /// </summary>
         public int PersistIntervalMs { get; set; } = 200;
 
@@ -123,6 +127,20 @@ namespace OzxApm.Core
         public float RetryMaxDelaySeconds { get; set; } = 300.0f;
 
         /// <summary>
+        /// Uploads (including the backlog stored by earlier sessions) start this many
+        /// seconds after Initialize, or earlier when the game calls ApmClient.MarkTTI
+        /// or ApmClient.Flush, so they do not compete with the game's own loading.
+        /// Events are still written to disk right away.
+        /// </summary>
+        public float InitialUploadDelaySeconds { get; set; } = 10.0f;
+
+        /// <summary>
+        /// Minimum time between two upload requests (seconds). Paces the drain of
+        /// a stored backlog (about one request per second by default).
+        /// </summary>
+        public float UploadIntervalSeconds { get; set; } = 1.0f;
+
+        /// <summary>
         /// Player consent. Nothing is enqueued, written to disk or uploaded unless Granted.
         /// Defaults to Granted (pre-APM-14 behaviour). Change at runtime with ApmClient.SetConsent.
         /// </summary>
@@ -132,13 +150,6 @@ namespace OzxApm.Core
         /// Request timeout in seconds
         /// </summary>
         public float RequestTimeoutSeconds { get; set; } = 30.0f;
-
-        /// <summary>
-        /// Not used. Stored events are retried until the server confirms them
-        /// (see RetryBaseDelaySeconds / RetryMaxDelaySeconds); the storage cap
-        /// (MaxOfflineStorageBytes) is the only thing that drops them.
-        /// </summary>
-        public int MaxRetryAttempts { get; set; } = 3;
 
         /// <summary>
         /// Enable gzip compression for requests

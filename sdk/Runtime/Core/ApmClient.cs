@@ -20,6 +20,10 @@ namespace OzxApm.Core
         /// </summary>
         internal const string LogPrefix = "[OzxApm]";
 
+        /// <summary>SDK version; sent with every upload so the server can tell clients apart.</summary>
+        public const string SdkVersion = "2.0.0";
+        internal const string SdkVersionHeader = "X-Apm-Sdk-Version";
+
         // How long lifecycle events may wait for the storage worker to write to disk.
         private const int PauseFlushTimeoutMs = 100;
         private const int ShutdownFlushTimeoutMs = 500;
@@ -176,20 +180,23 @@ namespace OzxApm.Core
         }
 
         /// <summary>
-        /// Marks Time To Interactive
+        /// Marks Time To Interactive. Also tells the SDK the game has finished
+        /// loading, so uploads may start before InitialUploadDelaySeconds.
         /// </summary>
         public static void MarkTTI()
         {
-            if (_isInitialized && Instance._startupTracker != null)
+            if (!_isInitialized)
+                return;
+
+            try
             {
-                try
-                {
-                    Instance._startupTracker.MarkTTI();
-                }
-                catch (Exception ex)
-                {
-                    ReportInternalError("MarkTTI", ex);
-                }
+                var client = Instance;
+                client._startupTracker?.MarkTTI();
+                client._reporter?.NotifyGameReady();
+            }
+            catch (Exception ex)
+            {
+                ReportInternalError("MarkTTI", ex);
             }
         }
 
@@ -218,6 +225,7 @@ namespace OzxApm.Core
                 var client = Instance;
                 client._exceptionCollector?.FlushPending();
                 client._offlineStorage?.Flush();
+                client._reporter?.NotifyGameReady();
                 client._reporter?.RetryNow();
             }
             catch (Exception ex)
