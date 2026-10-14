@@ -126,7 +126,9 @@ net_type, country (optional)
 - URL parameters stripped (template only)
 - IP used only for coarse geo (server-side anonymization)
 - user_id must be optional and disableable
-- Data retention: 30 days detail, 1 year aggregated
+- Data retention, two classes stored in separate tables:
+  - Technical data (perf, exceptions, crashes, breadcrumbs, logs): 30 days detail, 1 year aggregated
+  - Business/ops events: minimized detail up to 1 year — whitelisted fields only (event name, properties, anonymous player_id, version, channel, timestamps, whitelisted context keys); no stacks, logs, breadcrumbs, IP or fine-grained device info; deletable per player_id; collected only with user consent
 - SDK must support data deletion/disable for compliance requests
 
 ## Project Management (Memory Flow)
