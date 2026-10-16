@@ -9,6 +9,15 @@ import (
 // schemaStatements create the event tables on a fresh install and apply the
 // additive migrations; Migrate runs them on every start. Keep
 // scripts/migrate.sql in step.
+//
+// The event tables are ReplacingMergeTree with event_id appended to the sort
+// key (APM-19 phase B): a re-sent event has the same timestamp, app_version
+// and key column, so its full sort key matches the stored copy and merges
+// keep only one. The ingest handler drops most re-sent events before insert
+// (phase A); this catches the rest, eventually. Events without event_id get a
+// server-generated "srv-" id at ingest so that they never collapse together.
+// Existing MergeTree tables are converted by scripts/apm19_rmt_migrate.sh,
+// never by Migrate.
 var schemaStatements = []string{
 	`CREATE TABLE IF NOT EXISTS apm_perf_samples (
     timestamp DateTime64(3),
@@ -27,9 +36,9 @@ var schemaStatements = []string{
     event_id String DEFAULT '',
     seq UInt64 DEFAULT 0,
     INDEX ` + EventIDIndexDDL + `
-) ENGINE = MergeTree()
+) ENGINE = ReplacingMergeTree()
 PARTITION BY toYYYYMMDD(timestamp)
-ORDER BY (app_version, platform, timestamp)`,
+ORDER BY (app_version, platform, timestamp, event_id)`,
 
 	`CREATE TABLE IF NOT EXISTS apm_janks (
     timestamp DateTime64(3),
@@ -48,9 +57,9 @@ ORDER BY (app_version, platform, timestamp)`,
     event_id String DEFAULT '',
     seq UInt64 DEFAULT 0,
     INDEX ` + EventIDIndexDDL + `
-) ENGINE = MergeTree()
+) ENGINE = ReplacingMergeTree()
 PARTITION BY toYYYYMMDD(timestamp)
-ORDER BY (app_version, scene, timestamp)`,
+ORDER BY (app_version, scene, timestamp, event_id)`,
 
 	`CREATE TABLE IF NOT EXISTS apm_startups (
     timestamp DateTime64(3),
@@ -66,9 +75,9 @@ ORDER BY (app_version, scene, timestamp)`,
     event_id String DEFAULT '',
     seq UInt64 DEFAULT 0,
     INDEX ` + EventIDIndexDDL + `
-) ENGINE = MergeTree()
+) ENGINE = ReplacingMergeTree()
 PARTITION BY toYYYYMMDD(timestamp)
-ORDER BY (app_version, platform, timestamp)`,
+ORDER BY (app_version, platform, timestamp, event_id)`,
 
 	`CREATE TABLE IF NOT EXISTS apm_scene_loads (
     timestamp DateTime64(3),
@@ -83,9 +92,9 @@ ORDER BY (app_version, platform, timestamp)`,
     event_id String DEFAULT '',
     seq UInt64 DEFAULT 0,
     INDEX ` + EventIDIndexDDL + `
-) ENGINE = MergeTree()
+) ENGINE = ReplacingMergeTree()
 PARTITION BY toYYYYMMDD(timestamp)
-ORDER BY (app_version, scene_name, timestamp)`,
+ORDER BY (app_version, scene_name, timestamp, event_id)`,
 
 	`CREATE TABLE IF NOT EXISTS apm_exceptions (
     timestamp DateTime64(3),
@@ -103,9 +112,9 @@ ORDER BY (app_version, scene_name, timestamp)`,
     event_id String DEFAULT '',
     seq UInt64 DEFAULT 0,
     INDEX ` + EventIDIndexDDL + `
-) ENGINE = MergeTree()
+) ENGINE = ReplacingMergeTree()
 PARTITION BY toYYYYMMDD(timestamp)
-ORDER BY (app_version, fingerprint, timestamp)`,
+ORDER BY (app_version, fingerprint, timestamp, event_id)`,
 
 	`CREATE TABLE IF NOT EXISTS apm_crashes (
     timestamp DateTime64(3),
@@ -123,9 +132,9 @@ ORDER BY (app_version, fingerprint, timestamp)`,
     event_id String DEFAULT '',
     seq UInt64 DEFAULT 0,
     INDEX ` + EventIDIndexDDL + `
-) ENGINE = MergeTree()
+) ENGINE = ReplacingMergeTree()
 PARTITION BY toYYYYMMDD(timestamp)
-ORDER BY (app_version, fingerprint, timestamp)`,
+ORDER BY (app_version, fingerprint, timestamp, event_id)`,
 
 	// Additive migrations for deployments created before APM-2. Must stay
 	// idempotent: Migrate runs on every server start.

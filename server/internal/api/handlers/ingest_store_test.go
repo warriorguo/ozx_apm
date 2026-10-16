@@ -183,8 +183,9 @@ func TestIngest_StoresEventIDAndSeq(t *testing.T) {
 	if store.exceptions[0].EventID != "7c9e6679742540de944be07fc1f90ae7" || store.exceptions[0].Seq != 42 {
 		t.Errorf("exception event_id/seq not stored: %+v", store.exceptions[0])
 	}
-	if store.perfSamples[1].EventID != "" || store.perfSamples[1].Seq != 0 {
-		t.Errorf("old-SDK event should have empty event_id/seq: %+v", store.perfSamples[1])
+	// APM-19 phase B: an old-SDK event gets a server-generated id, seq stays 0.
+	if !strings.HasPrefix(store.perfSamples[1].EventID, ServerEventIDPrefix) || store.perfSamples[1].Seq != 0 {
+		t.Errorf("old-SDK event should have a srv- event_id and seq 0: %+v", store.perfSamples[1])
 	}
 }
 

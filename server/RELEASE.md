@@ -244,3 +244,179 @@ Redeploy the previous binary. No schema action is needed: the index is
 harmless to older binaries (verified with `0fcc972`). To remove it anyway (as
 admin): `ALTER TABLE <table> DROP INDEX IF EXISTS idx_event_id` on the six
 tables.
+
+Once phase B is deployed, roll back the tables first (phase B rollback below),
+then the binary.
+
+## APM-19, phase B: ReplacingMergeTree as the safety net (table rebuild)
+
+Deploy only after phase A runs everywhere. Phase B removes, on merge, the
+duplicates phase A cannot catch.
+
+Changes:
+
+- **New installs**: `Migrate` creates the six event tables as
+  `ReplacingMergeTree` with `event_id` appended to the existing sort key, e.g.
+  `ORDER BY (app_version, platform, timestamp, event_id)`. The prefix is
+  unchanged, so every query filters and prunes as before. A re-sent event has
+  the same timestamp, app_version and key column as the stored copy, so the
+  full sort key matches and merges keep one row.
+- **Server ids for old-SDK events**: an event without `event_id` gets
+  `srv-<UUIDv4>` at ingest (after the duplicate lookup, so it is never looked
+  up). Without it, two old-SDK events with the same app_version, key column
+  and millisecond (e.g. two devices on the same version) would collapse into
+  one row. A server-side insert retry reuses the same ids. The 503-or-200
+  decision for a failed insert still uses what the client sent, so old SDKs
+  keep their old behaviour. Nothing else reads `event_id = ''` (admin and
+  query APIs do not use event_id); old-SDK rows are now
+  `startsWith(event_id, 'srv-')` (or `seq = 0`).
+- **Existing tables are not converted by `Migrate`.** A one-off script,
+  run by a human, rebuilds them: `scripts/apm19_rmt_migrate.sh`
+  (`scripts/apm19_rmt_migrate.sql` shows its statements for one table). Per
+  table it creates `<t>_rmt` from the live table's own DDL (TTL, codecs and
+  settings kept; only the engine and ORDER BY change), swaps it in with
+  `EXCHANGE TABLES`, keeps the old table as `<t>_pre_apm19`, and copies the old
+  rows in, partition by partition, through a staging table and
+  `ATTACH PARTITION ... FROM`. Old-SDK rows get `srv-apm19-<UUIDv4>`. Details
+  and the reasons for each step are in the script header. Notably:
+  - inserts that arrive during the copy land in the new live table, so
+    nothing is lost; the script then waits until no insert that started before
+    the swap is still running (such an insert writes to the old table);
+  - the copy uses `ATTACH PARTITION`, not `INSERT INTO <t> SELECT`, because an
+    insert would feed every old row into the `apm_*_daily` materialized views
+    a second time;
+  - the materialized views are **detached during the swap** (about 4 s): on
+    26.1 an insert running while its target table is renamed pushed the whole
+    source table into a view (doubling `apm_fps_daily` or
+    `apm_exception_daily`) in 2 of 4 rehearsal runs and in 3 of 10 rounds of
+    a minimal reproduction; with the views detached, 0 of 14 (10 rounds + 4
+    rehearsals). Cost: rows inserted while they are detached are missing from
+    the views (not from the tables). No code reads these views today.
+- **Queries do not use `FINAL`.** Phase A keeps duplicates rare; the few
+  that slip through count twice until a merge removes them (usually minutes,
+  not guaranteed). `FINAL` on every admin query costs extra reading and
+  merging at query time and was not measured, so it is not added. For an
+  exact number, query with `FINAL`, or run `OPTIMIZE TABLE <t> FINAL` as
+  maintenance (rewrites the table).
+- The `apm_*_daily` materialized views are fed at insert time and are not
+  de-duplicated by the ReplacingMergeTree; phase A keeps duplicates out of
+  them.
+
+### Deploy order (strict)
+
+1. Phase A runs everywhere (and the admin added the index).
+2. Deploy the phase B binary (CI/CD app 36). A rolling deploy is safe: phase
+   A and phase B binaries can serve side by side on the MergeTree tables.
+3. **From now on no binary older than phase B may serve traffic.** Such a
+   binary stores old-SDK events with `event_id = ''`; in a ReplacingMergeTree
+   two of them with the same app_version, key column and millisecond collapse
+   into one (shown in the rehearsal). The migration script warns if it finds
+   rows with an empty event_id in the new tables.
+4. Run the migration on n192 (below).
+5. Verify, keep the `*_pre_apm19` tables for a few days, then `drop-backup`.
+
+### Production migration (run by a human on n192)
+
+Privileges: the local `default` account on n192 (passwordless, localhost
+only, full rights). No sudo is needed. The `apm` account cannot do this. The
+script needs an Atomic database (default since ClickHouse 20.10; `check`
+prints the engine), and disk space for about one more copy of the six tables
+until `drop-backup` (`check` prints the sizes and free space).
+
+```sh
+# from a checkout of this commit
+scp server/scripts/apm19_rmt_migrate.sh n192:~/apm19_rmt_migrate.sh
+ssh n192
+chmod +x ~/apm19_rmt_migrate.sh
+~/apm19_rmt_migrate.sh check                       # read-only
+~/apm19_rmt_migrate.sh migrate 2>&1 | tee ~/apm19-migrate.log
+~/apm19_rmt_migrate.sh verify
+# if the default account has a password: CH="clickhouse-client --password" ~/apm19_rmt_migrate.sh ...
+```
+
+`check` must show the six tables as `MergeTree` with the expected sort keys,
+`has_event_id_index`, the four materialized views, and the database engine
+`Atomic`. `migrate` prints, per table, `OK, copied N = N rows`; `verify` must
+show `ids_missing_now: 0`, `migration_ids_now` equal to `legacy_in_pre`, and
+`empty_ids_now: 0`. Expected duration: the rehearsal migrated 340k rows in
+17-21 s; production holds far less.
+
+Effects while it runs: the views miss ~4 s of rows (above); until a table's
+copy has finished, its old rows are not visible to queries or to the phase A
+lookup, so an old event re-sent in that window is stored again and removed
+later by a merge.
+
+After a few days, and once satisfied:
+
+```sh
+~/apm19_rmt_migrate.sh drop-backup   # refuses unless every old row is in the new table (FORCE=1 overrides)
+```
+
+If `migrate` stops after the swap (it prints so): run
+`~/apm19_rmt_migrate.sh rollback`, investigate, drop the
+`*_apm19_rolledback` tables, and run `migrate` again. If it stops before the
+swap: drop the `*_rmt` tables it created and run it again. If the database is
+not Atomic, `ALLOW_RENAME=1` uses a three-way `RENAME TABLE` instead of
+`EXCHANGE`; that is not atomic on an Ordinary database (inserts fail for a
+moment: new SDKs get 503 and resend, old SDKs lose that batch) and was not
+rehearsed.
+
+### Rollback
+
+Tables first, binary second:
+
+1. With traffic running, on n192:
+   ```sh
+   ~/apm19_rmt_migrate.sh rollback
+   ```
+   It swaps every table back with `<t>_pre_apm19` (the old MergeTree with all
+   rows from before the migration is live again; the ReplacingMergeTree
+   becomes `<t>_apm19_rolledback`), waits for inserts that started before the
+   swap, then copies back every row inserted since the migration: rows of
+   `<t>_apm19_rolledback FINAL` whose event_id is not a migration id and not
+   already in the old table, per partition, through `ATTACH PARTITION` (the
+   views already counted them). Duplicates that existed before the migration
+   are back as well: this restores the old table.
+2. Then the binary may go back to phase A or older.
+3. Drop the `*_apm19_rolledback` tables when satisfied. Rows stored by the
+   phase B binary keep their `srv-` ids; older binaries ignore them.
+
+Rolling back only the binary to a pre-phase-B version while the tables are
+ReplacingMergeTree is **not** safe (old-SDK collapse, above).
+
+### Verified
+
+Rehearsed on ClickHouse 26.1.12 (production schema with TTL and the four
+materialized views), 24.1.8 and 23.8.16 (tables from `Migrate`), each with
+300k perf / 30k exception / 6k crash rows over three days (10% without
+event_id, 1,000 old duplicates), data from `0fcc972` including a re-sent
+batch and two identical old-SDK events, and a load generator posting new
+events, re-sends and old-SDK events (~16 batches/s) during every migrate and
+rollback:
+
+- `migrate`: every acknowledged event present, none stored twice, all
+  old-SDK rows present; `verify` clean; admin numbers (the dashboard's SQL)
+  for the old days identical before and after; materialized view totals for
+  the old days unchanged;
+- `OPTIMIZE FINAL` collapses the 997 duplicated ids (including those written
+  by `0fcc972`) to 0; the two identical old-SDK rows stay two;
+- a `0fcc972` binary writing two identical old-SDK events into the new tables:
+  they collapse to one (why step 3 above is strict);
+- a migrate killed at the 3rd `ATTACH PARTITION` (fault injection), then
+  `rollback`: nothing lost, admin numbers unchanged; `migrate` again
+  afterwards succeeds;
+- `rollback` under load: every event acknowledged before and during the
+  rollback present in the restored tables;
+- `drop-backup` refuses when one copied row is missing;
+- the phase B binary on the migrated tables, with and without
+  `async_insert`: re-sent batches dropped, old-SDK events not collapsed.
+
+### Follow-up: APM-17
+
+APM-17 (TTL and materialized views missing from `Migrate`-created tables) is
+not part of this change: `Migrate` still creates tables without TTL, and the
+migration keeps whatever TTL the live table has (production: 30 days, from
+`scripts/migrate.sql`). A deployment whose tables came from `Migrate` has no
+TTL; adding it there means rewriting the tables, so APM-17 could reuse this
+rebuild (create `<t>_rmt` with the TTL) instead of a separate
+`ALTER ... MODIFY TTL` pass.

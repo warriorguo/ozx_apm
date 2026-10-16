@@ -1,13 +1,17 @@
 package handlers
 
 import (
+	"context"
 	"errors"
 	"net/http"
+	"regexp"
+	"strings"
 	"testing"
 	"time"
 
 	"go.uber.org/zap"
 
+	"github.com/warriorguo/ozx_apm/server/internal/models"
 	"github.com/warriorguo/ozx_apm/server/internal/storage"
 )
 
@@ -93,6 +97,56 @@ func TestDedup_OldSDKEventsAreNeverLookedUpOrDropped(t *testing.T) {
 	}
 	if len(store.lookups) != 0 {
 		t.Fatalf("legacy events were looked up: %+v", store.lookups)
+	}
+	// Phase B: each gets its own server id, so identical legacy events never
+	// collapse in the ReplacingMergeTree tables.
+	ids := map[string]bool{}
+	for _, s := range store.perfSamples {
+		if !strings.HasPrefix(s.EventID, "srv-") || len(s.EventID) != len("srv-")+36 {
+			t.Errorf("legacy event id %q", s.EventID)
+		}
+		ids[s.EventID] = true
+	}
+	if len(ids) != 4 {
+		t.Errorf("legacy ids not unique: %v", ids)
+	}
+}
+
+// A server-side insert retry must write the same server ids again, so the
+// ReplacingMergeTree collapses a retry whose first attempt did reach the table.
+func TestDedup_ServerIDsAreStableAcrossInsertRetries(t *testing.T) {
+	store := &recordingStore{}
+	h := newIngestHandler(store, zap.NewNop())
+	postBatch(t, h, batchOf(sdkEventJSON("exception", "", 0, `,"fingerprint":"abc","count":1`)), nil)
+	if len(store.attempts) != 2 || store.attempts[0] == "" || store.attempts[0] != store.attempts[1] {
+		t.Fatalf("ids per attempt: %q", store.attempts)
+	}
+}
+
+// recordingStore fails the first exception insert and records the event_id of
+// every attempt.
+type recordingStore struct {
+	fakeEventStore
+	attempts []string
+}
+
+func (r *recordingStore) InsertExceptions(_ context.Context, e []models.Exception) error {
+	r.attempts = append(r.attempts, e[0].EventID)
+	if len(r.attempts) == 1 {
+		return errors.New("connection reset")
+	}
+	return nil
+}
+
+func TestNewServerEventID_IsAPrefixedV4UUID(t *testing.T) {
+	re := regexp.MustCompile(`^srv-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+	seen := map[string]bool{}
+	for i := 0; i < 1000; i++ {
+		id := newServerEventID()
+		if !re.MatchString(id) || seen[id] {
+			t.Fatalf("bad or repeated id %q", id)
+		}
+		seen[id] = true
 	}
 }
 

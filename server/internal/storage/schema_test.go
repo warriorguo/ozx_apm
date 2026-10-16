@@ -82,6 +82,25 @@ func TestSchema_EventIDIndexOnEveryEventTable(t *testing.T) {
 	}
 }
 
+// APM-19 phase B: fresh installs create ReplacingMergeTree tables whose sort
+// key is the old one plus event_id, so queries keep the same prefix.
+func TestSchema_EventTablesAreReplacingMergeTreeOnEventID(t *testing.T) {
+	for _, et := range EventTables {
+		var create string
+		for _, stmt := range schemaStatements {
+			if strings.HasPrefix(stmt, "CREATE TABLE IF NOT EXISTS "+et.Name+" ") {
+				create = stmt
+			}
+		}
+		if !strings.Contains(create, ") ENGINE = ReplacingMergeTree()\n") {
+			t.Errorf("%s is not a ReplacingMergeTree", et.Name)
+		}
+		if !strings.HasSuffix(create, "ORDER BY (app_version, "+et.KeyColumn+", timestamp, event_id)") {
+			t.Errorf("%s: sort key is not (app_version, %s, timestamp, event_id)", et.Name, et.KeyColumn)
+		}
+	}
+}
+
 func TestEventTables_MatchTheSortKeyPrefix(t *testing.T) {
 	for _, et := range EventTables {
 		var create string

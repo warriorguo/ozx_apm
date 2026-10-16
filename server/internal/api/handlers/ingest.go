@@ -312,6 +312,16 @@ func (h *IngestHandler) IngestEvents(w http.ResponseWriter, r *http.Request) {
 		)
 	}
 
+	// Old-SDK events get a server-generated event_id (APM-19 phase B), after
+	// the lookup so that they are never looked up. hasEventIDs above still
+	// reflects what the client sent.
+	assignServerEventIDs(perfSamples, func(e *models.PerfSample) *string { return &e.EventID })
+	assignServerEventIDs(janks, func(e *models.Jank) *string { return &e.EventID })
+	assignServerEventIDs(startups, func(e *models.Startup) *string { return &e.EventID })
+	assignServerEventIDs(sceneLoads, func(e *models.SceneLoad) *string { return &e.EventID })
+	assignServerEventIDs(exceptions, func(e *models.Exception) *string { return &e.EventID })
+	assignServerEventIDs(crashes, func(e *models.Crash) *string { return &e.EventID })
+
 	// Insert events into ClickHouse. Each table insert is retried here
 	// before answering. Only events whose insert succeeded count as accepted,
 	// plus the duplicates, which are already stored.

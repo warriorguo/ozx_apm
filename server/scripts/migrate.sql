@@ -19,9 +19,9 @@ CREATE TABLE IF NOT EXISTS apm_perf_samples (
     event_id String DEFAULT '',
     seq UInt64 DEFAULT 0,
     INDEX idx_event_id event_id TYPE bloom_filter(0.001) GRANULARITY 1
-) ENGINE = MergeTree()
+) ENGINE = ReplacingMergeTree()
 PARTITION BY toYYYYMMDD(timestamp)
-ORDER BY (app_version, platform, timestamp)
+ORDER BY (app_version, platform, timestamp, event_id)
 TTL timestamp + INTERVAL 30 DAY;
 
 -- Jank events
@@ -42,9 +42,9 @@ CREATE TABLE IF NOT EXISTS apm_janks (
     event_id String DEFAULT '',
     seq UInt64 DEFAULT 0,
     INDEX idx_event_id event_id TYPE bloom_filter(0.001) GRANULARITY 1
-) ENGINE = MergeTree()
+) ENGINE = ReplacingMergeTree()
 PARTITION BY toYYYYMMDD(timestamp)
-ORDER BY (app_version, scene, timestamp)
+ORDER BY (app_version, scene, timestamp, event_id)
 TTL timestamp + INTERVAL 30 DAY;
 
 -- Startup events
@@ -62,9 +62,9 @@ CREATE TABLE IF NOT EXISTS apm_startups (
     event_id String DEFAULT '',
     seq UInt64 DEFAULT 0,
     INDEX idx_event_id event_id TYPE bloom_filter(0.001) GRANULARITY 1
-) ENGINE = MergeTree()
+) ENGINE = ReplacingMergeTree()
 PARTITION BY toYYYYMMDD(timestamp)
-ORDER BY (app_version, platform, timestamp)
+ORDER BY (app_version, platform, timestamp, event_id)
 TTL timestamp + INTERVAL 30 DAY;
 
 -- Scene loads
@@ -81,9 +81,9 @@ CREATE TABLE IF NOT EXISTS apm_scene_loads (
     event_id String DEFAULT '',
     seq UInt64 DEFAULT 0,
     INDEX idx_event_id event_id TYPE bloom_filter(0.001) GRANULARITY 1
-) ENGINE = MergeTree()
+) ENGINE = ReplacingMergeTree()
 PARTITION BY toYYYYMMDD(timestamp)
-ORDER BY (app_version, scene_name, timestamp)
+ORDER BY (app_version, scene_name, timestamp, event_id)
 TTL timestamp + INTERVAL 30 DAY;
 
 -- Exceptions (non-fatal)
@@ -103,9 +103,9 @@ CREATE TABLE IF NOT EXISTS apm_exceptions (
     event_id String DEFAULT '',
     seq UInt64 DEFAULT 0,
     INDEX idx_event_id event_id TYPE bloom_filter(0.001) GRANULARITY 1
-) ENGINE = MergeTree()
+) ENGINE = ReplacingMergeTree()
 PARTITION BY toYYYYMMDD(timestamp)
-ORDER BY (app_version, fingerprint, timestamp)
+ORDER BY (app_version, fingerprint, timestamp, event_id)
 TTL timestamp + INTERVAL 30 DAY;
 
 -- Crashes
@@ -125,9 +125,9 @@ CREATE TABLE IF NOT EXISTS apm_crashes (
     event_id String DEFAULT '',
     seq UInt64 DEFAULT 0,
     INDEX idx_event_id event_id TYPE bloom_filter(0.001) GRANULARITY 1
-) ENGINE = MergeTree()
+) ENGINE = ReplacingMergeTree()
 PARTITION BY toYYYYMMDD(timestamp)
-ORDER BY (app_version, fingerprint, timestamp)
+ORDER BY (app_version, fingerprint, timestamp, event_id)
 TTL timestamp + INTERVAL 30 DAY;
 
 -- APM-2: client event id + per-install sequence number.

@@ -88,6 +88,82 @@ func TestExistingEventIDs_RealClickHouse(t *testing.T) {
 	}
 }
 
+// APM-19 phase B on a fresh install: the tables are ReplacingMergeTree on
+// (..., timestamp, event_id). Copies of one event collapse on merge; old-SDK
+// events, even identical ones, keep their own server ids and never collapse.
+func TestReplacingMergeTree_CollapsesDuplicatesNotLegacyRows(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+	cfg := testutil.TestClickHouseConfig()
+	cfg.Database = "ozx_apm_rmt_test"
+	admin, err := storage.NewClickHouseClient(testutil.TestClickHouseConfig(), zap.NewNop())
+	if err != nil {
+		t.Skipf("ClickHouse not available: %v", err)
+	}
+	ctx := context.Background()
+	if err := admin.Exec(ctx, "DROP DATABASE IF EXISTS "+cfg.Database); err != nil {
+		t.Fatal(err)
+	}
+	admin.Close()
+	client, err := testutil.SetupTestDatabase(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	var engine, key string
+	if err := client.Conn().QueryRow(ctx, "SELECT engine, sorting_key FROM system.tables WHERE database = ? AND name = 'apm_exceptions'", cfg.Database).Scan(&engine, &key); err != nil {
+		t.Fatal(err)
+	}
+	if engine != "ReplacingMergeTree" || key != "app_version, fingerprint, timestamp, event_id" {
+		t.Fatalf("apm_exceptions: %s ORDER BY (%s)", engine, key)
+	}
+
+	repo := storage.NewRepository(client, zap.NewNop())
+	ts := time.UnixMilli(time.Now().UnixMilli())
+	dup := models.Exception{Timestamp: ts, EventID: "e-dup", AppVersion: "1", Platform: "Android", Fingerprint: "F", SessionID: "s", DeviceID: "d", Count: 1}
+	// Two separate inserts = two parts, as a resend through a binary without phase A.
+	for i := 0; i < 2; i++ {
+		if err := repo.InsertExceptions(ctx, []models.Exception{dup}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Two identical old-SDK events through the handler: they get distinct srv- ids.
+	h := handlers.NewIngestHandler(repo, zap.NewNop())
+	legacy := `{"type":"exception","timestamp":` + strconv.FormatInt(ts.UnixMilli(), 10) +
+		`,"app_version":"1","platform":"Android","session_id":"s","device_id":"d","fingerprint":"F","count":1}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/events", bytes.NewBufferString(`{"events":[`+legacy+`,`+legacy+`]}`))
+	w := httptest.NewRecorder()
+	h.IngestEvents(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("legacy upload: %d %s", w.Code, w.Body.String())
+	}
+
+	count := func(cond string) uint64 {
+		var n uint64
+		if err := client.Conn().QueryRow(ctx, "SELECT count() FROM apm_exceptions WHERE "+cond).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	if n := count("event_id = 'e-dup'"); n != 2 {
+		t.Fatalf("before merge: %d copies, want 2", n)
+	}
+	if err := client.Exec(ctx, "OPTIMIZE TABLE apm_exceptions FINAL"); err != nil {
+		t.Fatal(err)
+	}
+	if n := count("event_id = 'e-dup'"); n != 1 {
+		t.Errorf("after OPTIMIZE FINAL: %d copies, want 1", n)
+	}
+	if n := count("startsWith(event_id, 'srv-')"); n != 2 {
+		t.Errorf("legacy rows after OPTIMIZE FINAL: %d, want 2", n)
+	}
+	if n := count("event_id = ''"); n != 0 {
+		t.Errorf("%d rows with an empty event_id", n)
+	}
+}
+
 // APM-19 end to end through the ingest handler, with both insert paths: a
 // resent batch, and a resend that overlaps with new events, store no
 // duplicate rows; old-SDK events are stored every time.
