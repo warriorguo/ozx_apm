@@ -137,6 +137,7 @@ namespace OzxApm.Network
         private readonly object _lock = new object();
         private List<BaseEvent> _pending = new List<BaseEvent>(64);
         private bool _flushRequested;
+        private bool _releaseFirstRequested;
         private bool _clearRequested;
         private bool _uploadRequested;
         private UploadPoll _uploadState = UploadPoll.Empty;
@@ -382,6 +383,30 @@ namespace OzxApm.Network
                 MarkBusy();
             }
             _wake.Set();
+        }
+
+        /// <summary>
+        /// Before the first request of a process: seal the open segments and send
+        /// whatever is stored, so the one-time cost of the first request falls into
+        /// the loading phase instead of LowValueUploadIntervalSeconds later. Unlike
+        /// Flush it does not touch the sequence reservation. No-op without the hold.
+        /// </summary>
+        public void ReleaseForFirstUpload()
+        {
+            if (LowValueHoldSeconds <= 0f)
+                return;
+            bool wake;
+            lock (_lock)
+            {
+                if (_releaseFirstRequested)
+                    return;
+                _releaseFirstRequested = true;
+                MarkBusy();
+                wake = _workerLongWait;
+                _workerLongWait = false;
+            }
+            if (wake)
+                _wake.Set();
         }
 
         /// <summary>
@@ -642,7 +667,7 @@ namespace OzxApm.Network
             var now = DateTime.UtcNow;
             lock (_lock)
             {
-                if (_pending.Count > 0 || _flushRequested || _clearRequested || _uploadRequested || _completions.Count > 0)
+                if (_pending.Count > 0 || _flushRequested || _releaseFirstRequested || _clearRequested || _uploadRequested || _completions.Count > 0)
                 {
                     _workerLongWait = false;
                     if (_writeRetryAtUtc > now && _pending.Count > 0)
@@ -674,7 +699,7 @@ namespace OzxApm.Network
                 LoadExisting();
             }
 
-            bool flush, clear, upload;
+            bool flush, clear, upload, releaseFirst;
             bool writeAllowed = DateTime.UtcNow >= _writeRetryAtUtc;
             lock (_lock)
             {
@@ -686,9 +711,11 @@ namespace OzxApm.Network
                 }
 
                 flush = _flushRequested;
+                releaseFirst = _releaseFirstRequested;
                 clear = _clearRequested;
                 upload = _uploadRequested;
                 _flushRequested = false;
+                _releaseFirstRequested = false;
                 _clearRequested = false;
                 _uploadRequested = false;
 
@@ -714,15 +741,15 @@ namespace OzxApm.Network
                 foreach (var w in Writers)
                 {
                     if (w.Open != null && w.Open.EventCount > 0 &&
-                        (flush || (UtcNow - w.Open.CreatedUtc).TotalSeconds >= _config.FlushIntervalSeconds))
+                        (flush || releaseFirst || (UtcNow - w.Open.CreatedUtc).TotalSeconds >= _config.FlushIntervalSeconds))
                     {
                         SealOpen(w);
                     }
                 }
 
-                // Flush (pause, background, quit, explicit Flush): nothing waits for
-                // the low-value upload interval any more.
-                if (flush)
+                // Flush (pause, background, quit, explicit Flush) and the first upload
+                // of the process: nothing waits for the low-value upload interval.
+                if (flush || releaseFirst)
                     ReleaseHeldLowValue();
 
                 EnforceCap();
@@ -751,7 +778,7 @@ namespace OzxApm.Network
                 {
                     if (upload && _uploadState == UploadPoll.Pending && _preparedUpload == null)
                         _uploadState = UploadPoll.Empty; // PrepareUpload threw
-                    if (_pending.Count == 0 && !_flushRequested && !_clearRequested && _completions.Count == 0)
+                    if (_pending.Count == 0 && !_flushRequested && !_releaseFirstRequested && !_clearRequested && _completions.Count == 0)
                         idleGen = _busyGen;
                 }
                 if (idleGen >= 0)
@@ -1606,6 +1633,9 @@ namespace OzxApm.Network
         //   * when the oldest held segment is that old, or a full request
         //     (MaxBatchBytes) is waiting;
         //   * at once on Flush (pause, background, quit, ApmClient.Flush);
+        //   * at the first upload opportunity of the process (after
+        //     InitialUploadDelaySeconds or MarkTTI), so the one-time cost of the
+        //     first request falls into the loading phase (ReleaseForFirstUpload);
         //   * whenever a request goes out anyway (they ride along with it).
         // Exceptions, crashes and startup events (high-value segments) are never
         // held and are sent before held-back data. Segments left by earlier launches

@@ -111,6 +111,11 @@ namespace OzxApm.Network
         // which do not wait out the size-based pause of a large (e.g. held-back
         // perf) request. Failures set it to the backoff, so it never shortens a retry.
         private float _highValueAttemptTime;
+        // The first request of a process pays a one-time UnityWebRequest set-up cost
+        // (~10-20 ms on a mid-range phone). It goes out at the first upload
+        // opportunity (InitialUploadDelaySeconds / MarkTTI), i.e. still in the
+        // loading phase, with whatever is stored: nothing is held back for it.
+        private bool _firstRequestCreated;
         private float _uploadsAllowedAt;
         private int _consecutiveFailures;
 
@@ -185,6 +190,8 @@ namespace OzxApm.Network
                     if ((now >= _nextAttemptTime || (now >= _highValueAttemptTime && _storage.HighValueWaiting)) &&
                         now >= _uploadsAllowedAt && _config.Consent == ConsentState.Granted)
                     {
+                        if (!_firstRequestCreated)
+                            _storage.ReleaseForFirstUpload();
                         _storage.RequestUpload();
                         _state = State.WaitingForBatch;
                     }
@@ -311,6 +318,7 @@ namespace OzxApm.Network
 
                 _request = _transport.Create(_ingestUrl, batch.PayloadBuffer, batch.PayloadLength, batch.Compressed,
                     _config.AppKey, Mathf.Max(1, (int)_config.RequestTimeoutSeconds));
+                _firstRequestCreated = true;
                 _state = State.Created; // started on the next frame
             }
             catch (Exception ex)

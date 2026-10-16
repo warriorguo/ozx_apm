@@ -156,8 +156,11 @@ namespace OzxApm.Core
         /// game idles this data goes out in one request per interval instead of one
         /// every ~20 s. Exceptions, crashes and startup events are never delayed by it.
         /// Held data goes out earlier when a full request (MaxBatchBytes) is waiting,
-        /// when any other request is sent, and at once on pause, background, quit and
-        /// ApmClient.Flush. It is on disk while it waits, so nothing is lost on a crash.
+        /// when any other request is sent, at once on pause, background, quit and
+        /// ApmClient.Flush, and with the first upload of the process (after
+        /// InitialUploadDelaySeconds or MarkTTI, so the one-time cost of the first
+        /// request stays in the loading phase). It is on disk while it waits, so
+        /// nothing is lost on a crash.
         /// Maximum delay of perf data while online: this interval plus about one second
         /// (plus the retry backoff if uploads fail). Clamped to 0..600 s; 0 disables
         /// the hold (one request per sealed segment, the pre-APM-2 cadence).
