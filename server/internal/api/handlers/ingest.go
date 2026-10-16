@@ -44,6 +44,8 @@ type EventStore interface {
 	InsertSceneLoads(ctx context.Context, loads []models.SceneLoad) error
 	InsertExceptions(ctx context.Context, exceptions []models.Exception) error
 	InsertCrashes(ctx context.Context, crashes []models.Crash) error
+	// ExistingEventIDs returns which of the looked-up event_ids are already stored.
+	ExistingEventIDs(ctx context.Context, q storage.EventIDLookup) (map[string]struct{}, error)
 }
 
 type IngestHandler struct {
@@ -89,8 +91,13 @@ type EventWrapper struct {
 //
 // Events rejected by validation are counted in Rejected and are not worth
 // retrying, so they do not make Stored false.
+//
+// Duplicates counts events that were not inserted because their event_id was
+// already stored or appeared earlier in the batch (APM-19). They are included
+// in Accepted: the server has them, so the client must delete them.
 type IngestResponse struct {
 	Accepted   int      `json:"accepted"`
+	Duplicates int      `json:"duplicates"`
 	Rejected   int      `json:"rejected"`
 	Failed     int      `json:"failed"`
 	Stored     bool     `json:"stored"`
@@ -266,10 +273,49 @@ func (h *IngestHandler) IngestEvents(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Insert events into ClickHouse. Each table insert is retried here
-	// before answering. Only events whose insert succeeded count as accepted.
+	// Drop events that are already stored or repeated in this batch (APM-19).
 	ctx := r.Context()
-	var accepted, failed int
+	var dups dedupResult
+	add := func(d dedupResult) {
+		dups.inBatch += d.inBatch
+		dups.stored += d.stored
+		dups.lookupFailed += d.lookupFailed
+	}
+	var d dedupResult
+	perfSamples, d = dedupe(ctx, h.repo, h.logger, storage.TablePerfSamples, perfSamples,
+		func(e *models.PerfSample) eventKey { return eventKey{e.EventID, e.AppVersion, e.Platform, e.Timestamp} })
+	add(d)
+	janks, d = dedupe(ctx, h.repo, h.logger, storage.TableJanks, janks,
+		func(e *models.Jank) eventKey { return eventKey{e.EventID, e.AppVersion, e.Scene, e.Timestamp} })
+	add(d)
+	startups, d = dedupe(ctx, h.repo, h.logger, storage.TableStartups, startups,
+		func(e *models.Startup) eventKey { return eventKey{e.EventID, e.AppVersion, e.Platform, e.Timestamp} })
+	add(d)
+	sceneLoads, d = dedupe(ctx, h.repo, h.logger, storage.TableSceneLoads, sceneLoads,
+		func(e *models.SceneLoad) eventKey { return eventKey{e.EventID, e.AppVersion, e.SceneName, e.Timestamp} })
+	add(d)
+	exceptions, d = dedupe(ctx, h.repo, h.logger, storage.TableExceptions, exceptions,
+		func(e *models.Exception) eventKey {
+			return eventKey{e.EventID, e.AppVersion, e.Fingerprint, e.Timestamp}
+		})
+	add(d)
+	crashes, d = dedupe(ctx, h.repo, h.logger, storage.TableCrashes, crashes,
+		func(e *models.Crash) eventKey { return eventKey{e.EventID, e.AppVersion, e.Fingerprint, e.Timestamp} })
+	add(d)
+	if dups.total() > 0 {
+		h.logger.Info("dropped duplicate events",
+			zap.Int("duplicates", dups.total()),
+			zap.Int("in_batch", dups.inBatch),
+			zap.Int("already_stored", dups.stored),
+			zap.String("sdk_version", sdkVersion),
+			zap.String("client_ip", clientIP),
+		)
+	}
+
+	// Insert events into ClickHouse. Each table insert is retried here
+	// before answering. Only events whose insert succeeded count as accepted,
+	// plus the duplicates, which are already stored.
+	accepted, failed := dups.total(), 0
 
 	insert := func(kind string, n int, fn func() error) {
 		if n == 0 {
@@ -292,19 +338,20 @@ func (h *IngestHandler) IngestEvents(w http.ResponseWriter, r *http.Request) {
 	insert("crashes", len(crashes), func() error { return h.repo.InsertCrashes(ctx, crashes) })
 
 	resp := IngestResponse{
-		Accepted: accepted,
-		Rejected: rejected,
-		Failed:   failed,
-		Stored:   failed == 0,
-		Errors:   errors,
+		Accepted:   accepted,
+		Duplicates: dups.total(),
+		Rejected:   rejected,
+		Failed:     failed,
+		Stored:     failed == 0,
+		Errors:     errors,
 	}
 	status := http.StatusOK
 
 	if failed > 0 {
 		if hasEventIDs || sdkVersion != "" {
 			// The client keeps the batch and resends it. Tables that did
-			// succeed are written again; their events carry event_id, so the
-			// duplicates can be removed (APM-12).
+			// succeed are not written again: their events carry event_id and
+			// the resend drops them as duplicates (APM-19).
 			resp.Retry = true
 			status = http.StatusServiceUnavailable
 			w.Header().Set("Retry-After", strconv.Itoa(storageRetryAfterSeconds))
@@ -319,6 +366,8 @@ func (h *IngestHandler) IngestEvents(w http.ResponseWriter, r *http.Request) {
 
 	h.logger.Info("ingested events",
 		zap.Int("accepted", accepted),
+		zap.Int("duplicates", dups.total()),
+		zap.Int("dedup_lookup_failed", dups.lookupFailed),
 		zap.Int("rejected", rejected),
 		zap.Int("failed", failed),
 		zap.String("sdk_version", sdkVersion),

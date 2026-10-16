@@ -16,23 +16,55 @@ import (
 
 	"github.com/warriorguo/ozx_apm/server/internal/api/middleware"
 	"github.com/warriorguo/ozx_apm/server/internal/models"
+	"github.com/warriorguo/ozx_apm/server/internal/storage"
 )
 
 // fakeEventStore records inserted events. failExceptions makes every
 // exception insert fail; failExceptionsTimes makes only the first N fail.
+// It remembers stored event_ids per table and answers ExistingEventIDs from
+// them; lookupErr makes every lookup fail, lookupBlock makes it wait for the
+// context to end.
 type fakeEventStore struct {
 	failExceptions      bool
 	failExceptionsTimes int
 	exceptionCalls      int
 	perfSamples         []models.PerfSample
+	janks               []models.Jank
 	exceptions          []models.Exception
+	crashes             []models.Crash
+	ids                 map[string]map[string]bool
+	lookups             []storage.EventIDLookup
+	lookupErr           error
+	lookupBlock         bool
+}
+
+func (f *fakeEventStore) remember(table, id string) {
+	if id == "" {
+		return
+	}
+	if f.ids == nil {
+		f.ids = map[string]map[string]bool{}
+	}
+	if f.ids[table] == nil {
+		f.ids[table] = map[string]bool{}
+	}
+	f.ids[table][id] = true
 }
 
 func (f *fakeEventStore) InsertPerfSamples(_ context.Context, s []models.PerfSample) error {
 	f.perfSamples = append(f.perfSamples, s...)
+	for _, e := range s {
+		f.remember(storage.TablePerfSamples.Name, e.EventID)
+	}
 	return nil
 }
-func (f *fakeEventStore) InsertJanks(context.Context, []models.Jank) error           { return nil }
+func (f *fakeEventStore) InsertJanks(_ context.Context, j []models.Jank) error {
+	f.janks = append(f.janks, j...)
+	for _, e := range j {
+		f.remember(storage.TableJanks.Name, e.EventID)
+	}
+	return nil
+}
 func (f *fakeEventStore) InsertStartups(context.Context, []models.Startup) error     { return nil }
 func (f *fakeEventStore) InsertSceneLoads(context.Context, []models.SceneLoad) error { return nil }
 func (f *fakeEventStore) InsertExceptions(_ context.Context, e []models.Exception) error {
@@ -41,9 +73,35 @@ func (f *fakeEventStore) InsertExceptions(_ context.Context, e []models.Exceptio
 		return errors.New("clickhouse unavailable")
 	}
 	f.exceptions = append(f.exceptions, e...)
+	for _, x := range e {
+		f.remember(storage.TableExceptions.Name, x.EventID)
+	}
 	return nil
 }
-func (f *fakeEventStore) InsertCrashes(context.Context, []models.Crash) error { return nil }
+func (f *fakeEventStore) InsertCrashes(_ context.Context, c []models.Crash) error {
+	f.crashes = append(f.crashes, c...)
+	for _, e := range c {
+		f.remember(storage.TableCrashes.Name, e.EventID)
+	}
+	return nil
+}
+func (f *fakeEventStore) ExistingEventIDs(ctx context.Context, q storage.EventIDLookup) (map[string]struct{}, error) {
+	f.lookups = append(f.lookups, q)
+	if f.lookupBlock {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	if f.lookupErr != nil {
+		return nil, f.lookupErr
+	}
+	found := map[string]struct{}{}
+	for _, id := range q.EventIDs {
+		if f.ids[q.Table.Name][id] {
+			found[id] = struct{}{}
+		}
+	}
+	return found, nil
+}
 
 func init() {
 	// Keep the server-side insert retries fast in tests.

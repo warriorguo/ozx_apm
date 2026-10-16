@@ -17,7 +17,8 @@ CREATE TABLE IF NOT EXISTS apm_perf_samples (
     gc_alloc_kb Float32,
     mem_mb Float32,
     event_id String DEFAULT '',
-    seq UInt64 DEFAULT 0
+    seq UInt64 DEFAULT 0,
+    INDEX idx_event_id event_id TYPE bloom_filter(0.001) GRANULARITY 1
 ) ENGINE = MergeTree()
 PARTITION BY toYYYYMMDD(timestamp)
 ORDER BY (app_version, platform, timestamp)
@@ -39,7 +40,8 @@ CREATE TABLE IF NOT EXISTS apm_janks (
     recent_gc_alloc_kb Float32,
     recent_events Array(String),
     event_id String DEFAULT '',
-    seq UInt64 DEFAULT 0
+    seq UInt64 DEFAULT 0,
+    INDEX idx_event_id event_id TYPE bloom_filter(0.001) GRANULARITY 1
 ) ENGINE = MergeTree()
 PARTITION BY toYYYYMMDD(timestamp)
 ORDER BY (app_version, scene, timestamp)
@@ -58,7 +60,8 @@ CREATE TABLE IF NOT EXISTS apm_startups (
     phase2_ms Float32,
     tti_ms Float32,
     event_id String DEFAULT '',
-    seq UInt64 DEFAULT 0
+    seq UInt64 DEFAULT 0,
+    INDEX idx_event_id event_id TYPE bloom_filter(0.001) GRANULARITY 1
 ) ENGINE = MergeTree()
 PARTITION BY toYYYYMMDD(timestamp)
 ORDER BY (app_version, platform, timestamp)
@@ -76,7 +79,8 @@ CREATE TABLE IF NOT EXISTS apm_scene_loads (
     load_ms Float32,
     activate_ms Float32,
     event_id String DEFAULT '',
-    seq UInt64 DEFAULT 0
+    seq UInt64 DEFAULT 0,
+    INDEX idx_event_id event_id TYPE bloom_filter(0.001) GRANULARITY 1
 ) ENGINE = MergeTree()
 PARTITION BY toYYYYMMDD(timestamp)
 ORDER BY (app_version, scene_name, timestamp)
@@ -97,7 +101,8 @@ CREATE TABLE IF NOT EXISTS apm_exceptions (
     stack String,
     count UInt32,
     event_id String DEFAULT '',
-    seq UInt64 DEFAULT 0
+    seq UInt64 DEFAULT 0,
+    INDEX idx_event_id event_id TYPE bloom_filter(0.001) GRANULARITY 1
 ) ENGINE = MergeTree()
 PARTITION BY toYYYYMMDD(timestamp)
 ORDER BY (app_version, fingerprint, timestamp)
@@ -118,7 +123,8 @@ CREATE TABLE IF NOT EXISTS apm_crashes (
     stack String,
     breadcrumbs Array(String),
     event_id String DEFAULT '',
-    seq UInt64 DEFAULT 0
+    seq UInt64 DEFAULT 0,
+    INDEX idx_event_id event_id TYPE bloom_filter(0.001) GRANULARITY 1
 ) ENGINE = MergeTree()
 PARTITION BY toYYYYMMDD(timestamp)
 ORDER BY (app_version, fingerprint, timestamp)
@@ -126,7 +132,7 @@ TTL timestamp + INTERVAL 30 DAY;
 
 -- APM-2: client event id + per-install sequence number.
 -- Additive and idempotent so it is safe to re-run on existing deployments.
--- De-duplication by event_id is handled separately (APM-12).
+-- De-duplication by event_id: APM-19 (below).
 ALTER TABLE apm_perf_samples ADD COLUMN IF NOT EXISTS event_id String DEFAULT '';
 ALTER TABLE apm_perf_samples ADD COLUMN IF NOT EXISTS seq UInt64 DEFAULT 0;
 ALTER TABLE apm_janks ADD COLUMN IF NOT EXISTS event_id String DEFAULT '';
@@ -139,6 +145,19 @@ ALTER TABLE apm_exceptions ADD COLUMN IF NOT EXISTS event_id String DEFAULT '';
 ALTER TABLE apm_exceptions ADD COLUMN IF NOT EXISTS seq UInt64 DEFAULT 0;
 ALTER TABLE apm_crashes ADD COLUMN IF NOT EXISTS event_id String DEFAULT '';
 ALTER TABLE apm_crashes ADD COLUMN IF NOT EXISTS seq UInt64 DEFAULT 0;
+
+-- APM-19: bloom_filter skip index on event_id for the ingest-time duplicate
+-- lookup. Additive, idempotent, metadata only: new parts carry the index,
+-- existing parts get it when merged. Needs the ALTER ADD INDEX privilege (the
+-- `apm` service account does not have it; run as an admin, see RELEASE.md).
+-- To index existing parts right away (a background mutation per table):
+--   ALTER TABLE <table> MATERIALIZE INDEX idx_event_id;
+ALTER TABLE apm_perf_samples ADD INDEX IF NOT EXISTS idx_event_id event_id TYPE bloom_filter(0.001) GRANULARITY 1;
+ALTER TABLE apm_janks ADD INDEX IF NOT EXISTS idx_event_id event_id TYPE bloom_filter(0.001) GRANULARITY 1;
+ALTER TABLE apm_startups ADD INDEX IF NOT EXISTS idx_event_id event_id TYPE bloom_filter(0.001) GRANULARITY 1;
+ALTER TABLE apm_scene_loads ADD INDEX IF NOT EXISTS idx_event_id event_id TYPE bloom_filter(0.001) GRANULARITY 1;
+ALTER TABLE apm_exceptions ADD INDEX IF NOT EXISTS idx_event_id event_id TYPE bloom_filter(0.001) GRANULARITY 1;
+ALTER TABLE apm_crashes ADD INDEX IF NOT EXISTS idx_event_id event_id TYPE bloom_filter(0.001) GRANULARITY 1;
 
 -- Materialized views for aggregations (optional, for better query performance)
 
