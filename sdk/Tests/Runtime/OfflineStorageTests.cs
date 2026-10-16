@@ -33,6 +33,7 @@ namespace OzxApm.Tests
                 BatchSize = 5,
                 MaxBatchBytes = 64 * 1024,
                 FlushIntervalSeconds = 3600f, // seal only when asked or full
+                LowValueUploadIntervalSeconds = 0f, // no hold: the hold has its own tests
                 MaxOfflineStorageBytes = 5 * 1024 * 1024,
                 EnableCompression = false,
                 LogLevel = LogLevel.None

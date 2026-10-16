@@ -24,7 +24,7 @@ namespace OzxApm.Tests
         {
             PerfSamplePool.ClearForTests();
             _dir = Path.Combine(Path.GetTempPath(), "ozx_apm_pool_" + Guid.NewGuid().ToString("N"));
-            _config = new ApmConfig { BatchSize = 20, FlushIntervalSeconds = 3600f, LogLevel = LogLevel.None };
+            _config = new ApmConfig { BatchSize = 20, FlushIntervalSeconds = 3600f, LowValueUploadIntervalSeconds = 0f, LogLevel = LogLevel.None };
             _store = new OfflineStorage(_config, _dir, false);
         }
 

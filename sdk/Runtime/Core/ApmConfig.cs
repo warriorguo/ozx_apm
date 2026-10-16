@@ -150,6 +150,21 @@ namespace OzxApm.Core
         public int UploadBytesPerSecond { get; set; } = 8 * 1024;
 
         /// <summary>
+        /// How long low-value data (perf samples, jank, scene loads, network and asset
+        /// timings) written during this session may wait before it is uploaded
+        /// (seconds). Every upload request costs a few main-thread frames, so while the
+        /// game idles this data goes out in one request per interval instead of one
+        /// every ~20 s. Exceptions, crashes and startup events are never delayed by it.
+        /// Held data goes out earlier when a full request (MaxBatchBytes) is waiting,
+        /// when any other request is sent, and at once on pause, background, quit and
+        /// ApmClient.Flush. It is on disk while it waits, so nothing is lost on a crash.
+        /// Maximum delay of perf data while online: this interval plus about one second
+        /// (plus the retry backoff if uploads fail). Clamped to 0..600 s; 0 disables
+        /// the hold (one request per sealed segment, the pre-APM-2 cadence).
+        /// </summary>
+        public float LowValueUploadIntervalSeconds { get; set; } = 120.0f;
+
+        /// <summary>
         /// Player consent. Nothing is enqueued, written to disk or uploaded unless Granted.
         /// Defaults to Granted (pre-APM-14 behaviour). Change at runtime with ApmClient.SetConsent.
         /// </summary>

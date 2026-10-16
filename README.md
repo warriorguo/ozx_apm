@@ -125,6 +125,10 @@ var config = new ApmConfig
     // Batching
     BatchSize = 20,
     FlushIntervalSeconds = 30f,
+    // Perf samples and other low-value data go out at most this often while idle
+    // (max 600 s); exceptions, crashes and startup events are never delayed by it,
+    // and everything is flushed and uploaded on pause/background/quit.
+    LowValueUploadIntervalSeconds = 120f,
 
     // Offline support
     EnableOfflineStorage = true,

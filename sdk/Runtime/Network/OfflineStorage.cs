@@ -76,7 +76,9 @@ namespace OzxApm.Network
     /// A segment is sealed when it holds BatchSize events / MaxBatchBytes, is
     /// older than FlushIntervalSeconds, on Flush(), after a write error and at
     /// startup (".open" files left by a crash or kill). Consecutive small
-    /// segments are merged into one upload.
+    /// segments are merged into one upload. Low-value segments written by this
+    /// session are held back for up to LowValueUploadIntervalSeconds (see IsHeld);
+    /// this session's exception/crash/startup segments are sent first.
     ///
     /// Threading: all file I/O happens on one background worker thread. The
     /// main thread only appends to an in-memory list under a lock. An event is
@@ -214,6 +216,10 @@ namespace OzxApm.Network
         internal static Action<Stream> BeforeWriteHook;
         /// <summary>Test seam: makes thread creation fail.</summary>
         internal static bool FailThreadStartForTests;
+        /// <summary>Test seam: clock for segment ages (seal and low-value upload interval).</summary>
+        internal Func<DateTime> UtcNowForTests;
+
+        private DateTime UtcNow => UtcNowForTests != null ? UtcNowForTests() : DateTime.UtcNow;
 
         private sealed class Segment
         {
@@ -225,6 +231,8 @@ namespace OzxApm.Network
             public bool Legacy;
             public int HighValue = -1;  // -1 unknown, 0 no, 1 has exceptions/crashes/startup
             public DateTime CreatedUtc;
+            public bool ThisSession;    // written by this instance (not loaded from an earlier launch)
+            public bool Released;       // low-value segment no longer held back (see IsHeld)
         }
 
         public OfflineStorage(ApmConfig config)
@@ -263,6 +271,13 @@ namespace OzxApm.Network
 
         /// <summary>Events dropped because the in-memory hand-off or the storage cap overflowed.</summary>
         public long DroppedEventCount => Interlocked.Read(ref _droppedPendingEvents) + Interlocked.Read(ref _droppedByCap);
+
+        /// <summary>
+        /// True while a sealed exception/crash/startup segment of this session waits
+        /// for upload (worker's view, refreshed after every worker iteration).
+        /// </summary>
+        public bool HighValueWaiting => _highValueWaiting;
+        private volatile bool _highValueWaiting;
 
         /// <summary>Highest sequence number assigned so far.</summary>
         public long LastSeq => Interlocked.Read(ref _seq);
@@ -699,11 +714,16 @@ namespace OzxApm.Network
                 foreach (var w in Writers)
                 {
                     if (w.Open != null && w.Open.EventCount > 0 &&
-                        (flush || (DateTime.UtcNow - w.Open.CreatedUtc).TotalSeconds >= _config.FlushIntervalSeconds))
+                        (flush || (UtcNow - w.Open.CreatedUtc).TotalSeconds >= _config.FlushIntervalSeconds))
                     {
                         SealOpen(w);
                     }
                 }
+
+                // Flush (pause, background, quit, explicit Flush): nothing waits for
+                // the low-value upload interval any more.
+                if (flush)
+                    ReleaseHeldLowValue();
 
                 EnforceCap();
 
@@ -723,6 +743,7 @@ namespace OzxApm.Network
             }
             finally
             {
+                UpdateHighValueWaiting();
                 _drain.Clear();
                 _completionDrain.Clear();
                 long idleGen = -1;
@@ -1135,11 +1156,11 @@ namespace OzxApm.Network
 
         private void OpenSegment(SegmentWriter w)
         {
-            var now = DateTime.UtcNow;
+            var now = UtcNow;
             long ms = new DateTimeOffset(now).ToUnixTimeMilliseconds();
             string baseName = SegmentBaseName(ms);
 
-            var segment = new Segment { CreatedUtc = now, EventCount = 0, HighValue = w.High ? 1 : 0 };
+            var segment = new Segment { CreatedUtc = now, EventCount = 0, HighValue = w.High ? 1 : 0, ThisSession = true };
 
             if (_persistToDisk)
             {
@@ -1550,9 +1571,13 @@ namespace OzxApm.Network
 
             if (_config.Consent == ConsentState.Granted && _inFlight.Count == 0)
             {
+                ReleaseDueLowValue();
                 while (_segments.Count > 0 && batch == null)
                 {
-                    batch = BuildBatch();
+                    int head = SelectHead();
+                    if (head < 0)
+                        break; // only held low-value segments: nothing to send yet
+                    batch = BuildBatch(head);
                 }
             }
 
@@ -1569,13 +1594,104 @@ namespace OzxApm.Network
             }
         }
 
+        // ------------------------------------------------------------------
+        // Low-value upload interval (worker thread)
+        //
+        // Every upload request costs a few main-thread frames (UnityWebRequest
+        // create/start/dispose). While the game idles, perf samples alone used to
+        // fill a 20-event segment every ~20 s, i.e. one request every ~20 s. Low-value
+        // segments written by this session (perf samples, jank, scene loads, ...)
+        // are therefore held back and go out together, at most
+        // LowValueUploadIntervalSeconds after the oldest of them was started:
+        //   * when the oldest held segment is that old, or a full request
+        //     (MaxBatchBytes) is waiting;
+        //   * at once on Flush (pause, background, quit, ApmClient.Flush);
+        //   * whenever a request goes out anyway (they ride along with it).
+        // Exceptions, crashes and startup events (high-value segments) are never
+        // held and are sent before held-back data. Segments left by earlier launches
+        // are never held, so a stored backlog drains exactly as before.
+        // ------------------------------------------------------------------
+
+        /// <summary>Upper bound of the low-value upload interval (documented maximum delay).</summary>
+        public const float MaxLowValueUploadIntervalSeconds = 600f;
+
+        private float LowValueHoldSeconds =>
+            Math.Min(MaxLowValueUploadIntervalSeconds, Math.Max(0f, _config.LowValueUploadIntervalSeconds));
+
+        private bool IsHeld(Segment s)
+        {
+            return s.ThisSession && s.HighValue == 0 && !s.Released && LowValueHoldSeconds > 0f;
+        }
+
+        private void UpdateHighValueWaiting()
+        {
+            bool waiting = false;
+            for (int i = 0; i < _segments.Count && !waiting; i++)
+            {
+                var s = _segments[i];
+                waiting = s.ThisSession && s.HighValue == 1 && !_inFlight.Contains(s.Name);
+            }
+            _highValueWaiting = waiting;
+        }
+
+        private void ReleaseHeldLowValue()
+        {
+            for (int i = 0; i < _segments.Count; i++)
+                _segments[i].Released = true;
+        }
+
+        /// <summary>Releases the held segments once the oldest is due or a full request is waiting.</summary>
+        private void ReleaseDueLowValue()
+        {
+            float hold = LowValueHoldSeconds;
+            if (hold <= 0f)
+                return;
+
+            DateTime oldest = DateTime.MaxValue;
+            long bytes = 0;
+            for (int i = 0; i < _segments.Count; i++)
+            {
+                var s = _segments[i];
+                if (!IsHeld(s))
+                    continue;
+                if (s.CreatedUtc < oldest)
+                    oldest = s.CreatedUtc;
+                bytes += s.Bytes;
+            }
+            if (oldest == DateTime.MaxValue)
+                return;
+
+            if ((UtcNow - oldest).TotalSeconds >= hold || bytes >= Math.Max(1024, _config.MaxBatchBytes))
+                ReleaseHeldLowValue();
+        }
+
         /// <summary>
-        /// Builds one request from the oldest segment(s). Returns null after
+        /// First segment of the next request: this session's oldest high-value
+        /// segment, otherwise the oldest segment that is not held back; -1 if
+        /// only held-back segments are left.
+        /// </summary>
+        private int SelectHead()
+        {
+            int firstFree = -1;
+            for (int i = 0; i < _segments.Count; i++)
+            {
+                var s = _segments[i];
+                if (s.ThisSession && s.HighValue == 1)
+                    return i;
+                if (firstFree < 0 && !IsHeld(s))
+                    firstFree = i;
+            }
+            return firstFree;
+        }
+
+        /// <summary>
+        /// Builds one request starting at segment <paramref name="head"/>, followed
+        /// by the other segments in storage order while they fit. Returns null after
         /// dropping a segment with no valid event, so the caller tries the next.
         /// </summary>
-        private UploadBatch BuildBatch()
+        private UploadBatch BuildBatch(int head)
         {
-            var first = _segments[0];
+            var first = _segments[head];
             var batch = new UploadBatch { SegmentName = first.Name };
 
             _bodyBuffer.SetLength(0);
@@ -1584,7 +1700,7 @@ namespace OzxApm.Network
             {
                 if (!ReadSegment(first, out int length) || !LooksLikeObject(_readBuffer, length))
                 {
-                    DropUnreadable(0);
+                    DropUnreadable(head);
                     return null;
                 }
                 // Pre-APM-2 files already are a full {"events":[...]} body; the
@@ -1602,21 +1718,26 @@ namespace OzxApm.Network
             int maxBytes = Math.Max(1024, _config.MaxBatchBytes);
             _bodyBuffer.Write(BatchPrefix, 0, BatchPrefix.Length);
 
-            for (int s = 0; s < _segments.Count; s++)
+            // The head first, then the others in storage order (oldest first). With
+            // head == 0 (always the case for a backlog from earlier launches) this is
+            // the plain run of consecutive segments.
+            for (int k = 0; k < _segments.Count; k++)
             {
+                int s = k == 0 ? head : (k <= head ? k - 1 : k);
+                bool isHead = k == 0;
                 var segment = _segments[s];
                 if (segment.Legacy)
                     break;
-                if (s > 0 && segment.EventCount >= 0 &&
+                if (!isHead && segment.EventCount >= 0 &&
                     (batch.EventCount + segment.EventCount > maxEvents ||
                      _bodyBuffer.Length + segment.Bytes > maxBytes))
                     break;
 
                 if (!ReadSegment(segment, out int length))
                 {
-                    if (s == 0)
+                    if (isHead)
                     {
-                        DropUnreadable(0);
+                        DropUnreadable(head);
                         return null;
                     }
                     break;
@@ -1627,15 +1748,15 @@ namespace OzxApm.Network
                 if (added == 0)
                 {
                     _bodyBuffer.SetLength(mark);
-                    if (s == 0)
+                    if (isHead)
                     {
                         // Nothing valid inside (e.g. only a cut-off line): drop it.
-                        DropUnreadable(0);
+                        DropUnreadable(head);
                         return null;
                     }
                     break;
                 }
-                if (s > 0 && (batch.EventCount + added > maxEvents || _bodyBuffer.Length + BatchSuffix.Length > maxBytes))
+                if (!isHead && (batch.EventCount + added > maxEvents || _bodyBuffer.Length + BatchSuffix.Length > maxBytes))
                 {
                     _bodyBuffer.SetLength(mark); // would overflow the request
                     break;

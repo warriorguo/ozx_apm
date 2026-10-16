@@ -107,6 +107,10 @@ namespace OzxApm.Network
 
         private State _state = State.Idle;
         private float _nextAttemptTime;
+        // After a delivered request: earliest time for exceptions/crashes/startup,
+        // which do not wait out the size-based pause of a large (e.g. held-back
+        // perf) request. Failures set it to the backoff, so it never shortens a retry.
+        private float _highValueAttemptTime;
         private float _uploadsAllowedAt;
         private int _consecutiveFailures;
 
@@ -178,7 +182,8 @@ namespace OzxApm.Network
             switch (_state)
             {
                 case State.Idle:
-                    if (now >= _nextAttemptTime && now >= _uploadsAllowedAt && _config.Consent == ConsentState.Granted)
+                    if ((now >= _nextAttemptTime || (now >= _highValueAttemptTime && _storage.HighValueWaiting)) &&
+                        now >= _uploadsAllowedAt && _config.Consent == ConsentState.Granted)
                     {
                         _storage.RequestUpload();
                         _state = State.WaitingForBatch;
@@ -416,6 +421,7 @@ namespace OzxApm.Network
                 // rare without slowing the drain.
                 _consecutiveFailures = 0;
                 _nextAttemptTime = now + ComputeUploadGapSeconds(batchBytes, _config.UploadIntervalSeconds, _config.UploadBytesPerSecond);
+                _highValueAttemptTime = now + Mathf.Max(0f, _config.UploadIntervalSeconds);
                 return;
             }
 
@@ -426,6 +432,7 @@ namespace OzxApm.Network
                 _config.RetryMaxDelaySeconds, (float)_random.NextDouble());
             delay = Mathf.Max(delay, Mathf.Max(_config.UploadIntervalSeconds, retryAfterSeconds));
             _nextAttemptTime = now + delay;
+            _highValueAttemptTime = _nextAttemptTime;
         }
 
         /// <summary>

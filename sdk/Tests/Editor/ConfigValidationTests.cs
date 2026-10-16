@@ -53,6 +53,14 @@ namespace OzxApm.Tests.Editor
         }
 
         [Test]
+        public void Config_LowValueUploadIntervalDefault()
+        {
+            var config = ApmConfig.Default();
+            Assert.AreEqual(120f, config.LowValueUploadIntervalSeconds);
+            Assert.LessOrEqual(config.LowValueUploadIntervalSeconds, OzxApm.Network.OfflineStorage.MaxLowValueUploadIntervalSeconds);
+        }
+
+        [Test]
         public void Config_BatchSizeDefault()
         {
             var config = ApmConfig.Default();

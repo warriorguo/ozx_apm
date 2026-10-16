@@ -199,6 +199,7 @@ namespace OzxApm.Tests
                 BatchSize = 1,
                 MaxBatchBytes = 1024, // with ~900-byte events: one event per request, so requests are countable
                 FlushIntervalSeconds = 3600f,
+                LowValueUploadIntervalSeconds = 0f, // no hold here; see the LowValueHold tests below
                 EnableCompression = false,
                 InitialUploadDelaySeconds = 10f,
                 UploadIntervalSeconds = 1f,
@@ -458,6 +459,237 @@ namespace OzxApm.Tests
             Last.Respond(200, "{}");
             Step();
             Assert.AreEqual(1, StoredSegments());
+        }
+
+        // ---- Low-value upload interval (LowValueUploadIntervalSeconds) ----
+
+        private DateTime _utc;
+
+        /// <summary>Hold enabled, storage ages driven by the same fake clock as the reporter.</summary>
+        private void EnableHold(float seconds, int batchSize = 5, int maxBatchBytes = 64 * 1024, float flushInterval = 30f)
+        {
+            _config.LowValueUploadIntervalSeconds = seconds;
+            _config.BatchSize = batchSize;
+            _config.MaxBatchBytes = maxBatchBytes;
+            _config.FlushIntervalSeconds = flushInterval;
+            _utc = new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+            _storage.UtcNowForTests = () => _utc;
+        }
+
+        private void HoldStep(float seconds = 0f)
+        {
+            _utc = _utc.AddSeconds(seconds);
+            Step(seconds);
+        }
+
+        private PerfSampleEvent SmallPerf()
+        {
+            return new PerfSampleEvent
+            {
+                event_id = Guid.NewGuid().ToString("N"), timestamp = 1700000000000, app_version = "1",
+                platform = "Android", session_id = "s", device_id = "d", fps = 30f
+            };
+        }
+
+        private ExceptionEvent Exception(string tag)
+        {
+            return new ExceptionEvent
+            {
+                event_id = Guid.NewGuid().ToString("N"), timestamp = 1700000000000, app_version = "1",
+                platform = "Android", session_id = "s", device_id = "d", fingerprint = tag, message = tag, count = 1
+            };
+        }
+
+        private List<string> EnqueuePerf(int n)
+        {
+            var ids = new List<string>();
+            for (int i = 0; i < n; i++)
+            {
+                var e = SmallPerf();
+                ids.Add(e.event_id);
+                _storage.Enqueue(e);
+            }
+            _storage.Pump();
+            return ids;
+        }
+
+        private static string BodyOf(FakeRequest r) => System.Text.Encoding.UTF8.GetString(r.Payload);
+
+        [Test]
+        public void LowValueHold_PerfSamplesWaitForTheInterval_ThenGoOutInOneRequest()
+        {
+            EnableHold(120f);
+            _reporter.NotifyGameReady();
+
+            var ids = new List<string>();
+            for (int t = 0; t < 60; t++)
+            {
+                ids.AddRange(EnqueuePerf(1)); // one perf sample per second: a sealed 5-event segment every 5 s
+                HoldStep(1f);
+            }
+            Assert.AreEqual(0, _transport.Requests.Count, "sealed perf segments are held back while idle");
+
+            HoldStep(59f);
+            Assert.AreEqual(0, _transport.Requests.Count, "still inside the 120 s interval");
+
+            HoldStep(2f);
+            Assert.AreEqual(1, _transport.Requests.Count, "released when the oldest held segment is 120 s old");
+            string body = BodyOf(Last);
+            foreach (var id in ids)
+                StringAssert.Contains(id, body, "all held segments go out together in one request");
+        }
+
+        [Test]
+        public void LowValueHold_ExceptionsKeepTheirLatency_AndCarryHeldDataAlong()
+        {
+            // Same config with and without the hold: the exception must leave at the same time.
+            foreach (float hold in new[] { 0f, 120f })
+            {
+                TearDown();
+                SetUp();
+                EnableHold(hold);
+                _reporter.NotifyGameReady();
+
+                var exc = Exception("boom");
+                _storage.Enqueue(exc);
+                var perf = EnqueuePerf(3); // open low-value segment, written in the same pump
+
+                HoldStep(29f);
+                Assert.AreEqual(0, _transport.Requests.Count, "hold=" + hold + ": exception segment not sealed yet (FlushIntervalSeconds)");
+                HoldStep(1.5f);
+                Assert.AreEqual(1, _transport.Requests.Count, "hold=" + hold + ": exception sent after FlushIntervalSeconds, as before");
+                string body = BodyOf(Last);
+                StringAssert.Contains(exc.event_id, body);
+                foreach (var id in perf)
+                    StringAssert.Contains(id, body, "hold=" + hold + ": low-value data rides along with a request that goes out anyway");
+            }
+        }
+
+        [Test]
+        public void LowValueHold_HighValueSegmentsGoBeforeReleasedLowValueData()
+        {
+            // A full request of released perf data is waiting; an exception sealed
+            // later must not queue behind it (and behind its size-based pause).
+            EnableHold(120f, batchSize: 1, maxBatchBytes: 4096);
+            _storage.UtcNowForTests = () => _utc;
+            Enqueue(6); // ~900-byte perf samples, one segment each: > MaxBatchBytes held, so released
+            var exc = Exception("first");
+            _storage.Enqueue(exc);
+            _storage.Pump(); // BatchSize 1: the exception segment is sealed at once
+
+            _reporter.NotifyGameReady();
+            HoldStep();
+            Assert.AreEqual(1, _transport.Requests.Count);
+            StringAssert.Contains(exc.event_id, BodyOf(Last), "the exception goes out in the first request");
+        }
+
+        [Test]
+        public void LowValueHold_ExceptionDoesNotWaitOutThePauseAfterALargePerfRequest()
+        {
+            // A large held-back perf request is followed by a size-based pause
+            // (bytes / UploadBytesPerSecond). An exception sealed during that pause
+            // goes out after UploadIntervalSeconds, not after the pause.
+            EnableHold(120f, batchSize: 1, maxBatchBytes: 8192);
+            _config.UploadBytesPerSecond = 1024; // ~7 KB request -> ~7 s pause
+            Enqueue(8);                          // ~900-byte perf samples: a full request, released
+            _reporter.NotifyGameReady();
+            HoldStep();
+            Assert.AreEqual(1, _transport.Requests.Count);
+            Last.Respond(200, "{}");
+            HoldStep();
+            Assert.Greater(_reporter.NextAttemptTime - _now, 5f, "large request: long pause for low-value data");
+
+            var exc = Exception("during-pause");
+            _storage.Enqueue(exc);
+            _storage.Pump(); // BatchSize 1: sealed at once
+            HoldStep(1.1f);
+            Assert.AreEqual(2, _transport.Requests.Count, "the exception does not wait for the pause");
+            StringAssert.Contains(exc.event_id, BodyOf(Last));
+        }
+
+        [Test]
+        public void LowValueHold_FailureBackoffAlsoAppliesToExceptions()
+        {
+            EnableHold(120f, batchSize: 1);
+            var exc = Exception("x");
+            _storage.Enqueue(exc);
+            _storage.Pump();
+            _reporter.NotifyGameReady();
+            HoldStep();
+            Last.Respond(503);
+            HoldStep();
+            Assert.AreEqual(1, _transport.Requests.Count);
+            HoldStep(1.1f);
+            Assert.AreEqual(1, _transport.Requests.Count, "backoff (5 s) is not shortened for high-value data");
+            HoldStep(4f);
+            Assert.AreEqual(2, _transport.Requests.Count);
+        }
+
+        [Test]
+        public void LowValueHold_PauseFlushesAndUploadsHeldDataAtOnce()
+        {
+            EnableHold(120f);
+            _reporter.NotifyGameReady();
+            var ids = EnqueuePerf(12);
+            HoldStep(10f);
+            Assert.AreEqual(0, _transport.Requests.Count);
+
+            // What ApmClient.OnApplicationPause(true) does: flush, wait for the writer, retry now.
+            _storage.Flush();
+            Assert.IsTrue(_storage.WaitIdle(1000));
+            _reporter.RetryNow();
+            HoldStep();
+
+            Assert.AreEqual(1, _transport.Requests.Count, "pause does not wait for the interval");
+            string body = BodyOf(Last);
+            foreach (var id in ids)
+                StringAssert.Contains(id, body, "including the open segment sealed by the flush");
+        }
+
+        [Test]
+        public void LowValueHold_QuitKeepsHeldData_AndTheNextLaunchSendsItAtOnce()
+        {
+            EnableHold(120f);
+            var ids = EnqueuePerf(7);
+            HoldStep(5f);
+
+            // What ApmClient does on quit: seal and stop.
+            _reporter.Shutdown();
+            _storage.Shutdown(500);
+
+            // Next launch: segments from an earlier launch are never held.
+            _storage = new OfflineStorage(_config, _dir, false);
+            _reporter = new EventReporter(_config, _storage, null, _transport, () => _now, () => _reach, new FixedRandom(1.0));
+            _storage.UtcNowForTests = () => _utc;
+            _reporter.NotifyGameReady();
+            HoldStep();
+
+            Assert.AreEqual(1, _transport.Requests.Count);
+            string body = BodyOf(Last);
+            foreach (var id in ids)
+                StringAssert.Contains(id, body);
+        }
+
+        [Test]
+        public void LowValueHold_IntervalIsCappedAt600Seconds()
+        {
+            EnableHold(100000f);
+            _reporter.NotifyGameReady();
+            EnqueuePerf(5);
+            HoldStep(599f);
+            Assert.AreEqual(0, _transport.Requests.Count);
+            HoldStep(2f);
+            Assert.AreEqual(1, _transport.Requests.Count, "documented maximum delay: 600 s");
+        }
+
+        [Test]
+        public void LowValueHold_ZeroDisablesTheHold()
+        {
+            EnableHold(0f);
+            _reporter.NotifyGameReady();
+            EnqueuePerf(5); // one sealed segment
+            HoldStep();
+            Assert.AreEqual(1, _transport.Requests.Count, "0: every sealed segment is sent right away (old cadence)");
         }
     }
 }
