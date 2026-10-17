@@ -2,6 +2,7 @@ package admin
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -145,6 +146,10 @@ func (h *ExceptionHandler) GetOccurrences(w http.ResponseWriter, r *http.Request
 		return
 	}
 	page, pageSize := pageParams(q, 10, storage.MaxOccurrencesPageSize)
+	if (page-1)*pageSize >= storage.MaxOccurrencesOffset {
+		http.Error(w, fmt.Sprintf("only the %d most recent occurrences can be paged through; narrow the time range", storage.MaxOccurrencesOffset), http.StatusBadRequest)
+		return
+	}
 	resp, err := h.repo.GetExceptionOccurrences(r.Context(), fp, f, page, pageSize)
 	if err != nil {
 		h.logger.Error("failed to get exception occurrences", zap.Error(err), zap.String("fingerprint", fp))

@@ -180,7 +180,9 @@ describe('Exception detail page (APM-11)', () => {
     expect(href.searchParams.get('session_id')).toBe('1729245600000_a1b2&x=1')
     expect(href.searchParams.get('at')).toBe('2026-10-18T10:00:10.123Z')
     expect(href.searchParams.get('start_time')).toBe('2026-10-18T09:59:00.000Z')
-    expect(within(card).getByText('Its sessions').closest('a')!.getAttribute('href')).toBe('/sessions?device_id=dev+1')
+    const dev = new URL(within(card).getByText('Its sessions').closest('a')!.getAttribute('href')!, 'http://x')
+    expect(dev.searchParams.get('device_id')).toBe('dev 1')
+    expect(dev.searchParams.get('start_time')).toBe('2026-10-04T10:00:10.123Z')
 
     // Distribution by a context key: roomId, with the merged occurrences apart.
     api.getExceptionDistribution.mockResolvedValue({

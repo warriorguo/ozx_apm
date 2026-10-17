@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { parseBreadcrumb, sessionLink, exceptionDetailLink, deviceSessionsLink, formatSessionMs, utcClock } from './timeline'
+import { parseBreadcrumb, sessionLink, exceptionDetailLink, deviceSessionsLink, fillTrend, formatSessionMs, utcClock } from './timeline'
 
 describe('parseBreadcrumb', () => {
   it('reads the time, kind and text of the SDK format', () => {
@@ -54,9 +54,34 @@ describe('links', () => {
     expect(sessionLink({ session_id: 's', timestamp: '', session_ms: 0 })).toBe('/sessions?session_id=s')
   })
 
+  it('looks for the sessions of a device two weeks around a moment', () => {
+    const u = new URL(deviceSessionsLink('d&1', '2026-10-18T10:00:00Z'), 'http://x')
+    expect(u.searchParams.get('device_id')).toBe('d&1')
+    expect(u.searchParams.get('start_time')).toBe('2026-10-04T10:00:00.000Z')
+    expect(u.searchParams.get('end_time')).toBe('2026-11-01T10:00:00.000Z')
+    expect(deviceSessionsLink('d', 'garbage')).toBe('/sessions?device_id=d')
+  })
+
   it('encodes ids', () => {
     expect(exceptionDetailLink('a/b?c#d')).toBe('/exceptions/detail?fingerprint=a%2Fb%3Fc%23d')
     expect(deviceSessionsLink('javascript:alert(1)')).toBe('/sessions?device_id=javascript%3Aalert%281%29')
+  })
+})
+
+describe('fillTrend', () => {
+  it('adds the empty buckets between points', () => {
+    const pts = [
+      { timestamp: '2026-10-18T10:00:00.000Z', count: 5, sessions: 1 },
+      { timestamp: '2026-10-18T10:03:00.000Z', count: 2, sessions: 1 },
+    ]
+    expect(fillTrend(pts, 60).map((p) => [p.timestamp.slice(11, 16), p.count])).toEqual([
+      ['10:00', 5],
+      ['10:01', 0],
+      ['10:02', 0],
+      ['10:03', 2],
+    ])
+    expect(fillTrend(pts, 0)).toBe(pts)
+    expect(fillTrend([], 60)).toEqual([])
   })
 })
 

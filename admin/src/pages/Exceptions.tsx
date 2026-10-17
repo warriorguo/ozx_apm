@@ -12,8 +12,8 @@ import type { ExceptionGroup, ExceptionSort } from '../types/api'
 const sorts: { value: ExceptionSort; label: string }[] = [
   { value: 'count', label: 'Occurrences' },
   { value: 'sessions', label: 'Affected sessions' },
-  { value: 'first_seen', label: 'First seen (newest)' },
-  { value: 'last_seen', label: 'Last seen (newest)' },
+  { value: 'first_seen', label: 'First seen in range (newest)' },
+  { value: 'last_seen', label: 'Last seen in range (newest)' },
 ]
 
 export function Exceptions() {

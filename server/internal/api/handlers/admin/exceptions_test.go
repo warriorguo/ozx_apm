@@ -70,6 +70,13 @@ func TestExceptionHandler_Occurrences(t *testing.T) {
 	if store.pageSize != 10 || store.page != 1 {
 		t.Errorf("%+v", store)
 	}
+	// Deep pages are refused (the 10000 most recent rows only).
+	if w := serve(h.GetOccurrences, "/api/exceptions/occurrences?fingerprint=f&page=201&page_size=50"); w.Code != http.StatusBadRequest {
+		t.Errorf("deep page: %d", w.Code)
+	}
+	if w := serve(h.GetOccurrences, "/api/exceptions/occurrences?fingerprint=f&page=200&page_size=50"); w.Code != 200 {
+		t.Errorf("last allowed page: %d", w.Code)
+	}
 	for _, target := range []string{"/api/exceptions/occurrences", "/api/exceptions/occurrences?fingerprint=f&build_type=x"} {
 		if w := serve(h.GetOccurrences, target); w.Code != http.StatusBadRequest {
 			t.Errorf("%s: %d", target, w.Code)

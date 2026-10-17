@@ -53,10 +53,17 @@ func scanOccurrence(rows interface{ Scan(dest ...any) error }) (models.Exception
 // MaxOccurrencesPageSize bounds one page of GetExceptionOccurrences.
 const MaxOccurrencesPageSize = 50
 
+// MaxOccurrencesOffset: only the most recent rows can be paged through
+// (the offset is a sort of the group's rows); older ones by narrowing the
+// time range.
+const MaxOccurrencesOffset = 10000
+
 // GetExceptionOccurrences returns one page of the group's rows matching the
-// filter, most recent first, and how many rows match in all.
+// filter, most recent first, and how many rows match in all. The page is
+// found by (timestamp, event_id) only; the full rows (context, breadcrumbs)
+// are then read for those ids alone.
 func (r *Repository) GetExceptionOccurrences(ctx context.Context, fp string, f models.AdminFilter, page, pageSize int) (*models.ExceptionOccurrencesResponse, error) {
-	if page < 1 || pageSize < 1 || pageSize > MaxOccurrencesPageSize {
+	if page < 1 || pageSize < 1 || pageSize > MaxOccurrencesPageSize || (page-1)*pageSize >= MaxOccurrencesOffset {
 		return nil, fmt.Errorf("page %d, page size %d", page, pageSize)
 	}
 	where, args := tableWhere(TableExceptions.Name, f)
@@ -70,14 +77,48 @@ func (r *Repository) GetExceptionOccurrences(ctx context.Context, fp string, f m
 	if resp.TotalCount == 0 || int64(page-1)*int64(pageSize) >= resp.TotalCount {
 		return resp, nil
 	}
-	query := fmt.Sprintf(`
-		SELECT %s
+	keysQuery := fmt.Sprintf(`
+		SELECT event_id, toUnixTimestamp64Milli(timestamp) AS ms
 		FROM apm_exceptions
 		%s
 		ORDER BY timestamp DESC, event_id
 		LIMIT %d OFFSET %d
-	`, occurrenceColumns, where, pageSize, (page-1)*pageSize)
-	err := r.queryRows(ctx, query, args, func(rows driver.Rows) error {
+	`, where, pageSize, (page-1)*pageSize)
+	var ids []string
+	var lo, hi int64
+	err := r.queryRows(ctx, keysQuery, args, func(rows driver.Rows) error {
+		var id string
+		var ms int64
+		if err := rows.Scan(&id, &ms); err != nil {
+			return err
+		}
+		if len(ids) == 0 || ms < lo {
+			lo = ms
+		}
+		if len(ids) == 0 || ms > hi {
+			hi = ms
+		}
+		ids = append(ids, id)
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("occurrence page: %w", err)
+	}
+	if len(ids) == 0 {
+		return resp, nil
+	}
+	// Same filter, the page's time span and ids; one row per id (a re-sent
+	// copy not merged away yet by the ReplacingMergeTree is not shown twice).
+	query := fmt.Sprintf(`
+		SELECT %s
+		FROM apm_exceptions
+		%s AND event_id IN ? AND timestamp >= fromUnixTimestamp64Milli(toInt64(?)) AND timestamp <= fromUnixTimestamp64Milli(toInt64(?))
+		ORDER BY timestamp DESC, event_id
+		LIMIT 1 BY event_id
+		LIMIT %d
+	`, occurrenceColumns, where, pageSize)
+	pageArgs := append(append([]interface{}{}, args...), ids, lo, hi)
+	err = r.queryRows(ctx, query, pageArgs, func(rows driver.Rows) error {
 		o, err := scanOccurrence(rows)
 		if err != nil {
 			return err

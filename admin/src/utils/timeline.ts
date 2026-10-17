@@ -89,8 +89,41 @@ export function sessionLink(o: Pick<ExceptionOccurrence, 'session_id' | 'timesta
   return '/sessions?' + params.toString()
 }
 
-export function deviceSessionsLink(deviceId: string): string {
-  return '/sessions?' + new URLSearchParams({ device_id: deviceId }).toString()
+// A device's sessions around a moment (an occurrence, a session): two weeks
+// on each side (the server allows 31 days); without a time, the last 7 days.
+export function deviceSessionsLink(deviceId: string, around?: string): string {
+  const params = new URLSearchParams({ device_id: deviceId })
+  const t = around ? Date.parse(around) : NaN
+  if (!Number.isNaN(t)) {
+    const span = 14 * 24 * 3600 * 1000
+    params.set('start_time', iso(t - span))
+    params.set('end_time', iso(t + span))
+  }
+  return '/sessions?' + params.toString()
+}
+
+// fillTrend adds the empty buckets between the points (the server leaves
+// them out), so a chart does not draw a line across periods without
+// occurrences.
+export function fillTrend<T extends { timestamp: string; count: number }>(
+  points: T[],
+  intervalSeconds: number
+): { timestamp: string; count: number }[] {
+  if (points.length < 2 || intervalSeconds <= 0) return points
+  const step = intervalSeconds * 1000
+  const out: { timestamp: string; count: number }[] = []
+  let prev = Date.parse(points[0].timestamp)
+  out.push(points[0])
+  for (let i = 1; i < points.length; i++) {
+    const t = Date.parse(points[i].timestamp)
+    // At most 1000 filled buckets in all (the server returns at most ~200).
+    for (let g = prev + step; g < t && out.length < 1000; g += step) {
+      out.push({ timestamp: iso(g), count: 0 })
+    }
+    out.push(points[i])
+    prev = t
+  }
+  return out
 }
 
 // "1m 23.4s" for milliseconds since the session start.

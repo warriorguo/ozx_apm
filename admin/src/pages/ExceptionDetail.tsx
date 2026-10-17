@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import type { ReactNode } from 'react'
 import { Link, useSearchParams } from 'react-router-dom'
 import { GlobalFilterBar } from '../components/FilterBar'
@@ -14,7 +14,7 @@ import {
   isValidContextKey,
 } from '../hooks/useApi'
 import { formatDateTime, formatNumber } from '../utils/format'
-import { deviceSessionsLink, formatSessionMs, sessionLink } from '../utils/timeline'
+import { deviceSessionsLink, fillTrend, formatSessionMs, sessionLink } from '../utils/timeline'
 import type {
   ExceptionColumn,
   ExceptionDetail as Detail,
@@ -77,7 +77,7 @@ export function ExceptionDetail() {
           <Summary detail={data} />
           <TimeSeriesChart
             title="Occurrences over time"
-            data={data.trend.points.map((p) => ({ timestamp: p.timestamp, value: p.count }))}
+            data={fillTrend(data.trend.points, data.trend.interval_seconds).map((p) => ({ timestamp: p.timestamp, value: p.count }))}
             startTime={queryParams.start_time}
             endTime={queryParams.end_time}
             color="#d97706"
@@ -350,10 +350,16 @@ function DistributionSection({ fingerprint }: { fingerprint: string }) {
   )
 }
 
+// The server pages through the 10000 most recent rows of a group only.
+const MAX_PAGED_OCCURRENCES = 10000
+
 function OccurrencesSection({ fingerprint }: { fingerprint: string }) {
   const { queryParams } = useFilters()
   const [page, setPage] = useState(1)
   const pageSize = 10
+  // Another filter starts at the first page again.
+  const filterKey = JSON.stringify(queryParams)
+  useEffect(() => setPage(1), [filterKey, fingerprint])
   const { data, isLoading, isError } = useExceptionOccurrences(fingerprint, { ...queryParams, page, page_size: pageSize })
   const occurrences = data?.occurrences ?? []
   return (
@@ -377,7 +383,18 @@ function OccurrencesSection({ fingerprint }: { fingerprint: string }) {
         </div>
       )}
       {data && (
-        <Pagination page={data.page} pageSize={data.page_size} totalCount={data.total_count} onPageChange={setPage} />
+        <Pagination
+          page={data.page}
+          pageSize={data.page_size}
+          totalCount={Math.min(data.total_count, MAX_PAGED_OCCURRENCES)}
+          onPageChange={setPage}
+        />
+      )}
+      {data && data.total_count > MAX_PAGED_OCCURRENCES && (
+        <p className="text-xs text-gray-500 mt-2">
+          {formatNumber(data.total_count)} rows match; the {formatNumber(MAX_PAGED_OCCURRENCES)} most recent can be paged
+          through. Narrow the time range for older ones.
+        </p>
       )}
     </div>
   )
@@ -433,7 +450,7 @@ export function OccurrenceCard({ occurrence: o }: { occurrence: ExceptionOccurre
         {o.device_id && (
           <p className="break-all md:col-span-2">
             <span className="text-gray-500">Device id:</span> <span className="font-mono">{o.device_id}</span>{' '}
-            <Link to={deviceSessionsLink(o.device_id)} className="text-blue-600 hover:underline">
+            <Link to={deviceSessionsLink(o.device_id, o.timestamp)} className="text-blue-600 hover:underline">
               Its sessions
             </Link>
           </p>
