@@ -2,8 +2,10 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -154,5 +156,50 @@ func TestExceptionSorts(t *testing.T) {
 		if ValidExceptionSort(s) {
 			t.Errorf("%q accepted", s)
 		}
+	}
+}
+
+// At most cap(timelineSlots) time line queries run at once, whatever the
+// number of requests; a waiting query gives up when its context ends.
+func TestTimelineSlotsBoundConcurrency(t *testing.T) {
+	var running, peak int32
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = withTimelineSlot(context.Background(), func() error {
+				n := atomic.AddInt32(&running, 1)
+				for {
+					p := atomic.LoadInt32(&peak)
+					if n <= p || atomic.CompareAndSwapInt32(&peak, p, n) {
+						break
+					}
+				}
+				time.Sleep(5 * time.Millisecond)
+				atomic.AddInt32(&running, -1)
+				return nil
+			})
+		}()
+	}
+	wg.Wait()
+	if peak < 1 || int(peak) > cap(timelineSlots) {
+		t.Fatalf("peak concurrency %d, want 1..%d", peak, cap(timelineSlots))
+	}
+
+	for i := 0; i < cap(timelineSlots); i++ {
+		timelineSlots <- struct{}{}
+	}
+	defer func() {
+		for i := 0; i < cap(timelineSlots); i++ {
+			<-timelineSlots
+		}
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	called := false
+	err := withTimelineSlot(ctx, func() error { called = true; return nil })
+	if !errors.Is(err, context.DeadlineExceeded) || called {
+		t.Fatalf("err %v, called %v; want deadline exceeded and not called", err, called)
 	}
 }

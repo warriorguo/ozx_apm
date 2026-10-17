@@ -267,6 +267,24 @@ func parallelQueryContext(parent context.Context, timeout time.Duration) (contex
 	}
 }
 
+// timelineSlots bounds the time line queries running at once across all
+// requests. The admin API and ingest share one connection pool
+// (MaxOpenConns 10): one time line runs up to 9 queries, so without a bound
+// two time lines opened together would hold every connection and make
+// ingest wait for one (up to DialTimeout).
+var timelineSlots = make(chan struct{}, 4)
+
+// withTimelineSlot runs f once a slot is free, or returns ctx's error.
+func withTimelineSlot(ctx context.Context, f func() error) error {
+	select {
+	case timelineSlots <- struct{}{}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	defer func() { <-timelineSlots }()
+	return f()
+}
+
 type sourceResult struct {
 	items  []models.TimelineItem
 	crumbs []models.TimelineItem
@@ -293,9 +311,11 @@ func (r *Repository) GetSessionTimeline(parent context.Context, q SessionQuery) 
 	var withSessionMs, startedAtMs, perfRows int64
 	var perfFirst, perfLast time.Time
 	s := &tl.Session
-	if err := r.client.conn.QueryRow(ctx, infoQuery, infoArgs...).Scan(&s.Rows, &s.FirstSeen, &s.LastSeen,
-		&s.DeviceID, &s.AppVersion, &s.Platform, &s.DeviceModel, &s.OSVersion, &s.BuildType,
-		&withSessionMs, &startedAtMs, &perfRows, &perfFirst, &perfLast); err != nil {
+	if err := withTimelineSlot(ctx, func() error {
+		return r.client.conn.QueryRow(ctx, infoQuery, infoArgs...).Scan(&s.Rows, &s.FirstSeen, &s.LastSeen,
+			&s.DeviceID, &s.AppVersion, &s.Platform, &s.DeviceModel, &s.OSVersion, &s.BuildType,
+			&withSessionMs, &startedAtMs, &perfRows, &perfFirst, &perfLast)
+	}); err != nil {
 		return nil, fmt.Errorf("session: %w", err)
 	}
 	s.SessionID = q.SessionID
@@ -329,22 +349,24 @@ func (r *Repository) GetSessionTimeline(parent context.Context, q SessionQuery) 
 			res := &results[i]
 			query := fmt.Sprintf("SELECT timestamp, event_id, seq, %s FROM %s %s %s LIMIT %d", src.columns, src.table, where, order, src.limit+1)
 			args := append(append([]interface{}{}, whereArgs...), orderArgs...)
-			res.err = r.queryRows(ctx, query, args, func(dr driver.Rows) error {
-				it := models.TimelineItem{Type: src.src}
-				var lines []string
-				if err := src.scan(dr, &it, &lines); err != nil {
-					return err
-				}
-				if len(res.items) == src.limit {
-					res.more = true // the extra row only says there were more
+			res.err = withTimelineSlot(ctx, func() error {
+				return r.queryRows(ctx, query, args, func(dr driver.Rows) error {
+					it := models.TimelineItem{Type: src.src}
+					var lines []string
+					if err := src.scan(dr, &it, &lines); err != nil {
+						return err
+					}
+					if len(res.items) == src.limit {
+						res.more = true // the extra row only says there were more
+						return nil
+					}
+					it.Time = it.Time.UTC()
+					for _, line := range lines {
+						res.crumbs = append(res.crumbs, timeline.ParseBreadcrumb(line, it.Time, src.src))
+					}
+					res.items = append(res.items, it)
 					return nil
-				}
-				it.Time = it.Time.UTC()
-				for _, line := range lines {
-					res.crumbs = append(res.crumbs, timeline.ParseBreadcrumb(line, it.Time, src.src))
-				}
-				res.items = append(res.items, it)
-				return nil
+				})
 			})
 			if res.err != nil {
 				res.err = fmt.Errorf("%s: %w", src.table, res.err)
@@ -354,7 +376,10 @@ func (r *Repository) GetSessionTimeline(parent context.Context, q SessionQuery) 
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		changes, changesTruncated, changesErr = r.contextChanges(ctx, span)
+		changesErr = withTimelineSlot(ctx, func() (err error) {
+			changes, changesTruncated, err = r.contextChanges(ctx, span)
+			return err
+		})
 	}()
 	perfTruncated := false
 	if q.Perf && perfRows > 0 {
@@ -362,7 +387,10 @@ func (r *Repository) GetSessionTimeline(parent context.Context, q SessionQuery) 
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			tl.Perf, perfTruncated, perfErr = r.perfTrack(ctx, span, tl.PerfIntervalSeconds)
+			perfErr = withTimelineSlot(ctx, func() (err error) {
+				tl.Perf, perfTruncated, err = r.perfTrack(ctx, span, tl.PerfIntervalSeconds)
+				return err
+			})
 		}()
 	}
 	wg.Wait()
