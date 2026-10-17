@@ -1,0 +1,8 @@
+NullReferenceException: Object reference not set to an instance of an object
+  at Ozx.Rooms.EnemySpawner.SpawnWave (System.Int32 roomId) [0x0000a] in /Users/dev/ozx/Assets/Scripts/Samples.cs:88 
+  at Ozx.Rooms.EnemySpawner.<Register>m__0 (Ozx.Core.RoomEnteredEvent e) [0x00008] in /Users/dev/ozx/Assets/Scripts/Samples.cs:82 
+  at Ozx.Core.GameEventBus.Publish[T] (T evt) [0x00040] in /Users/dev/ozx/Assets/Scripts/Samples.cs:48 
+UnityEngine.StackTraceUtility:ExtractStringFromException(Object)
+Samples:Emit(String, String, Exception) (at /Users/dev/ozx/Assets/Scripts/Samples.cs:119)
+Ozx.Core.GameEventBus:Publish(RoomEnteredEvent) (at /Users/dev/ozx/Assets/Scripts/Samples.cs:52)
+Samples:Main(String[]) (at /Users/dev/ozx/Assets/Scripts/Samples.cs:156)

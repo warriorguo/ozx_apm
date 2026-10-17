@@ -1,0 +1,11 @@
+JsonReaderException: Unexpected character encountered while parsing value: x. Path '', line 1, position 1.
+  at Newtonsoft.Json.JsonConvert.DeserializeObject[T] (System.String json) [0x00025] in /Users/dev/ozx/Assets/Scripts/Samples.cs:21 
+  at Ozx.Rooms.SaveLoader.Load (System.String path) [0x00007] in /Users/dev/ozx/Assets/Scripts/Samples.cs:98 
+Rethrow as InvalidDataException: Save file '/data/user/0/com.ozx/files/inventory.json' is corrupt (size 1234 bytes)
+  at Ozx.Rooms.SaveLoader.Load (System.String path) [0x00021] in /Users/dev/ozx/Assets/Scripts/Samples.cs:102 
+  at Samples.<Main>m__0 () [0x0000a] in /Users/dev/ozx/Assets/Scripts/Samples.cs:160 
+  at Samples.Capture (System.String name, System.Action a) [0x00003] in /Users/dev/ozx/Assets/Scripts/Samples.cs:138 
+UnityEngine.StackTraceUtility:ExtractStringFromException(Object)
+Samples:Emit(String, String, Exception) (at /Users/dev/ozx/Assets/Scripts/Samples.cs:119)
+Samples:Capture(String, Action) (at /Users/dev/ozx/Assets/Scripts/Samples.cs:139)
+Samples:Main(String[]) (at /Users/dev/ozx/Assets/Scripts/Samples.cs:160)

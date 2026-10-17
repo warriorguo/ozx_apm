@@ -1,0 +1,430 @@
+{
+  "vectors": [
+    {
+      "name": "bus nre mono",
+      "input": {
+        "LogType": "error",
+        "Message": "[GameEventBus] Error handling event RoomEnteredEvent: System.NullReferenceException: Object reference not set to an instance of an object\n  at Ozx.Rooms.EnemySpawner.SpawnWave (System.Int32 roomId) [0x0000a] in /Users/dev/ozx/Assets/Scripts/Rooms/EnemySpawner.cs:88\n  at Ozx.Rooms.EnemySpawner.\u003cRegister\u003eb__2_0 (Ozx.Core.RoomEnteredEvent e) [0x00008] in /Users/dev/ozx/Assets/Scripts/Rooms/EnemySpawner.cs:82\n  at Ozx.Core.GameEventBus.Publish[T] (T evt) [0x00040] in /Users/dev/ozx/Assets/Scripts...",
+        "Stack": "UnityEngine.Debug:LogError (object)\nOzx.Core.GameEventBus:Publish\u003cOzx.Core.RoomEnteredEvent\u003e (Ozx.Core.RoomEnteredEvent) (at Assets/Scripts/Core/GameEventBus.cs:52)\nOzx.Rooms.RoomManager:EnterRoom (int) (at Assets/Scripts/Rooms/RoomManager.cs:140)\n",
+        "Embedded": "System.NullReferenceException: Object reference not set to an instance of an object\n  at Ozx.Rooms.EnemySpawner.SpawnWave (System.Int32 roomId) [0x0000a] in /Users/dev/ozx/Assets/Scripts/Rooms/EnemySpawner.cs:88\n  at Ozx.Rooms.EnemySpawner.\u003cRegister\u003eb__2_0 (Ozx.Core.RoomEnteredEvent e) [0x00008] in /Users/dev/ozx/Assets/Scripts/Rooms/EnemySpawner.cs:82\n  at Ozx.Core.GameEventBus.Publish[T] (T evt) [0x00040] in /Users/dev/ozx/Assets/Scripts/Core/GameEventBus.cs:48 "
+      },
+      "expected": {
+        "fingerprint": "0858f4c6a42792c7",
+        "kind": "exception",
+        "wrapped": true,
+        "type": "System.NullReferenceException",
+        "message_template": "Object reference not set to an instance of an object",
+        "throw_site": "Ozx.Rooms.EnemySpawner.SpawnWave (at /Users/dev/ozx/Assets/Scripts/Rooms/EnemySpawner.cs:88)",
+        "call_site": "Ozx.Core.GameEventBus.Publish (at Assets/Scripts/Core/GameEventBus.cs:52)",
+        "inner_exceptions": []
+      }
+    },
+    {
+      "name": "bus nre il2cpp",
+      "input": {
+        "LogType": "error",
+        "Message": "[GameEventBus] Error handling event RoomEnteredEvent: System.NullReferenceException: Object reference not set to an instance of an object.\n  at Ozx.Rooms.EnemySpawner.SpawnWave (System.Int32 roomId) [0x00000] in \u003c00000000000000000000000000000000\u003e:0\n  at Ozx.Rooms.EnemySpawner.\u003cRegister\u003eb__2_0 (Ozx.Core.RoomEnteredEvent e) [0x00000] in \u003c00000000000000000000000000000000\u003e:0\n  at Ozx.Core.GameEventBus.Publish[T] (T evt) [0x00000] in \u003c00000000000000000000000000000000\u003e:0 ",
+        "Stack": "Ozx.Core.GameEventBus:Publish(RoomEnteredEvent)\nOzx.Rooms.RoomManager:EnterRoom(Int32)\n",
+        "Embedded": "System.NullReferenceException: Object reference not set to an instance of an object.\n  at Ozx.Rooms.EnemySpawner.SpawnWave (System.Int32 roomId) [0x00000] in \u003c00000000000000000000000000000000\u003e:0\n  at Ozx.Rooms.EnemySpawner.\u003cRegister\u003eb__2_0 (Ozx.Core.RoomEnteredEvent e) [0x00000] in \u003c00000000000000000000000000000000\u003e:0\n  at Ozx.Core.GameEventBus.Publish[T] (T evt) [0x00000] in \u003c00000000000000000000000000000000\u003e:0 "
+      },
+      "expected": {
+        "fingerprint": "0858f4c6a42792c7",
+        "kind": "exception",
+        "wrapped": true,
+        "type": "System.NullReferenceException",
+        "message_template": "Object reference not set to an instance of an object.",
+        "throw_site": "Ozx.Rooms.EnemySpawner.SpawnWave",
+        "call_site": "Ozx.Core.GameEventBus.Publish",
+        "inner_exceptions": []
+      }
+    },
+    {
+      "name": "bus nre il2cpp lines",
+      "input": {
+        "LogType": "error",
+        "Message": "[GameEventBus] Error handling event RoomEnteredEvent: System.NullReferenceException: Object reference not set to an instance of an object.\n  at Ozx.Rooms.EnemySpawner.SpawnWave (System.Int32 roomId) [0x00000] in /Users/builder/ozx/Assets/Scripts/Rooms/EnemySpawner.cs:97\n  at Ozx.Rooms.EnemySpawner.\u003cRegister\u003eb__2_0 (Ozx.Core.RoomEnteredEvent e) [0x00000] in /Users/builder/ozx/Assets/Scripts/Rooms/EnemySpawner.cs:91\n  at Ozx.Core.GameEventBus.Publish[T] (T evt) [0x00000] in /Users/builder/ozx/A...",
+        "Stack": "Ozx.Core.GameEventBus:Publish(RoomEnteredEvent) (at /Users/builder/ozx/Assets/Scripts/Core/GameEventBus.cs:55)\nOzx.Rooms.RoomManager:EnterRoom(Int32) (at /Users/builder/ozx/Assets/Scripts/Rooms/RoomManager.cs:141)\n",
+        "Embedded": "System.NullReferenceException: Object reference not set to an instance of an object.\n  at Ozx.Rooms.EnemySpawner.SpawnWave (System.Int32 roomId) [0x00000] in /Users/builder/ozx/Assets/Scripts/Rooms/EnemySpawner.cs:97\n  at Ozx.Rooms.EnemySpawner.\u003cRegister\u003eb__2_0 (Ozx.Core.RoomEnteredEvent e) [0x00000] in /Users/builder/ozx/Assets/Scripts/Rooms/EnemySpawner.cs:91\n  at Ozx.Core.GameEventBus.Publish[T] (T evt) [0x00000] in /Users/builder/ozx/Assets/Scripts/Core/GameEventBus.cs:51 "
+      },
+      "expected": {
+        "fingerprint": "0858f4c6a42792c7",
+        "kind": "exception",
+        "wrapped": true,
+        "type": "System.NullReferenceException",
+        "message_template": "Object reference not set to an instance of an object.",
+        "throw_site": "Ozx.Rooms.EnemySpawner.SpawnWave (at /Users/builder/ozx/Assets/Scripts/Rooms/EnemySpawner.cs:97)",
+        "call_site": "Ozx.Core.GameEventBus.Publish (at /Users/builder/ozx/Assets/Scripts/Core/GameEventBus.cs:55)",
+        "inner_exceptions": []
+      }
+    },
+    {
+      "name": "bus nre dotnet",
+      "input": {
+        "LogType": "error",
+        "Message": "[GameEventBus] Error handling event RoomEnteredEvent: System.NullReferenceException: Object reference not set to an instance of an object.\n   at Ozx.Rooms.EnemySpawner.SpawnWave(Int32 roomId) in C:\\ozx\\Assets\\Scripts\\Rooms\\EnemySpawner.cs:line 88\n   at Ozx.Rooms.EnemySpawner.\u003cRegister\u003eb__2_0(RoomEnteredEvent e) in C:\\ozx\\Assets\\Scripts\\Rooms\\EnemySpawner.cs:line 82\n   at Ozx.Core.GameEventBus.Publish[T](T evt) in C:\\ozx\\Assets\\Scripts\\Core\\GameEventBus.cs:line 48",
+        "Stack": "UnityEngine.Debug:LogError (object)\nOzx.Core.GameEventBus:Publish\u003cOzx.Core.RoomEnteredEvent\u003e (Ozx.Core.RoomEnteredEvent) (at Assets/Scripts/Core/GameEventBus.cs:52)\nOzx.Rooms.RoomManager:EnterRoom (int) (at Assets/Scripts/Rooms/RoomManager.cs:140)\n",
+        "Embedded": "System.NullReferenceException: Object reference not set to an instance of an object.\n   at Ozx.Rooms.EnemySpawner.SpawnWave(Int32 roomId) in C:\\ozx\\Assets\\Scripts\\Rooms\\EnemySpawner.cs:line 88\n   at Ozx.Rooms.EnemySpawner.\u003cRegister\u003eb__2_0(RoomEnteredEvent e) in C:\\ozx\\Assets\\Scripts\\Rooms\\EnemySpawner.cs:line 82\n   at Ozx.Core.GameEventBus.Publish[T](T evt) in C:\\ozx\\Assets\\Scripts\\Core\\GameEventBus.cs:line 48"
+      },
+      "expected": {
+        "fingerprint": "0858f4c6a42792c7",
+        "kind": "exception",
+        "wrapped": true,
+        "type": "System.NullReferenceException",
+        "message_template": "Object reference not set to an instance of an object.",
+        "throw_site": "Ozx.Rooms.EnemySpawner.SpawnWave (at C:\\ozx\\Assets\\Scripts\\Rooms\\EnemySpawner.cs:88)",
+        "call_site": "Ozx.Core.GameEventBus.Publish (at Assets/Scripts/Core/GameEventBus.cs:52)",
+        "inner_exceptions": []
+      }
+    },
+    {
+      "name": "bus ioe room 12 mono",
+      "input": {
+        "LogType": "error",
+        "Message": "[GameEventBus] Error handling event RoomEnteredEvent: System.InvalidOperationException: Room template not found for roomId=12 (room_12)\n  at Ozx.Rooms.RoomLoader.LoadTemplate (System.Int32 roomId) [0x0001b] in /Users/dev/ozx/Assets/Scripts/Rooms/RoomLoader.cs:71 \n  at Ozx.Rooms.RoomLoader.OnRoomEntered (Ozx.Core.RoomEnteredEvent e) [0x0001b] in /Users/dev/ozx/Assets/Scripts/Rooms/RoomLoader.cs:64 \n  at Ozx.Core.GameEventBus.Publish[T] (T evt) [0x0001b] in /Users/dev/ozx/Assets/Scripts/Core/Ga...",
+        "Stack": "UnityEngine.Debug:LogError (object)\nOzx.Core.GameEventBus:Publish\u003cOzx.Core.RoomEnteredEvent\u003e (Ozx.Core.RoomEnteredEvent) (at Assets/Scripts/Core/GameEventBus.cs:52)\nOzx.Rooms.RoomManager:EnterRoom (int) (at Assets/Scripts/Rooms/RoomManager.cs:140)\n",
+        "Embedded": "System.InvalidOperationException: Room template not found for roomId=12 (room_12)\n  at Ozx.Rooms.RoomLoader.LoadTemplate (System.Int32 roomId) [0x0001b] in /Users/dev/ozx/Assets/Scripts/Rooms/RoomLoader.cs:71 \n  at Ozx.Rooms.RoomLoader.OnRoomEntered (Ozx.Core.RoomEnteredEvent e) [0x0001b] in /Users/dev/ozx/Assets/Scripts/Rooms/RoomLoader.cs:64 \n  at Ozx.Core.GameEventBus.Publish[T] (T evt) [0x0001b] in /Users/dev/ozx/Assets/Scripts/Core/GameEventBus.cs:48 "
+      },
+      "expected": {
+        "fingerprint": "fad75585e1523085",
+        "kind": "exception",
+        "wrapped": true,
+        "type": "System.InvalidOperationException",
+        "message_template": "Room template not found for roomId=\u003cv\u003e (room_\u003cn\u003e)",
+        "throw_site": "Ozx.Rooms.RoomLoader.LoadTemplate (at /Users/dev/ozx/Assets/Scripts/Rooms/RoomLoader.cs:71)",
+        "call_site": "Ozx.Core.GameEventBus.Publish (at Assets/Scripts/Core/GameEventBus.cs:52)",
+        "inner_exceptions": []
+      }
+    },
+    {
+      "name": "bus ioe room 7 il2cpp",
+      "input": {
+        "LogType": "error",
+        "Message": "[GameEventBus] Error handling event RoomEnteredEvent: System.InvalidOperationException: Room template not found for roomId=7 (room_7)\n  at Ozx.Rooms.RoomLoader.LoadTemplate (System.Int32 roomId) [0x00000] in \u003c00000000000000000000000000000000\u003e:0 \n  at Ozx.Rooms.RoomLoader.OnRoomEntered (Ozx.Core.RoomEnteredEvent e) [0x00000] in \u003c00000000000000000000000000000000\u003e:0 \n  at Ozx.Core.GameEventBus.Publish[T] (T evt) [0x00000] in \u003c00000000000000000000000000000000\u003e:0 ",
+        "Stack": "Ozx.Core.GameEventBus:Publish(RoomEnteredEvent)\nOzx.Rooms.RoomManager:EnterRoom(Int32)\n",
+        "Embedded": "System.InvalidOperationException: Room template not found for roomId=7 (room_7)\n  at Ozx.Rooms.RoomLoader.LoadTemplate (System.Int32 roomId) [0x00000] in \u003c00000000000000000000000000000000\u003e:0 \n  at Ozx.Rooms.RoomLoader.OnRoomEntered (Ozx.Core.RoomEnteredEvent e) [0x00000] in \u003c00000000000000000000000000000000\u003e:0 \n  at Ozx.Core.GameEventBus.Publish[T] (T evt) [0x00000] in \u003c00000000000000000000000000000000\u003e:0 "
+      },
+      "expected": {
+        "fingerprint": "fad75585e1523085",
+        "kind": "exception",
+        "wrapped": true,
+        "type": "System.InvalidOperationException",
+        "message_template": "Room template not found for roomId=\u003cv\u003e (room_\u003cn\u003e)",
+        "throw_site": "Ozx.Rooms.RoomLoader.LoadTemplate",
+        "call_site": "Ozx.Core.GameEventBus.Publish",
+        "inner_exceptions": []
+      }
+    },
+    {
+      "name": "bus real mono room 12",
+      "input": {
+        "LogType": "error",
+        "Message": "x",
+        "Stack": "",
+        "Embedded": "System.NullReferenceException: Object reference not set to an instance of an object\n  at Ozx.Rooms.EnemySpawner.SpawnWave (System.Int32 roomId) [0x0000a] in /Users/dev/ozx/Assets/Scripts/Samples.cs:88 \n  at Ozx.Rooms.EnemySpawner.\u003cRegister\u003em__0 (Ozx.Core.RoomEnteredEvent e) [0x00008] in /Users/dev/ozx/Assets/Scripts/Samples.cs:82 \n  at Ozx.Core.GameEventBus.Publish[T] (T evt) [0x00040] in /Users/dev/ozx/Assets/Scripts/Samples.cs:48 "
+      },
+      "expected": {
+        "fingerprint": "0858e9c6a4278016",
+        "kind": "exception",
+        "wrapped": true,
+        "type": "System.NullReferenceException",
+        "message_template": "Object reference not set to an instance of an object",
+        "throw_site": "Ozx.Rooms.EnemySpawner.SpawnWave (at /Users/dev/ozx/Assets/Scripts/Samples.cs:88)",
+        "call_site": "",
+        "inner_exceptions": []
+      }
+    },
+    {
+      "name": "inner chain tostring",
+      "input": {
+        "LogType": "error",
+        "Message": "Load failed",
+        "Stack": "",
+        "Embedded": "System.IO.InvalidDataException: Save file '/data/user/0/com.ozx/files/inventory.json' is corrupt (size 1234 bytes) ---\u003e Newtonsoft.Json.JsonReaderException: Unexpected character encountered while parsing value: x. Path '', line 1, position 1.\n  at Newtonsoft.Json.JsonConvert.DeserializeObject[T] (System.String json) [0x00025] in /Users/dev/ozx/Assets/Scripts/Samples.cs:21 \n  at Ozx.Rooms.SaveLoader.Load (System.String path) [0x00007] in /Users/dev/ozx/Assets/Scripts/Samples.cs:98 \n   --- End of inner exception stack trace ---\n  at Ozx.Rooms.SaveLoader.Load (System.String path) [0x00021] in /Users/dev/ozx/Assets/Scripts/Samples.cs:102 \n  at Samples.\u003cMain\u003em__0 () [0x0000a] in /Users/dev/ozx/Assets/Scripts/Samples.cs:160 \n  at Samples.Capture (System.String name, System.Action a) [0x00003] in /Users/dev/ozx/Assets/Scripts/Samples.cs:138 "
+      },
+      "expected": {
+        "fingerprint": "2fef5a6ea2847995",
+        "kind": "exception",
+        "wrapped": true,
+        "type": "System.IO.InvalidDataException",
+        "message_template": "Save file '*' is corrupt (size \u003cn\u003e bytes)",
+        "throw_site": "Ozx.Rooms.SaveLoader.Load (at /Users/dev/ozx/Assets/Scripts/Samples.cs:102)",
+        "call_site": "",
+        "inner_exceptions": [
+          "Newtonsoft.Json.JsonReaderException: Unexpected character encountered while parsing value: x. Path '', line 1, position 1."
+        ]
+      }
+    },
+    {
+      "name": "inner chain unity",
+      "input": {
+        "LogType": "exception",
+        "Message": "JsonReaderException: Unexpected character encountered while parsing value: x. Path '', line 1, position 1.",
+        "Stack": "  at Newtonsoft.Json.JsonConvert.DeserializeObject[T] (System.String json) [0x00025] in /Users/dev/ozx/Assets/Scripts/Samples.cs:21 \n  at Ozx.Rooms.SaveLoader.Load (System.String path) [0x00007] in /Users/dev/ozx/Assets/Scripts/Samples.cs:98 \nRethrow as InvalidDataException: Save file '/data/user/0/com.ozx/files/inventory.json' is corrupt (size 1234 bytes)\n  at Ozx.Rooms.SaveLoader.Load (System.String path) [0x00021] in /Users/dev/ozx/Assets/Scripts/Samples.cs:102 \n  at Samples.\u003cMain\u003em__0 () [0x0000a] in /Users/dev/ozx/Assets/Scripts/Samples.cs:160 \n  at Samples.Capture (System.String name, System.Action a) [0x00003] in /Users/dev/ozx/Assets/Scripts/Samples.cs:138 \nUnityEngine.StackTraceUtility:ExtractStringFromException(Object)\nSamples:Emit(String, String, Exception) (at /Users/dev/ozx/Assets/Scripts/Samples.cs:119)\nSamples:Capture(String, Action) (at /Users/dev/ozx/Assets/Scripts/Samples.cs:139)\nSamples:Main(String[]) (at /Users/dev/ozx/Assets/Scripts/Samples.cs:160)\n",
+        "Embedded": ""
+      },
+      "expected": {
+        "fingerprint": "2fef5a6ea2847995",
+        "kind": "exception",
+        "wrapped": false,
+        "type": "InvalidDataException",
+        "message_template": "Save file '*' is corrupt (size \u003cn\u003e bytes)",
+        "throw_site": "Ozx.Rooms.SaveLoader.Load (at /Users/dev/ozx/Assets/Scripts/Samples.cs:102)",
+        "call_site": "",
+        "inner_exceptions": [
+          "JsonReaderException: Unexpected character encountered while parsing value: x. Path '', line 1, position 1."
+        ]
+      }
+    },
+    {
+      "name": "aggregate",
+      "input": {
+        "LogType": "error",
+        "Message": "x",
+        "Stack": "",
+        "Embedded": "System.AggregateException: One or more errors occurred. (Item 41 not found in table 'weapons') (second failure 99) ---\u003e System.Collections.Generic.KeyNotFoundException: Item 41 not found in table 'weapons'\n  at Samples.ThrowAsync (System.Int32 id) [0x00083] in /Users/dev/ozx/Assets/Scripts/Samples.cs:145 \n   --- End of inner exception stack trace ---\n  at System.Threading.Tasks.Task.WaitAll (System.Threading.Tasks.Task[] tasks, System.Int32 millisecondsTimeout, System.Threading.CancellationToken cancellationToken) [0x001c8] in \u003ce8c367f6d593468e80166a9b6a9ae827\u003e:0 \n  at System.Threading.Tasks.Task.WaitAll (System.Threading.Tasks.Task[] tasks, System.Int32 millisecondsTimeout) [0x00000] in \u003ce8c367f6d593468e80166a9b6a9ae827\u003e:0 \n  at System.Threading.Tasks.Task.WaitAll (System.Threading.Tasks.Task[] tasks) [0x00000] in \u003ce8c367f6d593468e80166a9b6a9ae827\u003e:0 \n  at Samples.\u003cMain\u003em__1 () [0x00055] in /Users/dev/ozx/Assets/Scripts/Samples.cs:165 \n  at Samples.Capture (System.String name, System.Action a) [0x00003] in /Users/dev/ozx/Assets/Scripts/Samples.cs:138 \n---\u003e (Inner Exception #0) System.Collections.Generic.KeyNotFoundException: Item 41 not found in table 'weapons'\n  at Samples.ThrowAsync (System.Int32 id) [0x00083] in /Users/dev/ozx/Assets/Scripts/Samples.cs:145 \u003c---\n\n---\u003e (Inner Exception #1) System.InvalidOperationException: second failure 99\n  at Samples.\u003cMain\u003em__4 () [0x00006] in /Users/dev/ozx/Assets/Scripts/Samples.cs:164 \n  at System.Threading.Tasks.Task`1[TResult].InnerInvoke () [0x0000f] in \u003ce8c367f6d593468e80166a9b6a9ae827\u003e:0 \n  at System.Threading.Tasks.Task.Execute () [0x00000] in \u003ce8c367f6d593468e80166a9b6a9ae827\u003e:0 \u003c---\n"
+      },
+      "expected": {
+        "fingerprint": "ed6dcaab4867db27",
+        "kind": "exception",
+        "wrapped": true,
+        "type": "System.AggregateException",
+        "message_template": "One or more errors occurred. (Item \u003cn\u003e not found in table '*') (second failure \u003cn\u003e)",
+        "throw_site": "Samples.\u003cMain\u003em (at /Users/dev/ozx/Assets/Scripts/Samples.cs:165)",
+        "call_site": "",
+        "inner_exceptions": [
+          "System.Collections.Generic.KeyNotFoundException: Item 41 not found in table 'weapons'",
+          "System.InvalidOperationException: second failure 99"
+        ]
+      }
+    },
+    {
+      "name": "async rethrow",
+      "input": {
+        "LogType": "error",
+        "Message": "x",
+        "Stack": "",
+        "Embedded": "System.Collections.Generic.KeyNotFoundException: Item 5 not found in table 'weapons'\n  at Samples.ThrowAsync (System.Int32 id) [0x00083] in /Users/dev/ozx/Assets/Scripts/Samples.cs:145 \n  at Samples.\u003cMain\u003em__2 () [0x00010] in /Users/dev/ozx/Assets/Scripts/Samples.cs:169 \n--- End of stack trace from previous location where exception was thrown ---\n\n  at Samples.\u003cMain\u003em__2 () [0x00023] in /Users/dev/ozx/Assets/Scripts/Samples.cs:170 \n  at Samples.Capture (System.String name, System.Action a) [0x00003] in /Users/dev/ozx/Assets/Scripts/Samples.cs:138 "
+      },
+      "expected": {
+        "fingerprint": "e80d7c970ba3a0be",
+        "kind": "exception",
+        "wrapped": true,
+        "type": "System.Collections.Generic.KeyNotFoundException",
+        "message_template": "Item \u003cn\u003e not found in table '*'",
+        "throw_site": "Samples.ThrowAsync (at /Users/dev/ozx/Assets/Scripts/Samples.cs:145)",
+        "call_site": "",
+        "inner_exceptions": []
+      }
+    },
+    {
+      "name": "logexception editor",
+      "input": {
+        "LogType": "exception",
+        "Message": "NullReferenceException: Object reference not set to an instance of an object",
+        "Stack": "Ozx.Enemies.EnemyAI.UpdateTarget () (at Assets/Scripts/Enemies/EnemyAI.cs:57)\nOzx.Enemies.EnemyAI.Update () (at Assets/Scripts/Enemies/EnemyAI.cs:31)\n",
+        "Embedded": ""
+      },
+      "expected": {
+        "fingerprint": "820dbeaa9ed209cd",
+        "kind": "exception",
+        "wrapped": false,
+        "type": "NullReferenceException",
+        "message_template": "Object reference not set to an instance of an object",
+        "throw_site": "Ozx.Enemies.EnemyAI.UpdateTarget (at Assets/Scripts/Enemies/EnemyAI.cs:57)",
+        "call_site": "",
+        "inner_exceptions": []
+      }
+    },
+    {
+      "name": "logexception il2cpp",
+      "input": {
+        "LogType": "exception",
+        "Message": "NullReferenceException: Object reference not set to an instance of an object.",
+        "Stack": "  at Ozx.Enemies.EnemyAI.UpdateTarget () [0x00000] in \u003c00000000000000000000000000000000\u003e:0 \n  at Ozx.Enemies.EnemyAI.Update () [0x00000] in \u003c00000000000000000000000000000000\u003e:0 \n",
+        "Embedded": ""
+      },
+      "expected": {
+        "fingerprint": "820dbeaa9ed209cd",
+        "kind": "exception",
+        "wrapped": false,
+        "type": "NullReferenceException",
+        "message_template": "Object reference not set to an instance of an object.",
+        "throw_site": "Ozx.Enemies.EnemyAI.UpdateTarget",
+        "call_site": "",
+        "inner_exceptions": []
+      }
+    },
+    {
+      "name": "logexception no frames",
+      "input": {
+        "LogType": "exception",
+        "Message": "TimeoutException: Request 42 timed out after 3000 ms",
+        "Stack": "",
+        "Embedded": ""
+      },
+      "expected": {
+        "fingerprint": "2fb4a13650efdcd4",
+        "kind": "exception",
+        "wrapped": false,
+        "type": "TimeoutException",
+        "message_template": "Request \u003cn\u003e timed out after \u003cn\u003e ms",
+        "throw_site": "",
+        "call_site": "",
+        "inner_exceptions": []
+      }
+    },
+    {
+      "name": "plain error editor",
+      "input": {
+        "LogType": "error",
+        "Message": "Save write failed for slot 3 (1024 bytes, id=7c9e6679-7425-40de-944b-e07fc1f90ae7)",
+        "Stack": "UnityEngine.Debug:LogError (object)\nOzx.Save.SaveSystem:Write (string) (at Assets/Save/SaveSystem.cs:88)\n",
+        "Embedded": ""
+      },
+      "expected": {
+        "fingerprint": "77167f58b194a9f0",
+        "kind": "error",
+        "wrapped": false,
+        "type": "",
+        "message_template": "Save write failed for slot \u003cn\u003e (\u003cn\u003e bytes, id=\u003cv\u003e)",
+        "throw_site": "",
+        "call_site": "Ozx.Save.SaveSystem.Write (at Assets/Save/SaveSystem.cs:88)",
+        "inner_exceptions": []
+      }
+    },
+    {
+      "name": "plain error il2cpp",
+      "input": {
+        "LogType": "error",
+        "Message": "Save write failed for slot 1 (88 bytes, id=0a1b2c3d-0000-4000-8000-000000000000)",
+        "Stack": "Ozx.Save.SaveSystem:Write(String)\n",
+        "Embedded": ""
+      },
+      "expected": {
+        "fingerprint": "77167f58b194a9f0",
+        "kind": "error",
+        "wrapped": false,
+        "type": "",
+        "message_template": "Save write failed for slot \u003cn\u003e (\u003cn\u003e bytes, id=\u003cv\u003e)",
+        "throw_site": "",
+        "call_site": "Ozx.Save.SaveSystem.Write",
+        "inner_exceptions": []
+      }
+    },
+    {
+      "name": "assert",
+      "input": {
+        "LogType": "assert",
+        "Message": "Assertion failed: hp \u003e= 0 (hp=-3)",
+        "Stack": "UnityEngine.Debug:Assert (bool,string)\nOzx.Combat.Health:Apply (int) (at Assets/Combat/Health.cs:12)\n",
+        "Embedded": ""
+      },
+      "expected": {
+        "fingerprint": "51196a49dbac33b0",
+        "kind": "assert",
+        "wrapped": false,
+        "type": "",
+        "message_template": "Assertion failed: hp \u003e= \u003cn\u003e (hp=\u003cv\u003e)",
+        "throw_site": "",
+        "call_site": "Ozx.Combat.Health.Apply (at Assets/Combat/Health.cs:12)",
+        "inner_exceptions": []
+      }
+    },
+    {
+      "name": "plain error unicode",
+      "input": {
+        "LogType": "error",
+        "Message": "房间 12 未找到 '森林_3' 😀 ok=是",
+        "Stack": "Ozx.UI.Panel:Open(String)\n",
+        "Embedded": ""
+      },
+      "expected": {
+        "fingerprint": "180d20f6d87bc4f9",
+        "kind": "error",
+        "wrapped": false,
+        "type": "",
+        "message_template": "房间 \u003cn\u003e 未找到 '*' 😀 ok=\u003cv\u003e",
+        "throw_site": "",
+        "call_site": "Ozx.UI.Panel.Open",
+        "inner_exceptions": []
+      }
+    },
+    {
+      "name": "plain error no stack",
+      "input": {
+        "LogType": "error",
+        "Message": "Pool not found: enemy_goblin_2",
+        "Stack": "",
+        "Embedded": ""
+      },
+      "expected": {
+        "fingerprint": "013dd32df4fcc56d",
+        "kind": "error",
+        "wrapped": false,
+        "type": "",
+        "message_template": "Pool not found: enemy_goblin_\u003cn\u003e",
+        "throw_site": "",
+        "call_site": "",
+        "inner_exceptions": []
+      }
+    },
+    {
+      "name": "legacy exception",
+      "input": {
+        "LogType": "",
+        "Message": "KeyNotFoundException: The given key 'boss_3' was not present in the dictionary.",
+        "Stack": "System.Collections.Generic.Dictionary`2[TKey,TValue].get_Item (TKey key) (at \u003c00000\u003e:0)\nOzx.Data.Repo.Get (System.String id) (at Assets/Data/Repo.cs:20)\n",
+        "Embedded": ""
+      },
+      "expected": {
+        "fingerprint": "133b30a401f8dc93",
+        "kind": "exception",
+        "wrapped": false,
+        "type": "KeyNotFoundException",
+        "message_template": "The given key '*' was not present in the dictionary.",
+        "throw_site": "Ozx.Data.Repo.Get (at Assets/Data/Repo.cs:20)",
+        "call_site": "",
+        "inner_exceptions": []
+      }
+    },
+    {
+      "name": "legacy wrapped",
+      "input": {
+        "LogType": "",
+        "Message": "[GameEventBus] Error handling event RoomEnteredEvent: System.NullReferenceException: Object reference not set to an instance of an object.\n  at Ozx.Rooms.EnemySpawner.SpawnWave (System.Int32 roomId) [0x00000] in \u003c00000000000000000000000000000000\u003e:0\n  at Ozx.Rooms.EnemySpawner.\u003cRegister\u003eb__2_0 (Ozx.Core.RoomEnteredEvent e) [0x00000] in \u003c00000000000000000000000000000000\u003e:0\n  at Ozx.Core.GameEventBus.Publish[T] (T evt) [0x00000] in \u003c00000000000000000000000000000000\u003e:0 ",
+        "Stack": "Ozx.Core.GameEventBus:Publish(RoomEnteredEvent)\nOzx.Rooms.RoomManager:EnterRoom(Int32)\n",
+        "Embedded": ""
+      },
+      "expected": {
+        "fingerprint": "0858f4c6a42792c7",
+        "kind": "exception",
+        "wrapped": true,
+        "type": "System.NullReferenceException",
+        "message_template": "Object reference not set to an instance of an object.",
+        "throw_site": "Ozx.Rooms.EnemySpawner.SpawnWave",
+        "call_site": "Ozx.Core.GameEventBus.Publish",
+        "inner_exceptions": []
+      }
+    },
+    {
+      "name": "legacy plain",
+      "input": {
+        "LogType": "",
+        "Message": "Asset not found: anim/arack_red",
+        "Stack": "UnityEngine.Debug:LogError (object)\nOzx.Pool.Factory:Load (string) (at Assets/Pool/Factory.cs:33)\n",
+        "Embedded": ""
+      },
+      "expected": {
+        "fingerprint": "0bd8609f8e2dd569",
+        "kind": "error",
+        "wrapped": false,
+        "type": "",
+        "message_template": "Asset not found: anim/arack_red",
+        "throw_site": "",
+        "call_site": "Ozx.Pool.Factory.Load (at Assets/Pool/Factory.cs:33)",
+        "inner_exceptions": []
+      }
+    }
+  ],
+  "version": 1
+}

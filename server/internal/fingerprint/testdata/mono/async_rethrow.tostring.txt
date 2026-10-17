@@ -1,0 +1,7 @@
+System.Collections.Generic.KeyNotFoundException: Item 5 not found in table 'weapons'
+  at Samples.ThrowAsync (System.Int32 id) [0x00083] in /Users/dev/ozx/Assets/Scripts/Samples.cs:145 
+  at Samples.<Main>m__2 () [0x00010] in /Users/dev/ozx/Assets/Scripts/Samples.cs:169 
+--- End of stack trace from previous location where exception was thrown ---
+
+  at Samples.<Main>m__2 () [0x00023] in /Users/dev/ozx/Assets/Scripts/Samples.cs:170 
+  at Samples.Capture (System.String name, System.Action a) [0x00003] in /Users/dev/ozx/Assets/Scripts/Samples.cs:138 
