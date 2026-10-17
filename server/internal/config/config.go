@@ -34,6 +34,10 @@ type AdminServerConfig struct {
 	ReadTimeout    time.Duration `mapstructure:"read_timeout"`
 	WriteTimeout   time.Duration `mapstructure:"write_timeout"`
 	AllowedOrigins []string      `mapstructure:"allowed_origins"`
+	// PrivacyToken enables the privacy deletion endpoints (APM-14): they
+	// require "Authorization: Bearer <token>" and are disabled while it is
+	// empty. Environment: OZX_ADMIN_PRIVACY_TOKEN. Never logged.
+	PrivacyToken string `mapstructure:"privacy_token"`
 }
 
 type ClickHouseConfig struct {
@@ -83,6 +87,8 @@ func Load() (*Config, error) {
 	viper.SetDefault("admin_server.read_timeout", "30s")
 	viper.SetDefault("admin_server.write_timeout", "30s")
 	viper.SetDefault("admin_server.allowed_origins", []string{"*"})
+	viper.SetDefault("admin_server.privacy_token", "")
+	_ = viper.BindEnv("admin_server.privacy_token", "OZX_ADMIN_PRIVACY_TOKEN")
 
 	viper.SetDefault("clickhouse.host", "localhost")
 	viper.SetDefault("clickhouse.port", 9000)

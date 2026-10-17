@@ -93,12 +93,21 @@ func viewTotals(t *testing.T, client *storage.ClickHouseClient) string {
 func privacyPost(t *testing.T, router http.Handler, path, id, confirm string) (int, []byte) {
 	t.Helper()
 	req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{"id_type":"device_id","id":`+jsonString(id)+`}`))
+	req.Header.Set("Authorization", "Bearer "+privacyTestToken)
 	if confirm != "" {
 		req.Header.Set(admin.ConfirmDeleteHeader, confirm)
 	}
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
 	return w.Code, w.Body.Bytes()
+}
+
+const privacyTestToken = "apm14-integration-token"
+
+func privacyConfig() *config.Config {
+	cfg := &config.Config{}
+	cfg.AdminServer.PrivacyToken = privacyTestToken
+	return cfg
 }
 
 func jsonString(s string) string {
@@ -224,7 +233,45 @@ func TestPrivacyDelete_DeviceRemovedFromEveryTable(t *testing.T) {
 	if n := logs.Len(); n != 0 {
 		t.Errorf("Migrate logged %d warnings: %v", n, logs.All())
 	}
-	router := api.NewAdminRouter(&config.Config{}, storage.NewRepository(client, zap.NewNop()), zap.NewNop())
+	repo := storage.NewRepository(client, zap.NewNop())
+
+	// Through the real router: no token configured -> disabled; wrong token -> 401.
+	const device = "dev-auth"
+	seedDevice(t, client, device, 1)
+	for _, c := range []struct {
+		cfg  *config.Config
+		auth string
+		want int
+	}{
+		{&config.Config{}, "Bearer " + privacyTestToken, http.StatusForbidden},
+		{privacyConfig(), "", http.StatusUnauthorized},
+		{privacyConfig(), "Bearer wrong", http.StatusUnauthorized},
+	} {
+		router := api.NewAdminRouter(c.cfg, repo, zap.NewNop())
+		for _, path := range []string{"/api/privacy/delete", "/api/privacy/verify"} {
+			req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{"id":"`+device+`"}`))
+			req.Header.Set("X-Apm-Confirm-Delete", device) // admin.ConfirmDeleteHeader (shadowed here)
+			if c.auth != "" {
+				req.Header.Set("Authorization", c.auth)
+			}
+			w := httptest.NewRecorder()
+			router.ServeHTTP(w, req)
+			if w.Code != c.want {
+				t.Errorf("%s auth %q token set %v: %d, want %d", path, c.auth, c.cfg.AdminServer.PrivacyToken != "", w.Code, c.want)
+			}
+		}
+	}
+	if n := deviceRows(t, client, device, true); n[storage.TableCrashes.Name] != 1 {
+		t.Fatalf("rejected requests deleted rows: %v", n)
+	}
+	if n := queryUint(t, client, "SELECT count() FROM "+storage.PrivacyAuditTable); n != 0 {
+		t.Fatalf("rejected requests wrote %d audit rows", n)
+	}
+	for _, et := range storage.EventTables {
+		must(t, client.Exec(context.Background(), "ALTER TABLE "+et.Name+" DELETE WHERE device_id = ? SETTINGS mutations_sync = 2", device))
+	}
+
+	router := api.NewAdminRouter(privacyConfig(), repo, zap.NewNop())
 	runDeletionScenario(t, client, router)
 }
 
@@ -249,7 +296,7 @@ func TestPrivacyDelete_ServiceAccountNeedsAlterDelete(t *testing.T) {
 		t.Errorf("audit table not created by the service account: %s", w)
 	}
 	owner, _ := connect(t, db, "")
-	router := api.NewAdminRouter(&config.Config{}, storage.NewRepository(svc, zap.NewNop()), zap.NewNop())
+	router := api.NewAdminRouter(privacyConfig(), storage.NewRepository(svc, zap.NewNop()), zap.NewNop())
 
 	const device = "dev-denied"
 	want := seedDevice(t, owner, device, 2)
@@ -276,7 +323,7 @@ func TestPrivacyDelete_ServiceAccountNeedsAlterDelete(t *testing.T) {
 	// The documented GRANT (RELEASE.md), on this database.
 	must(t, admin.Exec(ctx, "GRANT ALTER DELETE ON "+db+".* TO "+user))
 	svc2, _ := connect(t, db, user) // grants are read per session
-	router = api.NewAdminRouter(&config.Config{}, storage.NewRepository(svc2, zap.NewNop()), zap.NewNop())
+	router = api.NewAdminRouter(privacyConfig(), storage.NewRepository(svc2, zap.NewNop()), zap.NewNop())
 	must(t, owner.Exec(ctx, "DELETE FROM "+storage.PrivacyAuditTable+" WHERE 1")) // the scenario counts audit rows
 	runDeletionScenario(t, owner, router)
 }

@@ -303,3 +303,25 @@ func TestLoad_DatabaseURL(t *testing.T) {
 		t.Errorf("expected password=testpass, got %s", cfg.ClickHouse.Password)
 	}
 }
+
+// APM-14: the privacy API token comes from OZX_ADMIN_PRIVACY_TOKEN; unset means disabled.
+func TestLoad_PrivacyToken(t *testing.T) {
+	os.Unsetenv("OZX_ADMIN_PRIVACY_TOKEN")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.AdminServer.PrivacyToken != "" {
+		t.Errorf("default token %q, want empty", cfg.AdminServer.PrivacyToken)
+	}
+
+	os.Setenv("OZX_ADMIN_PRIVACY_TOKEN", "s3cret-token")
+	defer os.Unsetenv("OZX_ADMIN_PRIVACY_TOKEN")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.AdminServer.PrivacyToken != "s3cret-token" {
+		t.Errorf("token from env %q", cfg.AdminServer.PrivacyToken)
+	}
+}

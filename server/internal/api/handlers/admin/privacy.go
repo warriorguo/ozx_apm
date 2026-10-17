@@ -3,6 +3,7 @@ package admin
 import (
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -37,7 +38,9 @@ type PrivacyStore interface {
 
 const aggregatesNote = "apm_*_daily aggregates are not changed: they hold no device or player id"
 
-// PrivacyHandler serves the APM-14 deletion endpoints:
+// PrivacyHandler serves the APM-14 deletion endpoints. Both need
+// "Authorization: Bearer <token>" (NewPrivacyHandler) and are disabled
+// without a configured token:
 //
 //	POST /api/privacy/delete  {"id_type":"device_id","id":"..."}
 //	                          header X-Apm-Confirm-Delete: <the same id>
@@ -54,6 +57,7 @@ const aggregatesNote = "apm_*_daily aggregates are not changed: they hold no dev
 type PrivacyHandler struct {
 	store  PrivacyStore
 	logger *zap.Logger
+	token  []byte // empty: the endpoints are disabled
 
 	// SyncWait: how long POST /delete waits for the result before answering 202.
 	SyncWait time.Duration
@@ -63,10 +67,14 @@ type PrivacyHandler struct {
 	mu sync.Mutex // one deletion at a time
 }
 
-func NewPrivacyHandler(store PrivacyStore, logger *zap.Logger) *PrivacyHandler {
+// NewPrivacyHandler: token is the bearer token both endpoints require
+// (config admin_server.privacy_token, OZX_ADMIN_PRIVACY_TOKEN). With an empty
+// token they answer 403 and do nothing.
+func NewPrivacyHandler(store PrivacyStore, logger *zap.Logger, token string) *PrivacyHandler {
 	return &PrivacyHandler{
 		store:         store,
 		logger:        logger,
+		token:         []byte(token),
 		SyncWait:      20 * time.Second,
 		DeleteTimeout: 30 * time.Minute,
 	}
@@ -80,6 +88,41 @@ func writePrivacyJSON(w http.ResponseWriter, status int, v interface{}) {
 
 func writePrivacyError(w http.ResponseWriter, status int, msg string) {
 	writePrivacyJSON(w, status, map[string]string{"error": msg})
+}
+
+// Enabled reports whether a token is configured.
+func (h *PrivacyHandler) Enabled() bool {
+	return len(h.token) > 0
+}
+
+// authorize checks "Authorization: Bearer <token>" in constant time. It
+// answers 403 while the API is disabled and 401 for a missing or wrong token
+// (logged with the remote address, never with the token).
+func (h *PrivacyHandler) authorize(w http.ResponseWriter, r *http.Request) bool {
+	if !h.Enabled() {
+		writePrivacyError(w, http.StatusForbidden,
+			"privacy API disabled: no token configured (set OZX_ADMIN_PRIVACY_TOKEN, RELEASE.md APM-14)")
+		return false
+	}
+	const prefix = "Bearer "
+	header := r.Header.Get("Authorization")
+	reason := ""
+	switch {
+	case header == "":
+		reason = "missing Authorization header"
+	case !strings.HasPrefix(header, prefix):
+		reason = "Authorization is not a bearer token"
+	case subtle.ConstantTimeCompare([]byte(strings.TrimPrefix(header, prefix)), h.token) != 1:
+		reason = "wrong token"
+	}
+	if reason == "" {
+		return true
+	}
+	h.logger.Warn("privacy API: unauthorized request", zap.String("path", r.URL.Path),
+		zap.String("remote", r.RemoteAddr), zap.String("reason", reason))
+	w.Header().Set("WWW-Authenticate", `Bearer realm="ozx-apm-privacy"`)
+	writePrivacyError(w, http.StatusUnauthorized, "unauthorized: "+reason)
+	return false
 }
 
 // parsePrivacyRequest reads and validates the body. Returns the column the id lives in.
@@ -126,6 +169,9 @@ func newRequestID() string {
 
 // Delete handles POST /api/privacy/delete.
 func (h *PrivacyHandler) Delete(w http.ResponseWriter, r *http.Request) {
+	if !h.authorize(w, r) {
+		return
+	}
 	if h.store == nil {
 		writePrivacyError(w, http.StatusInternalServerError, "repository not configured")
 		return
@@ -323,6 +369,9 @@ func (h *PrivacyHandler) deleteFromTable(ctx context.Context, table, column, id 
 // Verify handles POST /api/privacy/verify: the rows of the subject stored
 // now, per table, and its deletion requests.
 func (h *PrivacyHandler) Verify(w http.ResponseWriter, r *http.Request) {
+	if !h.authorize(w, r) {
+		return
+	}
 	if h.store == nil {
 		writePrivacyError(w, http.StatusInternalServerError, "repository not configured")
 		return

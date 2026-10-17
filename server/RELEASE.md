@@ -709,19 +709,40 @@ string newId = ApmClient.ResetDeviceId();
 ### Server: `POST /api/privacy/delete` and `POST /api/privacy/verify`
 
 ```sh
+TOKEN=...                             # the value of OZX_ADMIN_PRIVACY_TOKEN (from the secret store)
 ID=0123456789abcdef0123456789abcdef   # the device id (ApmClient.GetDeviceId)
 curl -sS -X POST http://<admin-host>/api/privacy/delete \
-  -H 'Content-Type: application/json' -H "X-Apm-Confirm-Delete: $ID" \
+  -H "Authorization: Bearer $TOKEN" -H "X-Apm-Confirm-Delete: $ID" \
+  -H 'Content-Type: application/json' \
   -d "{\"id_type\":\"device_id\",\"id\":\"$ID\"}"
 curl -sS -X POST http://<admin-host>/api/privacy/verify \
-  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   -d "{\"id_type\":\"device_id\",\"id\":\"$ID\"}"
 ```
 
-- `X-Apm-Confirm-Delete` must repeat the id (400 otherwise). It guards against
-  typos and, because it is not in the admin CORS allow-list, against requests
-  from other web origins. The admin API itself has **no authentication** (as
-  before: it must only be reachable from the internal network).
+- **Token (required).** Both endpoints need `Authorization: Bearer <token>`,
+  compared in constant time with the server config `admin_server.privacy_token`,
+  environment variable **`OZX_ADMIN_PRIVACY_TOKEN`**. Without a token configured
+  they are disabled: every call answers 403 "privacy API disabled: no token
+  configured", and the server logs `privacy API disabled: no token configured`
+  (info) once at startup. A missing or wrong token answers 401 and logs a
+  warning `privacy API: unauthorized request` with path, remote address and
+  reason; the token itself is never logged or returned.
+  - Set it on the admin deployment (CI/CD app 38, and app 36 only if it runs
+    the admin server) as an environment variable stored as a secret, e.g.
+    generated with `openssl rand -hex 32`; then redeploy (it is read at
+    startup). Keep it out of `config.yaml`, the repo and tickets. To rotate:
+    set a new value and redeploy; to disable the API: remove it and redeploy.
+  - Check after deploy: the startup log has no "privacy API disabled" line;
+    `verify` without the header answers 401, with it 200.
+- `X-Apm-Confirm-Delete` must repeat the id (400 otherwise), in addition to
+  the token. It guards against typos and, because it is not in the admin CORS
+  allow-list, against requests from other web origins.
+- **Open risk (pre-existing):** the rest of the admin API (dashboard, crashes,
+  exceptions, context endpoints) still has **no authentication** and relies on
+  being reachable only from the internal network; it exposes stack traces,
+  device ids and game context to anyone who can reach it. Only the two privacy
+  endpoints are protected by this change.
 - Tables: every MergeTree-family table of the database that has the column
   (`device_id`): the six event tables, tables added later with the column
   (APM-12 `ops_events`) and leftover copies such as `*_pre_apm19`.
@@ -787,7 +808,8 @@ requests then answer 503).
 ### Rolling deploy and rollback
 
 Old and new binaries serve side by side: the old one ignores the audit table
-and has no privacy endpoints. **Rollback:** redeploy the previous binary; keep
+and has no privacy endpoints. Deploying without `OZX_ADMIN_PRIVACY_TOKEN` is
+safe: the endpoints stay disabled (403) until it is set. **Rollback:** redeploy the previous binary; keep
 `apm_privacy_deletions` (it is the record of honoured requests). The grant can
 stay, or be removed from `apm.xml`. Deleted rows cannot be restored (that is
 the point; no backup is taken).
@@ -795,7 +817,9 @@ the point; no backup is taken).
 ### Verified
 
 - Server: `go vet`, `go test ./...`, handler unit tests (`-race`): 200/202/400/
-  500/503 paths, confirmation header, validation, audit before deletion, one
+  500/503 paths, token (disabled 403 without one, 401 for missing, malformed,
+  wrong or lower-case "bearer" values, never logged; 200 with it; the token does
+  not replace the confirmation header), the env variable, confirmation header, validation, audit before deletion, one
   deletion at a time, background completion. Integration on ClickHouse
   26.1.12, 24.1.8 and 23.8.16 (34/34, 34/34 and 32/32 + 2 skipped: 23.8's local
   default account cannot create users): two devices in all six tables with a

@@ -230,16 +230,17 @@ curl "http://localhost:8080/v1/crashes?platform=Android"
 ### Privacy deletion (admin server)
 
 **POST /api/privacy/delete** - Delete every stored row of a device (APM-14).
-Needs `ALTER DELETE` for the ClickHouse account; see `server/RELEASE.md`.
+Disabled until `OZX_ADMIN_PRIVACY_TOKEN` is set; needs `ALTER DELETE` for the
+ClickHouse account; see `server/RELEASE.md`.
 ```bash
-curl -X POST http://localhost:8081/api/privacy/delete \
+curl -X POST http://localhost:8081/api/privacy/delete -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" -H "X-Apm-Confirm-Delete: $DEVICE_ID" \
   -d "{\"id_type\":\"device_id\",\"id\":\"$DEVICE_ID\"}"
 ```
 
 **POST /api/privacy/verify** - Rows left per table and the deletion requests
 ```bash
-curl -X POST http://localhost:8081/api/privacy/verify \
+curl -X POST http://localhost:8081/api/privacy/verify -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" -d "{\"id_type\":\"device_id\",\"id\":\"$DEVICE_ID\"}"
 ```
 

@@ -18,6 +18,9 @@ admin_server:
   write_timeout: "30s"
   allowed_origins:
     - "*"
+  # APM-14 privacy deletion API: disabled unless a token is set. Set it through
+  # the environment (OZX_ADMIN_PRIVACY_TOKEN, a secret), not in this file.
+  # privacy_token: ""
 
 # ClickHouse database configuration
 # Can also be configured via DATABASE_URL environment variable:

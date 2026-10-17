@@ -55,14 +55,18 @@ func NewAdminRouter(cfg *config.Config, repo *storage.Repository, logger *zap.Lo
 		r.Get("/context/values", contextHandler.ListValues)
 		r.Get("/context/distribution", contextHandler.Distribution)
 
-		// Privacy deletion (APM-14). Like every admin endpoint it has no
-		// authentication of its own (internal network only, RELEASE.md);
-		// deleting needs the X-Apm-Confirm-Delete header.
+		// Privacy deletion (APM-14). The rest of the admin API has no
+		// authentication (internal network only, RELEASE.md); these two
+		// destructive endpoints need a bearer token and are disabled (403)
+		// without one. Deleting also needs the X-Apm-Confirm-Delete header.
 		var privacyStore admin.PrivacyStore
 		if repo != nil {
 			privacyStore = repo
 		}
-		privacyHandler := admin.NewPrivacyHandler(privacyStore, logger)
+		privacyHandler := admin.NewPrivacyHandler(privacyStore, logger, cfg.AdminServer.PrivacyToken)
+		if !privacyHandler.Enabled() {
+			logger.Info("privacy API disabled: no token configured")
+		}
 		r.Post("/privacy/delete", privacyHandler.Delete)
 		r.Post("/privacy/verify", privacyHandler.Verify)
 	})

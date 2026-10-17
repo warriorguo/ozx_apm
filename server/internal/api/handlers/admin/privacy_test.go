@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 
 	"github.com/warriorguo/ozx_apm/server/internal/models"
 	"github.com/warriorguo/ozx_apm/server/internal/storage"
@@ -87,8 +89,11 @@ func (f *fakePrivacyStore) PrivacyAuditHistory(ctx context.Context, idType, idHa
 	return out, nil
 }
 
+const testToken = "test-token-0123456789"
+
 func postPrivacy(h http.HandlerFunc, body, confirm string) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(http.MethodPost, "/api/privacy/delete", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+testToken)
 	if confirm != "" {
 		req.Header.Set(ConfirmDeleteHeader, confirm)
 	}
@@ -108,7 +113,7 @@ func decodeDeletion(t *testing.T, w *httptest.ResponseRecorder) models.PrivacyDe
 
 func TestPrivacyDelete_DeletesOnlyTheDevice_AndAudits(t *testing.T) {
 	store := newFakeStore()
-	h := NewPrivacyHandler(store, zap.NewNop())
+	h := NewPrivacyHandler(store, zap.NewNop(), testToken)
 
 	w := postPrivacy(h.Delete, `{"id_type":"device_id","id":"dev-a"}`, "dev-a")
 	if w.Code != http.StatusOK {
@@ -144,7 +149,7 @@ func TestPrivacyDelete_DeletesOnlyTheDevice_AndAudits(t *testing.T) {
 
 func TestPrivacyDelete_RequiresConfirmation(t *testing.T) {
 	store := newFakeStore()
-	h := NewPrivacyHandler(store, zap.NewNop())
+	h := NewPrivacyHandler(store, zap.NewNop(), testToken)
 	for _, confirm := range []string{"", "dev-b", "yes"} {
 		w := postPrivacy(h.Delete, `{"id":"dev-a"}`, confirm)
 		if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), ConfirmDeleteHeader) {
@@ -157,7 +162,7 @@ func TestPrivacyDelete_RequiresConfirmation(t *testing.T) {
 }
 
 func TestPrivacyDelete_ValidatesTheRequest(t *testing.T) {
-	h := NewPrivacyHandler(newFakeStore(), zap.NewNop())
+	h := NewPrivacyHandler(newFakeStore(), zap.NewNop(), testToken)
 	cases := map[string]string{
 		`not json`:                                  "JSON",
 		`{"id":""}`:                                 "id is required",
@@ -178,7 +183,7 @@ func TestPrivacyDelete_ValidatesTheRequest(t *testing.T) {
 func TestPrivacyDelete_WithoutPrivilege_Is503WithTheGrant(t *testing.T) {
 	store := newFakeStore()
 	store.deleteErr = fmt.Errorf("%w (code: 497, Not enough privileges)", storage.ErrPrivacyDeleteNotPermitted)
-	h := NewPrivacyHandler(store, zap.NewNop())
+	h := NewPrivacyHandler(store, zap.NewNop(), testToken)
 
 	w := postPrivacy(h.Delete, `{"id":"dev-a"}`, "dev-a")
 	if w.Code != http.StatusServiceUnavailable {
@@ -202,7 +207,7 @@ func TestPrivacyDelete_WithoutPrivilege_Is503WithTheGrant(t *testing.T) {
 func TestPrivacyDelete_OtherErrorIs500(t *testing.T) {
 	store := newFakeStore()
 	store.deleteErr = errors.New("code: 159, timeout")
-	h := NewPrivacyHandler(store, zap.NewNop())
+	h := NewPrivacyHandler(store, zap.NewNop(), testToken)
 	w := postPrivacy(h.Delete, `{"id":"dev-a"}`, "dev-a")
 	if d := decodeDeletion(t, w); w.Code != http.StatusInternalServerError || d.Status != "failed" || len(d.Tables) != 3 {
 		t.Fatalf("%d %+v", w.Code, d)
@@ -212,7 +217,7 @@ func TestPrivacyDelete_OtherErrorIs500(t *testing.T) {
 func TestPrivacyDelete_NoAuditNoDeletion(t *testing.T) {
 	store := newFakeStore()
 	store.auditErr = errors.New("table apm_privacy_deletions does not exist")
-	h := NewPrivacyHandler(store, zap.NewNop())
+	h := NewPrivacyHandler(store, zap.NewNop(), testToken)
 	w := postPrivacy(h.Delete, `{"id":"dev-a"}`, "dev-a")
 	if d := decodeDeletion(t, w); w.Code != http.StatusInternalServerError || !strings.Contains(d.Error, "nothing was deleted") {
 		t.Fatalf("%d %+v", w.Code, d)
@@ -225,7 +230,7 @@ func TestPrivacyDelete_NoAuditNoDeletion(t *testing.T) {
 func TestPrivacyDelete_RowsLeft_IsIncomplete202(t *testing.T) {
 	store := newFakeStore()
 	store.resurrect = 1 // a row of the device arrived during the mutation
-	h := NewPrivacyHandler(store, zap.NewNop())
+	h := NewPrivacyHandler(store, zap.NewNop(), testToken)
 	w := postPrivacy(h.Delete, `{"id":"dev-a"}`, "dev-a")
 	d := decodeDeletion(t, w)
 	if w.Code != http.StatusAccepted || d.Status != "incomplete" || d.RowsRemaining != 2 {
@@ -236,7 +241,7 @@ func TestPrivacyDelete_RowsLeft_IsIncomplete202(t *testing.T) {
 func TestPrivacyDelete_SlowDeletionAnswers202_ThenFinishes(t *testing.T) {
 	store := newFakeStore()
 	store.block = make(chan struct{})
-	h := NewPrivacyHandler(store, zap.NewNop())
+	h := NewPrivacyHandler(store, zap.NewNop(), testToken)
 	h.SyncWait = 20 * time.Millisecond
 
 	w := postPrivacy(h.Delete, `{"id":"dev-a"}`, "dev-a")
@@ -247,6 +252,7 @@ func TestPrivacyDelete_SlowDeletionAnswers202_ThenFinishes(t *testing.T) {
 
 	verify := func() models.PrivacyVerification {
 		req := httptest.NewRequest(http.MethodPost, "/api/privacy/verify", strings.NewReader(`{"id":"dev-a"}`))
+		req.Header.Set("Authorization", "Bearer "+testToken)
 		rec := httptest.NewRecorder()
 		h.Verify(rec, req)
 		if rec.Code != http.StatusOK {
@@ -277,7 +283,7 @@ func TestPrivacyDelete_SlowDeletionAnswers202_ThenFinishes(t *testing.T) {
 func TestPrivacyDelete_OneAtATime(t *testing.T) {
 	store := newFakeStore()
 	store.block = make(chan struct{})
-	h := NewPrivacyHandler(store, zap.NewNop())
+	h := NewPrivacyHandler(store, zap.NewNop(), testToken)
 	h.SyncWait = 20 * time.Millisecond
 
 	postPrivacy(h.Delete, `{"id":"dev-a"}`, "dev-a")
@@ -298,14 +304,102 @@ func TestPrivacyDelete_OneAtATime(t *testing.T) {
 }
 
 func TestPrivacy_NilStore(t *testing.T) {
-	h := NewPrivacyHandler(nil, zap.NewNop())
+	h := NewPrivacyHandler(nil, zap.NewNop(), testToken)
 	if w := postPrivacy(h.Delete, `{"id":"a"}`, "a"); w.Code != http.StatusInternalServerError {
 		t.Errorf("delete %d", w.Code)
 	}
 	req := httptest.NewRequest(http.MethodPost, "/api/privacy/verify", strings.NewReader(`{"id":"a"}`))
+	req.Header.Set("Authorization", "Bearer "+testToken)
 	w := httptest.NewRecorder()
 	h.Verify(w, req)
 	if w.Code != http.StatusInternalServerError {
 		t.Errorf("verify %d", w.Code)
+	}
+}
+
+func privacyRequest(h *PrivacyHandler, path, auth string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{"id":"dev-a"}`))
+	req.Header.Set(ConfirmDeleteHeader, "dev-a")
+	if auth != "" {
+		req.Header.Set("Authorization", auth)
+	}
+	w := httptest.NewRecorder()
+	if strings.HasSuffix(path, "/delete") {
+		h.Delete(w, req)
+	} else {
+		h.Verify(w, req)
+	}
+	return w
+}
+
+func TestPrivacy_DisabledWithoutToken(t *testing.T) {
+	store := newFakeStore()
+	h := NewPrivacyHandler(store, zap.NewNop(), "")
+	if h.Enabled() {
+		t.Fatal("enabled without a token")
+	}
+	for _, path := range []string{"/api/privacy/delete", "/api/privacy/verify"} {
+		for _, auth := range []string{"", "Bearer ", "Bearer anything"} {
+			w := privacyRequest(h, path, auth)
+			if w.Code != http.StatusForbidden || !strings.Contains(w.Body.String(), "privacy API disabled") {
+				t.Errorf("%s auth %q: %d %s", path, auth, w.Code, w.Body.String())
+			}
+		}
+	}
+	if store.deletes != 0 || len(store.audit) != 0 {
+		t.Errorf("disabled API touched the store")
+	}
+}
+
+func TestPrivacy_WrongOrMissingToken_Is401_AndTheTokenIsNeverLogged(t *testing.T) {
+	core, logs := observer.New(zapcore.DebugLevel)
+	store := newFakeStore()
+	h := NewPrivacyHandler(store, zap.New(core), testToken)
+	cases := []string{"", testToken, "Basic " + testToken, "Bearer", "Bearer ", "Bearer wrong", "Bearer " + testToken + "x",
+		"bearer " + testToken, "Bearer " + testToken[:len(testToken)-1]}
+	for _, path := range []string{"/api/privacy/delete", "/api/privacy/verify"} {
+		for _, auth := range cases {
+			w := privacyRequest(h, path, auth)
+			if w.Code != http.StatusUnauthorized || w.Header().Get("WWW-Authenticate") == "" {
+				t.Errorf("%s auth %q: %d %s", path, auth, w.Code, w.Body.String())
+			}
+		}
+	}
+	if store.deletes != 0 || len(store.audit) != 0 {
+		t.Errorf("unauthorized requests touched the store")
+	}
+	if n := logs.FilterMessage("privacy API: unauthorized request").Len(); n != 2*len(cases) {
+		t.Errorf("%d unauthorized requests logged, want %d", n, 2*len(cases))
+	}
+	for _, e := range logs.All() {
+		text := e.Message
+		for _, f := range e.Context {
+			text += " " + f.String
+		}
+		if strings.Contains(text, testToken[:8]) {
+			t.Errorf("log contains the token: %s", text)
+		}
+	}
+}
+
+func TestPrivacy_RightToken_Is200(t *testing.T) {
+	store := newFakeStore()
+	h := NewPrivacyHandler(store, zap.NewNop(), testToken)
+	if w := privacyRequest(h, "/api/privacy/verify", "Bearer "+testToken); w.Code != http.StatusOK {
+		t.Fatalf("verify %d %s", w.Code, w.Body.String())
+	}
+	if w := privacyRequest(h, "/api/privacy/delete", "Bearer "+testToken); w.Code != http.StatusOK {
+		t.Fatalf("delete %d %s", w.Code, w.Body.String())
+	}
+	if store.rows["apm_crashes"]["dev-a"] != 0 {
+		t.Errorf("not deleted")
+	}
+	// The token does not replace the confirmation header.
+	req := httptest.NewRequest(http.MethodPost, "/api/privacy/delete", strings.NewReader(`{"id":"dev-b"}`))
+	req.Header.Set("Authorization", "Bearer "+testToken)
+	w := httptest.NewRecorder()
+	h.Delete(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("without confirmation: %d", w.Code)
 	}
 }
