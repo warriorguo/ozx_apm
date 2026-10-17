@@ -243,7 +243,8 @@ func createEventTableStatement(s eventTableSchema) string {
 	for _, col := range addedColumns[s.table.Name] {
 		sb.WriteString("    " + col + ",\n")
 	}
-	sb.WriteString("    INDEX " + EventIDIndexDDL + "\n")
+	sb.WriteString("    INDEX " + EventIDIndexDDL + ",\n")
+	sb.WriteString("    INDEX " + SessionIDIndexDDL + "\n")
 	sb.WriteString(") ENGINE = ReplacingMergeTree()\n")
 	sb.WriteString("PARTITION BY toYYYYMMDD(timestamp)\n")
 	sb.WriteString("ORDER BY (app_version, " + s.table.KeyColumn + ", timestamp, event_id)\n")
@@ -292,6 +293,25 @@ const EventIDIndexDDL = EventIDIndexName + " event_id TYPE bloom_filter(0.001) G
 
 func addEventIDIndexStatement(table string) string {
 	return "ALTER TABLE " + table + " ADD INDEX IF NOT EXISTS " + EventIDIndexDDL
+}
+
+// SessionIDIndexName is the bloom_filter skip index on session_id (APM-15):
+// a session's time line reads one session_id from every event table, and
+// session_id is in no sort key, so without it each query reads the
+// session_id column of every row in its time range. With it, ClickHouse
+// reads the index and only the granules that may hold the session.
+//
+// bloom_filter(0.01), one filter per granule: a granule holds the rows of
+// many sessions (the tables are sorted by version, key column and time), and
+// a query probes one id, so 1% false positives cost about 1% of the granules
+// in the range (RELEASE.md, APM-15, has the measurements).
+const SessionIDIndexName = "idx_session_id"
+
+// SessionIDIndexDDL is the index definition used by CREATE TABLE and ADD INDEX.
+const SessionIDIndexDDL = SessionIDIndexName + " session_id TYPE bloom_filter(0.01) GRANULARITY 1"
+
+func addSessionIDIndexStatement(table string) string {
+	return "ALTER TABLE " + table + " ADD INDEX IF NOT EXISTS " + SessionIDIndexDDL
 }
 
 // materializedView is one of the apm_*_daily aggregations. They are fed at
@@ -446,6 +466,32 @@ func (c *ClickHouseClient) migrateEventIDIndexes(ctx context.Context, tables map
 	}
 }
 
+// migrateSessionIDIndexes adds the session_id index (APM-15) to existing
+// tables that lack it, like migrateEventIDIndexes: only for speed (session
+// time lines), so a refusal is logged once, listing the tables, and startup
+// continues. The production service account has no ALTER ADD INDEX
+// privilege: an admin runs the statements (RELEASE.md, APM-11/APM-15).
+// Metadata only: new parts carry the index; existing parts get it when they
+// are merged or through MATERIALIZE INDEX (optional, a background mutation,
+// not run here).
+func (c *ClickHouseClient) migrateSessionIDIndexes(ctx context.Context, tables map[string]string) {
+	var failed []string
+	var lastErr error
+	for _, t := range EventTables {
+		if strings.Contains(tables[t.Name], "INDEX "+SessionIDIndexName+" ") {
+			continue
+		}
+		if err := c.conn.Exec(ctx, addSessionIDIndexStatement(t.Name)); err != nil {
+			failed = append(failed, t.Name)
+			lastErr = err
+		}
+	}
+	if len(failed) > 0 {
+		c.logger.Warn("could not add the session_id index; session time lines read more data until an admin adds it (RELEASE.md, APM-15)",
+			zap.Strings("tables", failed), zap.Error(lastErr))
+	}
+}
+
 // migrateMaterializedViews creates the apm_*_daily views that do not exist
 // yet. Existing views are skipped without a statement (the service account
 // has no CREATE VIEW privilege, and they are never redefined here). A refused
@@ -495,6 +541,7 @@ func (c *ClickHouseClient) Migrate(ctx context.Context) error {
 		tables = map[string]string{}
 	}
 	c.migrateEventIDIndexes(ctx, tables)
+	c.migrateSessionIDIndexes(ctx, tables)
 	c.migrateMaterializedViews(ctx, tables)
 	c.checkEventTTL(tables)
 	c.migratePrivacyAudit(ctx)
@@ -551,6 +598,15 @@ func SchemaSQL() string {
 `)
 	for _, t := range EventTables {
 		sb.WriteString(addEventIDIndexStatement(t.Name) + ";\n")
+	}
+	sb.WriteString(`
+-- APM-15: bloom_filter skip index on session_id for the session time line.
+-- Additive, idempotent, metadata only, same privilege as above. To index
+-- existing parts right away (optional; a background mutation per table):
+--   ALTER TABLE <table> MATERIALIZE INDEX idx_session_id;
+`)
+	for _, t := range EventTables {
+		sb.WriteString(addSessionIDIndexStatement(t.Name) + ";\n")
 	}
 	sb.WriteString(`
 -- Daily aggregations. They only see rows inserted after they were created.

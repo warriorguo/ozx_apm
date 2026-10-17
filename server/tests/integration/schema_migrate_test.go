@@ -224,10 +224,50 @@ func warnings(logs *observer.ObservedLogs, msgPrefix string) []string {
 }
 
 const (
-	warnNoTTL  = "event table has no TTL"
-	warnNoView = "could not create a materialized view"
-	warnNoIdx  = "could not add the event_id index"
+	warnNoTTL        = "event table has no TTL"
+	warnNoView       = "could not create a materialized view"
+	warnNoIdx        = "could not add the event_id index"
+	warnNoSessionIdx = "could not add the session_id index"
 )
+
+// tablesWithoutSessionIndex lists the event tables that lack idx_session_id (APM-15).
+func tablesWithoutSessionIndex(t *testing.T, client *storage.ClickHouseClient) []string {
+	t.Helper()
+	var missing []string
+	for _, et := range storage.EventTables {
+		var create string
+		if err := client.Conn().QueryRow(context.Background(),
+			"SELECT create_table_query FROM system.tables WHERE database = currentDatabase() AND name = ?", et.Name).Scan(&create); err != nil {
+			t.Fatalf("%s: %v", et.Name, err)
+		}
+		if !strings.Contains(create, "INDEX idx_session_id session_id TYPE bloom_filter(0.01) GRANULARITY 1") {
+			missing = append(missing, et.Name)
+		}
+	}
+	return missing
+}
+
+// sessionIndexWarning returns the tables of the one session_id index warning.
+func sessionIndexWarning(t *testing.T, logs *observer.ObservedLogs) []string {
+	t.Helper()
+	var tables []string
+	n := 0
+	for _, e := range logs.All() {
+		if !strings.HasPrefix(e.Message, warnNoSessionIdx) {
+			continue
+		}
+		n++
+		for _, f := range e.Context {
+			if f.Key == "tables" {
+				tables = strings.Split(strings.Trim(fmt.Sprint(f.Interface), "[]"), " ")
+			}
+		}
+	}
+	if n > 1 {
+		t.Errorf("%d session_id index warnings, want at most one", n)
+	}
+	return tables
+}
 
 func TestMigrate_FreshInstallHasTTLAndViews(t *testing.T) {
 	admin := adminClient(t)
@@ -247,6 +287,9 @@ func TestMigrate_FreshInstallHasTTLAndViews(t *testing.T) {
 	}
 	if n := logs.Len(); n != 0 {
 		t.Errorf("fresh install logged %d warnings: %v", n, logs.All())
+	}
+	if missing := tablesWithoutSessionIndex(t, client); len(missing) != 0 {
+		t.Errorf("tables without the session_id index: %v", missing)
 	}
 
 	// Idempotent: a restart changes nothing and logs nothing.
@@ -406,6 +449,11 @@ func TestMigrate_UpgradesProductionDatabase(t *testing.T) {
 	if n := logs.Len(); n != 0 {
 		t.Errorf("%d warnings: %v", n, logs.All())
 	}
+	// APM-15: an account that may add indexes (the default one here) adds
+	// the session_id index to the existing tables.
+	if missing := tablesWithoutSessionIndex(t, client); len(missing) != 0 {
+		t.Errorf("tables without the session_id index: %v", missing)
+	}
 	assertLegacyRowsIntact(t, client, session)
 	if n := queryUint(t, client, "SELECT toUInt64(sum(total_count)) FROM apm_exception_daily"); n != viewRows {
 		t.Errorf("apm_exception_daily changed from %d to %d by Migrate", viewRows, n)
@@ -506,9 +554,36 @@ func TestMigrate_WithServiceAccountPrivileges(t *testing.T) {
 			if got := warnings(logs, warnNoIdx); len(got) != 0 {
 				t.Errorf("index warnings %v (the legacy tables have the index)", got)
 			}
-			// The service account still inserts and reads.
+			// APM-15: the service account may not add the session_id index to
+			// the existing tables: one warning naming them; the tables it
+			// created (APM-6) have it from CREATE TABLE.
+			legacy := legacyEventTables()
+			missing := tablesWithoutSessionIndex(t, client)
+			warned := sessionIndexWarning(t, logs)
+			if len(missing) != len(legacy) || strings.Join(warned, ",") != strings.Join(missing, ",") {
+				t.Errorf("without the session_id index: %v; warning names %v", missing, warned)
+			}
+			// The service account still inserts and reads, and the time line
+			// works without the index.
 			seedLegacyRows(t, client)
 			assertLegacyRowsIntact(t, client, session)
+			tl, err := storage.NewRepository(client, zap.NewNop()).GetSessionTimeline(ctx, storage.SessionQuery{
+				SessionID: session, Start: time.Now().Add(-24 * time.Hour), End: time.Now()})
+			if err != nil || !tl.Found || len(tl.Items) == 0 {
+				t.Errorf("time line without the index: %v %+v", err, tl)
+			}
+
+			// The admin step (RELEASE.md, APM-15); then a restart is quiet.
+			for _, stmt := range sqlStatements(t, "../../scripts/migrate.sql") {
+				if strings.Contains(stmt, "ADD INDEX IF NOT EXISTS idx_session_id") {
+					must(t, owner.Exec(ctx, stmt))
+				}
+			}
+			logs.TakeAll()
+			must(t, client.Migrate(ctx))
+			if got := sessionIndexWarning(t, logs); len(got) != 0 || len(tablesWithoutSessionIndex(t, client)) != 0 {
+				t.Errorf("after the admin step: warning %v, missing %v", got, tablesWithoutSessionIndex(t, client))
+			}
 		})
 	}
 }

@@ -53,6 +53,11 @@ func NewAdminRouter(cfg *config.Config, repo *storage.Repository, logger *zap.Lo
 		r.Get("/exceptions/occurrences", exceptionHandler.GetOccurrences)
 		r.Get("/exceptions/distribution", exceptionHandler.GetDistribution)
 
+		// Session time line (APM-15)
+		sessionHandler := admin.NewSessionHandler(repo, logger)
+		r.Get("/sessions/timeline", sessionHandler.Timeline)
+		r.Get("/sessions", sessionHandler.DeviceSessions)
+
 		// Game context (APM-5)
 		contextHandler := admin.NewContextHandler(repo, logger)
 		r.Get("/context/keys", contextHandler.ListKeys)

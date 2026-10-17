@@ -30,7 +30,8 @@ CREATE TABLE IF NOT EXISTS apm_perf_samples (
     ram_class LowCardinality(String) DEFAULT '',
     net_type LowCardinality(String) DEFAULT '',
     ctx Map(LowCardinality(String), String),
-    INDEX idx_event_id event_id TYPE bloom_filter(0.001) GRANULARITY 1
+    INDEX idx_event_id event_id TYPE bloom_filter(0.001) GRANULARITY 1,
+    INDEX idx_session_id session_id TYPE bloom_filter(0.01) GRANULARITY 1
 ) ENGINE = ReplacingMergeTree()
 PARTITION BY toYYYYMMDD(timestamp)
 ORDER BY (app_version, platform, timestamp, event_id)
@@ -57,7 +58,8 @@ CREATE TABLE IF NOT EXISTS apm_janks (
     ram_class LowCardinality(String) DEFAULT '',
     net_type LowCardinality(String) DEFAULT '',
     ctx Map(LowCardinality(String), String),
-    INDEX idx_event_id event_id TYPE bloom_filter(0.001) GRANULARITY 1
+    INDEX idx_event_id event_id TYPE bloom_filter(0.001) GRANULARITY 1,
+    INDEX idx_session_id session_id TYPE bloom_filter(0.01) GRANULARITY 1
 ) ENGINE = ReplacingMergeTree()
 PARTITION BY toYYYYMMDD(timestamp)
 ORDER BY (app_version, scene, timestamp, event_id)
@@ -81,7 +83,8 @@ CREATE TABLE IF NOT EXISTS apm_startups (
     ram_class LowCardinality(String) DEFAULT '',
     net_type LowCardinality(String) DEFAULT '',
     ctx Map(LowCardinality(String), String),
-    INDEX idx_event_id event_id TYPE bloom_filter(0.001) GRANULARITY 1
+    INDEX idx_event_id event_id TYPE bloom_filter(0.001) GRANULARITY 1,
+    INDEX idx_session_id session_id TYPE bloom_filter(0.01) GRANULARITY 1
 ) ENGINE = ReplacingMergeTree()
 PARTITION BY toYYYYMMDD(timestamp)
 ORDER BY (app_version, platform, timestamp, event_id)
@@ -104,7 +107,8 @@ CREATE TABLE IF NOT EXISTS apm_scene_loads (
     ram_class LowCardinality(String) DEFAULT '',
     net_type LowCardinality(String) DEFAULT '',
     ctx Map(LowCardinality(String), String),
-    INDEX idx_event_id event_id TYPE bloom_filter(0.001) GRANULARITY 1
+    INDEX idx_event_id event_id TYPE bloom_filter(0.001) GRANULARITY 1,
+    INDEX idx_session_id session_id TYPE bloom_filter(0.01) GRANULARITY 1
 ) ENGINE = ReplacingMergeTree()
 PARTITION BY toYYYYMMDD(timestamp)
 ORDER BY (app_version, scene_name, timestamp, event_id)
@@ -144,7 +148,8 @@ CREATE TABLE IF NOT EXISTS apm_exceptions (
     session_ms UInt64 DEFAULT 0,
     unhandled LowCardinality(String) DEFAULT '',
     ctx_merged UInt8 DEFAULT 0,
-    INDEX idx_event_id event_id TYPE bloom_filter(0.001) GRANULARITY 1
+    INDEX idx_event_id event_id TYPE bloom_filter(0.001) GRANULARITY 1,
+    INDEX idx_session_id session_id TYPE bloom_filter(0.01) GRANULARITY 1
 ) ENGINE = ReplacingMergeTree()
 PARTITION BY toYYYYMMDD(timestamp)
 ORDER BY (app_version, fingerprint, timestamp, event_id)
@@ -170,7 +175,8 @@ CREATE TABLE IF NOT EXISTS apm_crashes (
     ram_class LowCardinality(String) DEFAULT '',
     net_type LowCardinality(String) DEFAULT '',
     ctx Map(LowCardinality(String), String),
-    INDEX idx_event_id event_id TYPE bloom_filter(0.001) GRANULARITY 1
+    INDEX idx_event_id event_id TYPE bloom_filter(0.001) GRANULARITY 1,
+    INDEX idx_session_id session_id TYPE bloom_filter(0.01) GRANULARITY 1
 ) ENGINE = ReplacingMergeTree()
 PARTITION BY toYYYYMMDD(timestamp)
 ORDER BY (app_version, fingerprint, timestamp, event_id)
@@ -197,7 +203,8 @@ CREATE TABLE IF NOT EXISTS apm_custom_events (
     ram_class LowCardinality(String) DEFAULT '',
     net_type LowCardinality(String) DEFAULT '',
     ctx Map(LowCardinality(String), String),
-    INDEX idx_event_id event_id TYPE bloom_filter(0.001) GRANULARITY 1
+    INDEX idx_event_id event_id TYPE bloom_filter(0.001) GRANULARITY 1,
+    INDEX idx_session_id session_id TYPE bloom_filter(0.01) GRANULARITY 1
 ) ENGINE = ReplacingMergeTree()
 PARTITION BY toYYYYMMDD(timestamp)
 ORDER BY (app_version, name, timestamp, event_id)
@@ -230,7 +237,8 @@ CREATE TABLE IF NOT EXISTS apm_custom_metrics (
     ram_class LowCardinality(String) DEFAULT '',
     net_type LowCardinality(String) DEFAULT '',
     ctx Map(LowCardinality(String), String),
-    INDEX idx_event_id event_id TYPE bloom_filter(0.001) GRANULARITY 1
+    INDEX idx_event_id event_id TYPE bloom_filter(0.001) GRANULARITY 1,
+    INDEX idx_session_id session_id TYPE bloom_filter(0.01) GRANULARITY 1
 ) ENGINE = ReplacingMergeTree()
 PARTITION BY toYYYYMMDD(timestamp)
 ORDER BY (app_version, name, timestamp, event_id)
@@ -328,6 +336,19 @@ ALTER TABLE apm_exceptions ADD INDEX IF NOT EXISTS idx_event_id event_id TYPE bl
 ALTER TABLE apm_crashes ADD INDEX IF NOT EXISTS idx_event_id event_id TYPE bloom_filter(0.001) GRANULARITY 1;
 ALTER TABLE apm_custom_events ADD INDEX IF NOT EXISTS idx_event_id event_id TYPE bloom_filter(0.001) GRANULARITY 1;
 ALTER TABLE apm_custom_metrics ADD INDEX IF NOT EXISTS idx_event_id event_id TYPE bloom_filter(0.001) GRANULARITY 1;
+
+-- APM-15: bloom_filter skip index on session_id for the session time line.
+-- Additive, idempotent, metadata only, same privilege as above. To index
+-- existing parts right away (optional; a background mutation per table):
+--   ALTER TABLE <table> MATERIALIZE INDEX idx_session_id;
+ALTER TABLE apm_perf_samples ADD INDEX IF NOT EXISTS idx_session_id session_id TYPE bloom_filter(0.01) GRANULARITY 1;
+ALTER TABLE apm_janks ADD INDEX IF NOT EXISTS idx_session_id session_id TYPE bloom_filter(0.01) GRANULARITY 1;
+ALTER TABLE apm_startups ADD INDEX IF NOT EXISTS idx_session_id session_id TYPE bloom_filter(0.01) GRANULARITY 1;
+ALTER TABLE apm_scene_loads ADD INDEX IF NOT EXISTS idx_session_id session_id TYPE bloom_filter(0.01) GRANULARITY 1;
+ALTER TABLE apm_exceptions ADD INDEX IF NOT EXISTS idx_session_id session_id TYPE bloom_filter(0.01) GRANULARITY 1;
+ALTER TABLE apm_crashes ADD INDEX IF NOT EXISTS idx_session_id session_id TYPE bloom_filter(0.01) GRANULARITY 1;
+ALTER TABLE apm_custom_events ADD INDEX IF NOT EXISTS idx_session_id session_id TYPE bloom_filter(0.01) GRANULARITY 1;
+ALTER TABLE apm_custom_metrics ADD INDEX IF NOT EXISTS idx_session_id session_id TYPE bloom_filter(0.01) GRANULARITY 1;
 
 -- Daily aggregations. They only see rows inserted after they were created.
 -- Need the CREATE VIEW privilege (not granted to the `apm` service account).

@@ -151,6 +151,39 @@ func TestSchema_EventIDIndexOnEveryEventTable(t *testing.T) {
 	}
 }
 
+// APM-15: every event table gets the session_id skip index, on fresh
+// installs (CREATE) and on existing tables (ADD INDEX in migrate.sql; Migrate
+// tolerates a refusal).
+func TestSchema_SessionIDIndexOnEveryEventTable(t *testing.T) {
+	sql := SchemaSQL()
+	for _, table := range eventTables {
+		want := "ALTER TABLE " + table + " ADD INDEX IF NOT EXISTS idx_session_id session_id TYPE bloom_filter(0.01) GRANULARITY 1"
+		if got := addSessionIDIndexStatement(table); got != want {
+			t.Errorf("got %q, want %q", got, want)
+		}
+		if !strings.Contains(sql, want+";\n") {
+			t.Errorf("migrate.sql lacks %q", want)
+		}
+		found := false
+		for _, stmt := range schemaStatements {
+			if strings.HasPrefix(stmt, "CREATE TABLE IF NOT EXISTS "+table+" ") {
+				found = true
+				if !strings.Contains(stmt, "    INDEX idx_event_id event_id TYPE bloom_filter(0.001) GRANULARITY 1,\n    INDEX idx_session_id session_id TYPE bloom_filter(0.01) GRANULARITY 1\n)") {
+					t.Errorf("CREATE TABLE %s lacks the session_id index", table)
+				}
+			}
+			// Never part of the statements that must succeed: the service
+			// account may not add an index.
+			if strings.Contains(stmt, "ADD INDEX") {
+				t.Errorf("schemaStatements adds an index: %s", stmt)
+			}
+		}
+		if !found {
+			t.Errorf("no CREATE TABLE for %s", table)
+		}
+	}
+}
+
 // APM-19 phase B: fresh installs create ReplacingMergeTree tables whose sort
 // key is the old one plus event_id, so queries keep the same prefix.
 func TestSchema_EventTablesAreReplacingMergeTreeOnEventID(t *testing.T) {
