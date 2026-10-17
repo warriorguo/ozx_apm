@@ -570,6 +570,7 @@ namespace OzxApm.Collectors
                     // New fingerprint: the first occurrence goes to disk right away,
                     // with the time it happened and the breadcrumbs that led to it.
                     _immediateSent++;
+                    _eventsEnqueued++;
                     first = BuildEvent(entry, 1, ref occ, false,
                         SnapshotBreadcrumbsLocked(MaxBreadcrumbsPerEvent, MaxBreadcrumbLength));
                     if (hold)
@@ -875,7 +876,8 @@ namespace OzxApm.Collectors
         private List<ExceptionEvent> CloseWindowLocked()
         {
             List<ExceptionEvent> events = null;
-            for (int h = 0; h < _held.Count; h++)
+            int held = _held.Count;
+            for (int h = 0; h < held; h++)
                 (events ?? (events = new List<ExceptionEvent>())).Add(_held[h].Event);
             _held.Clear();
             _heldCount = 0;
@@ -918,7 +920,7 @@ namespace OzxApm.Collectors
             _windowId++;
             Volatile.Write(ref _windowStartTick, Environment.TickCount);
             if (events != null)
-                _eventsEnqueued += events.Count;
+                _eventsEnqueued += events.Count - held; // held ones were counted when built
             return events;
         }
 

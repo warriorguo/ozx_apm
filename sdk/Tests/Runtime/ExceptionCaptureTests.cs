@@ -192,6 +192,7 @@ namespace OzxApm.Tests
             Assert.AreEqual(ExceptionParser.Analyze("error", summary.message, "", "").Fingerprint, summary.fingerprint);
             _collector.GetStats(out long seen, out long events, out long untracked);
             Assert.AreEqual(2L * n, seen);
+            Assert.AreEqual(_events.Count, events);
             Assert.AreEqual(40, untracked);
 
             // The next window tracks them again.
@@ -309,6 +310,14 @@ namespace OzxApm.Tests
 
             RunOnThread(() => _collector.HandleLogMessage("Asset not found: x", Stack, LogType.Error));
             Assert.AreEqual(2, _events.Count, "errors are not held");
+
+            // Held at the end of the window: enqueued with it, counted once.
+            RunOnThread(() => _collector.HandleLogMessage("ArgumentException: bad", "Ozx.Net.Worker.Send () (at Assets/Net/Worker.cs:20)\n", LogType.Exception));
+            _collector.FlushPending();
+            Assert.AreEqual(3, _events.Count);
+            _collector.GetStats(out long seen, out long events, out _);
+            Assert.AreEqual(3, seen);
+            Assert.AreEqual(3, events);
         }
 
         // ---- Unhandled exceptions ----
