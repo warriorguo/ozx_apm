@@ -8,12 +8,20 @@ import type {
   ExceptionListResponse,
   FilterParams,
   PaginationParams,
+  ContextKeysResponse,
+  ContextValuesResponse,
+  ContextDistribution,
 } from '../types/api'
 
-const api = axios.create({
+export const apiConfig = {
   baseURL: '/api',
   timeout: 30000,
-})
+  // Arrays as repeated keys (ctx=a&ctx=b), which is what the server reads;
+  // axios' default would send ctx[]=a&ctx[]=b.
+  paramsSerializer: { indexes: null },
+}
+
+const api = axios.create(apiConfig)
 
 // Dashboard APIs
 export async function getSummary(params: FilterParams): Promise<DashboardSummary> {
@@ -101,7 +109,11 @@ export async function getCrashDetail(
   }
   return {
     ...data,
-    occurrences: data.occurrences || [],
+    occurrences: (data.occurrences || []).map((o) => ({
+      ...o,
+      breadcrumbs: o.breadcrumbs || [],
+      context: o.context || {},
+    })),
     version_distribution: data.version_distribution || [],
     device_distribution: data.device_distribution || [],
     os_distribution: data.os_distribution || [],
@@ -117,4 +129,41 @@ export async function getExceptions(
     return { exceptions: [], total_count: 0, page: 1, page_size: 20 }
   }
   return { ...data, exceptions: data.exceptions || [] }
+}
+
+// Game context APIs (APM-5). source: perf, janks, startups, scene_loads,
+// exceptions, crashes or all (default).
+export async function getContextKeys(
+  params: FilterParams & { source?: string }
+): Promise<ContextKeysResponse> {
+  const { data } = await api.get<ContextKeysResponse>('/context/keys', { params })
+  return { keys: data?.keys || [] }
+}
+
+export async function getContextValues(
+  key: string,
+  params: FilterParams & { source?: string; limit?: number }
+): Promise<ContextValuesResponse> {
+  const { data } = await api.get<ContextValuesResponse>('/context/values', {
+    params: { key, ...params },
+  })
+  return { key, values: data?.values || [] }
+}
+
+export async function getContextDistribution(
+  key: string,
+  metric: string,
+  params: FilterParams & { fingerprint?: string }
+): Promise<ContextDistribution> {
+  const { data } = await api.get<ContextDistribution>('/context/distribution', {
+    params: { key, metric, ...params },
+  })
+  return {
+    key,
+    metric,
+    unit: data?.unit || '',
+    total: data?.total || 0,
+    truncated: !!data?.truncated,
+    rows: data?.rows || [],
+  }
 }

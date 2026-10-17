@@ -1,18 +1,11 @@
-import { FilterBar } from '../components/FilterBar'
+import { GlobalFilterBar } from '../components/FilterBar'
 import { TimeSeriesChart } from '../components/TimeSeriesChart'
 import { DistributionChart } from '../components/DistributionChart'
 import { useFilters } from '../hooks/useFilters'
 import { useTimeSeries, useDistribution } from '../hooks/useApi'
 
 export function Performance() {
-  const {
-    filters,
-    queryParams,
-    formattedRange,
-    setTimePreset,
-    setAppVersion,
-    setPlatform,
-  } = useFilters()
+  const { queryParams } = useFilters()
 
   const { data: fpsTimeSeries, isLoading: fpsTimeLoading } = useTimeSeries('fps', queryParams)
   const { data: frameTimeTimeSeries } = useTimeSeries('frame_time', queryParams)
@@ -27,15 +20,7 @@ export function Performance() {
     <div>
       <h1 className="text-2xl font-bold text-gray-900 mb-6">Performance Analysis</h1>
 
-      <FilterBar
-        timePreset={filters.timePreset}
-        appVersion={filters.appVersion}
-        platform={filters.platform}
-        formattedRange={formattedRange}
-        onTimePresetChange={setTimePreset}
-        onAppVersionChange={setAppVersion}
-        onPlatformChange={setPlatform}
-      />
+      <GlobalFilterBar />
 
       <div className="space-y-6">
         <section>

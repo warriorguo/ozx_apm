@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { FilterBar } from '../components/FilterBar'
+import { GlobalFilterBar } from '../components/FilterBar'
 import { DataTable } from '../components/DataTable'
 import { Pagination } from '../components/Pagination'
 import { useFilters } from '../hooks/useFilters'
@@ -8,14 +8,7 @@ import { formatNumber, formatDateTime } from '../utils/format'
 import type { ExceptionGroup } from '../types/api'
 
 export function Exceptions() {
-  const {
-    filters,
-    queryParams,
-    formattedRange,
-    setTimePreset,
-    setAppVersion,
-    setPlatform,
-  } = useFilters()
+  const { queryParams } = useFilters()
 
   const [page, setPage] = useState(1)
 
@@ -70,15 +63,7 @@ export function Exceptions() {
     <div>
       <h1 className="text-2xl font-bold text-gray-900 mb-6">Exceptions</h1>
 
-      <FilterBar
-        timePreset={filters.timePreset}
-        appVersion={filters.appVersion}
-        platform={filters.platform}
-        formattedRange={formattedRange}
-        onTimePresetChange={setTimePreset}
-        onAppVersionChange={setAppVersion}
-        onPlatformChange={setPlatform}
-      />
+      <GlobalFilterBar />
 
       <DataTable
         data={exceptionsData?.exceptions || []}

@@ -84,6 +84,9 @@ export interface CrashOccurrence {
   os_version: string
   scene: string
   breadcrumbs: string[]
+  // APM-5; absent in responses from servers before it
+  build_type?: string
+  context?: Record<string, string>
 }
 
 export interface VersionDist {
@@ -141,6 +144,64 @@ export interface TimeRangeParams {
 export interface FilterParams extends TimeRangeParams {
   app_version?: string
   platform?: string
+  // APM-5. build_type: release (server default; includes events from SDKs
+  // without a build type), dev, editor, unknown, all.
+  build_type?: string
+  // "key:value"; the same key repeated is an OR, different keys an AND.
+  ctx?: string[]
+}
+
+// Game context (APM-5)
+export type BuildTypeFilter = 'release' | 'dev' | 'editor' | 'unknown' | 'all'
+
+export interface ContextFilter {
+  key: string
+  value: string // '' matches events without the key
+}
+
+export interface ContextKeyStat {
+  key: string
+  count: number
+}
+
+export interface ContextKeysResponse {
+  keys: ContextKeyStat[]
+}
+
+export interface ContextValueStat {
+  value: string
+  count: number
+}
+
+export interface ContextValuesResponse {
+  key: string
+  values: ContextValueStat[]
+}
+
+export type ContextMetric =
+  | 'fps'
+  | 'frame_time'
+  | 'janks'
+  | 'startup'
+  | 'scene_load'
+  | 'exceptions'
+  | 'crashes'
+
+export interface ContextDistributionRow {
+  value: string // '' = key not set
+  count: number
+  sessions: number
+  p50: number
+  p95: number
+}
+
+export interface ContextDistribution {
+  key: string
+  metric: string
+  unit: string // 'fps', 'ms', or '' for counts only
+  total: number
+  truncated: boolean
+  rows: ContextDistributionRow[]
 }
 
 export interface PaginationParams {

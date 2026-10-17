@@ -1,5 +1,7 @@
-import { useState, useMemo } from 'react'
+import { createContext, createElement, useContext, useMemo, useState } from 'react'
+import type { ReactNode } from 'react'
 import { format, subDays, subHours } from 'date-fns'
+import type { BuildTypeFilter, ContextFilter } from '../types/api'
 
 export type TimePreset = '1h' | '6h' | '24h' | '7d' | '30d' | 'custom'
 
@@ -9,9 +11,22 @@ interface FilterState {
   endTime: Date
   appVersion: string
   platform: string
+  // APM-5: release by default (the server then also includes events from
+  // SDKs without a build type).
+  buildType: BuildTypeFilter
+  contextFilters: ContextFilter[]
 }
 
-export function useFilters() {
+export interface QueryParams {
+  start_time: string
+  end_time: string
+  app_version?: string
+  platform?: string
+  build_type: BuildTypeFilter
+  ctx?: string[]
+}
+
+function useFilterState() {
   const [filters, setFilters] = useState<FilterState>(() => {
     const endTime = new Date()
     const startTime = subHours(endTime, 24)
@@ -21,6 +36,8 @@ export function useFilters() {
       endTime,
       appVersion: '',
       platform: '',
+      buildType: 'release',
+      contextFilters: [],
     }
   })
 
@@ -73,16 +90,44 @@ export function useFilters() {
     setFilters((prev) => ({ ...prev, platform }))
   }
 
+  const setBuildType = (buildType: BuildTypeFilter) => {
+    setFilters((prev) => ({ ...prev, buildType }))
+  }
+
+  // Adding the same key:value twice is a no-op.
+  const addContextFilter = (filter: ContextFilter) => {
+    setFilters((prev) =>
+      prev.contextFilters.some((f) => f.key === filter.key && f.value === filter.value)
+        ? prev
+        : { ...prev, contextFilters: [...prev.contextFilters, filter] }
+    )
+  }
+
+  const removeContextFilter = (index: number) => {
+    setFilters((prev) => ({
+      ...prev,
+      contextFilters: prev.contextFilters.filter((_, i) => i !== index),
+    }))
+  }
+
+  const clearContextFilters = () => {
+    setFilters((prev) => ({ ...prev, contextFilters: [] }))
+  }
+
   const queryParams = useMemo(() => {
-    const params: Record<string, string> = {
+    const params: QueryParams = {
       start_time: filters.startTime.toISOString(),
       end_time: filters.endTime.toISOString(),
+      build_type: filters.buildType,
     }
     if (filters.appVersion) {
       params.app_version = filters.appVersion
     }
     if (filters.platform) {
       params.platform = filters.platform
+    }
+    if (filters.contextFilters.length > 0) {
+      params.ctx = filters.contextFilters.map((f) => `${f.key}:${f.value}`)
     }
     return params
   }, [filters])
@@ -99,5 +144,28 @@ export function useFilters() {
     setCustomTime,
     setAppVersion,
     setPlatform,
+    setBuildType,
+    addContextFilter,
+    removeContextFilter,
+    clearContextFilters,
   }
+}
+
+export type Filters = ReturnType<typeof useFilterState>
+
+const FiltersContext = createContext<Filters | null>(null)
+
+// FiltersProvider shares one filter state between all pages, so the build
+// type and context filters stay set when switching pages.
+export function FiltersProvider({ children }: { children: ReactNode }) {
+  const value = useFilterState()
+  return createElement(FiltersContext.Provider, { value }, children)
+}
+
+// useFilters returns the shared filters inside a FiltersProvider, and a
+// component-local state outside of one.
+export function useFilters(): Filters {
+  const shared = useContext(FiltersContext)
+  const local = useFilterState()
+  return shared ?? local
 }

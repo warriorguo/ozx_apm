@@ -25,6 +25,9 @@ import {
   getCrashes,
   getCrashDetail,
   getExceptions,
+  getContextKeys,
+  getContextValues,
+  getContextDistribution,
 } from './api'
 
 describe('API Service', () => {
@@ -44,7 +47,8 @@ describe('API Service', () => {
       const result = await getSummary(params)
 
       expect(mockGet).toHaveBeenCalledWith('/summary', { params })
-      expect(result).toEqual(mockData)
+      // Missing arrays are normalized to [].
+      expect(result).toEqual({ ...mockData, top_versions: [], top_platforms: [] })
     })
   })
 
@@ -140,7 +144,26 @@ describe('API Service', () => {
       expect(mockGet).toHaveBeenCalledWith('/crashes/detail', {
         params: { fingerprint: 'crash-123', ...params },
       })
-      expect(result).toEqual(mockData)
+      // Missing arrays are normalized to [].
+      expect(result).toEqual({
+        ...mockData,
+        occurrences: [],
+        version_distribution: [],
+        device_distribution: [],
+        os_distribution: [],
+      })
+    })
+
+    it('normalizes occurrences without context (servers before APM-5)', async () => {
+      mockGet.mockResolvedValue({
+        data: {
+          fingerprint: 'c',
+          occurrences: [{ timestamp: 't', breadcrumbs: null }],
+        },
+      })
+      const result = await getCrashDetail('c', {})
+      expect(result.occurrences[0].breadcrumbs).toEqual([])
+      expect(result.occurrences[0].context).toEqual({})
     })
   })
 
@@ -154,6 +177,34 @@ describe('API Service', () => {
 
       expect(mockGet).toHaveBeenCalledWith('/exceptions', { params })
       expect(result).toEqual(mockData)
+    })
+  })
+
+  describe('context APIs (APM-5)', () => {
+    it('getContextKeys passes the filter and normalizes null', async () => {
+      mockGet.mockResolvedValue({ data: { keys: null } })
+      const params = { build_type: 'all', ctx: ['levelId:3', 'roomId:r1'] }
+      const result = await getContextKeys(params)
+      expect(mockGet).toHaveBeenCalledWith('/context/keys', { params })
+      expect(result).toEqual({ keys: [] })
+    })
+
+    it('getContextValues sends the key', async () => {
+      mockGet.mockResolvedValue({ data: { key: 'levelId', values: [{ value: '1', count: 2 }] } })
+      const result = await getContextValues('levelId', { build_type: 'release' })
+      expect(mockGet).toHaveBeenCalledWith('/context/values', {
+        params: { key: 'levelId', build_type: 'release' },
+      })
+      expect(result.values).toEqual([{ value: '1', count: 2 }])
+    })
+
+    it('getContextDistribution survives an empty body', async () => {
+      mockGet.mockResolvedValue({ data: null })
+      const result = await getContextDistribution('levelId', 'fps', {})
+      expect(mockGet).toHaveBeenCalledWith('/context/distribution', {
+        params: { key: 'levelId', metric: 'fps' },
+      })
+      expect(result).toEqual({ key: 'levelId', metric: 'fps', unit: '', total: 0, truncated: false, rows: [] })
     })
   })
 })

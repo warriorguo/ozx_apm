@@ -62,3 +62,39 @@ export function useExceptions(params: FilterParams & PaginationParams) {
     queryFn: () => api.getExceptions(params),
   })
 }
+
+// Game context (APM-5)
+export function useContextKeys(params: FilterParams & { source?: string }, enabled = true) {
+  return useQuery({
+    queryKey: ['context-keys', params],
+    queryFn: () => api.getContextKeys(params),
+    staleTime: 60 * 1000,
+    enabled,
+  })
+}
+
+export function useContextValues(key: string, params: FilterParams & { source?: string }) {
+  return useQuery({
+    queryKey: ['context-values', key, params],
+    queryFn: () => api.getContextValues(key, params),
+    staleTime: 60 * 1000,
+    enabled: isValidContextKey(key),
+  })
+}
+
+export function useContextDistribution(
+  key: string,
+  metric: string,
+  params: FilterParams & { fingerprint?: string }
+) {
+  return useQuery({
+    queryKey: ['context-distribution', key, metric, params],
+    queryFn: () => api.getContextDistribution(key, metric, params),
+    enabled: isValidContextKey(key) && !!metric,
+  })
+}
+
+// Same rule as the SDK and the server: 1-64 characters from [A-Za-z0-9_.-].
+export function isValidContextKey(key: string): boolean {
+  return /^[A-Za-z0-9_.-]{1,64}$/.test(key)
+}

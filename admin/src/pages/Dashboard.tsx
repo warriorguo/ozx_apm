@@ -1,4 +1,4 @@
-import { FilterBar } from '../components/FilterBar'
+import { GlobalFilterBar } from '../components/FilterBar'
 import { StatCard } from '../components/StatCard'
 import { TimeSeriesChart } from '../components/TimeSeriesChart'
 import { useFilters } from '../hooks/useFilters'
@@ -6,14 +6,7 @@ import { useSummary, useTimeSeries } from '../hooks/useApi'
 import { formatNumber, formatPercent, formatMs } from '../utils/format'
 
 export function Dashboard() {
-  const {
-    filters,
-    queryParams,
-    formattedRange,
-    setTimePreset,
-    setAppVersion,
-    setPlatform,
-  } = useFilters()
+  const { queryParams } = useFilters()
 
   const { data: summary, isLoading: summaryLoading } = useSummary(queryParams)
   const { data: fpsTimeSeries } = useTimeSeries('fps', queryParams)
@@ -24,15 +17,7 @@ export function Dashboard() {
     <div>
       <h1 className="text-2xl font-bold text-gray-900 mb-6">Dashboard</h1>
 
-      <FilterBar
-        timePreset={filters.timePreset}
-        appVersion={filters.appVersion}
-        platform={filters.platform}
-        formattedRange={formattedRange}
-        onTimePresetChange={setTimePreset}
-        onAppVersionChange={setAppVersion}
-        onPlatformChange={setPlatform}
-      />
+      <GlobalFilterBar />
 
       {summaryLoading ? (
         <div className="text-center py-8 text-gray-500">Loading...</div>

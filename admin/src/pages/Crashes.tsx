@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { FilterBar } from '../components/FilterBar'
+import { GlobalFilterBar } from '../components/FilterBar'
 import { DataTable } from '../components/DataTable'
 import { Pagination } from '../components/Pagination'
 import { useFilters } from '../hooks/useFilters'
@@ -8,14 +8,7 @@ import { formatNumber, formatDateTime } from '../utils/format'
 import type { CrashGroup } from '../types/api'
 
 export function Crashes() {
-  const {
-    filters,
-    queryParams,
-    formattedRange,
-    setTimePreset,
-    setAppVersion,
-    setPlatform,
-  } = useFilters()
+  const { queryParams } = useFilters()
 
   const [page, setPage] = useState(1)
   const [selectedFingerprint, setSelectedFingerprint] = useState<string | null>(null)
@@ -93,15 +86,7 @@ export function Crashes() {
     <div>
       <h1 className="text-2xl font-bold text-gray-900 mb-6">Crashes</h1>
 
-      <FilterBar
-        timePreset={filters.timePreset}
-        appVersion={filters.appVersion}
-        platform={filters.platform}
-        formattedRange={formattedRange}
-        onTimePresetChange={setTimePreset}
-        onAppVersionChange={setAppVersion}
-        onPlatformChange={setPlatform}
-      />
+      <GlobalFilterBar />
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         <div className="lg:col-span-2">
@@ -198,6 +183,27 @@ export function Crashes() {
                           <p>
                             <span className="text-gray-500">Scene:</span> {occ.scene}
                           </p>
+                          {occ.build_type && (
+                            <p>
+                              <span className="text-gray-500">Build:</span> {occ.build_type}
+                            </p>
+                          )}
+                          {occ.context && Object.keys(occ.context).length > 0 && (
+                            <details className="mt-1">
+                              <summary className="text-gray-500 cursor-pointer">
+                                Context ({Object.keys(occ.context).length})
+                              </summary>
+                              <ul className="pl-2 mt-1 text-gray-600 font-mono">
+                                {Object.entries(occ.context)
+                                  .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+                                  .map(([k, v]) => (
+                                    <li key={k}>
+                                      {k} = {v}
+                                    </li>
+                                  ))}
+                              </ul>
+                            </details>
+                          )}
                           {occ.breadcrumbs && occ.breadcrumbs.length > 0 && (
                             <details className="mt-1">
                               <summary className="text-gray-500 cursor-pointer">
