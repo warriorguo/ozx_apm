@@ -841,3 +841,239 @@ the point; no backup is taken).
 - Not verified: on a device (test plan written, not run yet), the XML-defined `apm`
   account with the new grant (the tests use a SQL-defined copy), deletion time
   at production volume, iOS.
+
+## APM-4: exception grouping by a server-side fingerprint (additive schema change)
+
+Deploy order: **server, then admin UI, then SDK builds.** Each step works
+without the next one (below).
+
+Before this change the fingerprint was computed by the SDK from the text
+before the message's first colon and the first stack line. OZX's event bus
+logs every handler exception as
+`Debug.LogError("[GameEventBus] Error handling event {EventType}: {ex}")`, so
+all handler failures of one event type were one group, whatever exception
+was thrown where; the exception's stack was in the message, which the SDK
+cut to 500 characters.
+
+### Wire format (SDK -> server)
+
+Exception events may carry, next to the existing fields:
+
+```json
+{"type":"exception", ..., "fingerprint":"fad75585e1523085",
+ "log_type":"error",
+ "embedded_exception":"System.InvalidOperationException: Room template not found for roomId=7\n  at Ozx.Rooms.RoomLoader.LoadTemplate (System.Int32 roomId) [0x00000] in /Users/builder/ozx/Assets/Scripts/Rooms/RoomLoader.cs:71 \n  ...",
+ "breadcrumbs":["[10:00:00.000] Scene: Main", "[10:00:01.512] Exception: ..."]}
+```
+
+- `log_type`: `exception` (Debug.LogException / unhandled), `error` or
+  `assert`. Absent from older SDKs.
+- `embedded_exception`: an `Exception.ToString()` the SDK found in an error or
+  assert message (a type name ending in `Exception` followed by stack frames
+  or an inner exception), extracted from the **full** message before it is
+  cut to 500 characters. Up to 8000 characters: when longer, each exception
+  keeps its header and its first 32/16/8/4/2/1 frames until it fits, the rest
+  replaced by `  ... (N frames omitted)`. The `stack` limit is now 8000 too
+  (was 4000).
+- `breadcrumbs`: on the first occurrence in a de-duplication window only, the
+  last 20 breadcrumbs (`[HH:mm:ss.fff] text`, UTC, cut to 200 characters).
+  Repeat counts (count > 1) carry the first occurrence's message, stack and
+  embedded exception, no breadcrumbs.
+- `fingerprint`: still sent and still required; the SDK computes it with the
+  server's algorithm (below) to de-duplicate on the device.
+
+Server limits: `embedded_exception` 16000 characters, at most the last 50
+breadcrumbs of 512 characters; an unknown `log_type` is stored as `''`.
+
+### Fingerprint, version 1
+
+Computed by the server at ingest from the stored raw fields
+(`internal/fingerprint`; its package comment is the full specification):
+
+1. Classification: a logged exception (`log_type` `exception`: Unity's
+   message is the innermost `Type: message`, the stack has `Rethrow as
+   Outer: message` before each outer exception's frames), an exception
+   wrapped in an error log (`embedded_exception`; its call site is the first
+   in-app frame of Unity's stack of the log call), or a plain error/assert.
+   Events of older SDKs: a message starting with `SomethingException:` is a
+   logged exception; otherwise the (500-character) message is searched for
+   an embedded exception, whose cut-off last line is ignored.
+2. Frames in every format (Mono and IL2CPP `Exception.ToString()` with and
+   without file/line, .NET, Unity `Type:Method (args) (at File:Line)`) become
+   a method identity: no arguments, location, generic arguments, arity or
+   compiler-generated numbers (`<Start>b__5_0` -> `<Start>b`), `:` -> `.`,
+   `/` -> `+`. Frames whose method starts with `System.`, `Mono.`,
+   `Microsoft.`, `UnityEngine.`, `UnityEditor.`, `Unity.`, `TMPro.`,
+   `Newtonsoft.` or `OzxApm.` are not in-app.
+3. Input of the hash:
+   - exceptions: `v1`, `exception`, the outermost exception's type without
+     namespace, the inner exceptions' types (`A>B`), and the first two
+     distinct in-app frames of the outermost exception (any frames if none is
+     in-app); without frames, its message template;
+   - plain errors and asserts: `v1`, the log type, the template of the
+     message's first line, and the first in-app frame of the log call.
+4. FNV-1a 64 of that text, 16 hex digits.
+
+The message template replaces quoted text, GUIDs, hex numbers and hashes,
+numbers (also inside identifiers: `room_12` -> `room_<n>`) and values after
+`=` (`roomId=forest` -> `roomId=<v>`), and is cut to 200 characters.
+
+Line numbers, file paths, the LogError call site and the message (when there
+is a stack) do not take part, so the same bug groups together across Mono and
+IL2CPP, across versions, and with any roomId; two bus handlers throwing are
+two groups. Only two frames are used because IL2CPP release builds inline
+small methods (frames Mono shows are missing); a bug whose top frames are
+inlined differently on IL2CPP than on Mono can still form two groups. In
+Unity's form of a logged exception the frames of the logging call follow the
+exception's own; they count only when the exception has fewer than two
+in-app frames.
+
+`testdata/vectors.json` pins the output (22 cases); the SDK's port
+(`sdk/Runtime/Collectors/ExceptionParser.cs`) is checked against it, and
+`internal/processor/testdata/sdk_events.jsonl` holds events serialized by
+the SDK whose fingerprint the server must reproduce.
+
+### Schema
+
+`Migrate` adds ten columns to `apm_exceptions` (also in `scripts/migrate.sql`):
+
+```sql
+ALTER TABLE apm_exceptions ADD COLUMN IF NOT EXISTS client_fingerprint String DEFAULT '';
+ALTER TABLE apm_exceptions ADD COLUMN IF NOT EXISTS fingerprint_version UInt8 DEFAULT 0;
+ALTER TABLE apm_exceptions ADD COLUMN IF NOT EXISTS log_type LowCardinality(String) DEFAULT '';
+ALTER TABLE apm_exceptions ADD COLUMN IF NOT EXISTS exception_type String DEFAULT '';
+ALTER TABLE apm_exceptions ADD COLUMN IF NOT EXISTS message_template String DEFAULT '';
+ALTER TABLE apm_exceptions ADD COLUMN IF NOT EXISTS embedded_exception String DEFAULT '';
+ALTER TABLE apm_exceptions ADD COLUMN IF NOT EXISTS inner_exceptions Array(String);
+ALTER TABLE apm_exceptions ADD COLUMN IF NOT EXISTS throw_site String DEFAULT '';
+ALTER TABLE apm_exceptions ADD COLUMN IF NOT EXISTS call_site String DEFAULT '';
+ALTER TABLE apm_exceptions ADD COLUMN IF NOT EXISTS breadcrumbs Array(String);
+```
+
+Metadata only, idempotent, within the `apm` account's `ALTER ADD COLUMN`
+grant; fresh and migrated tables have the same columns in the same order.
+`fingerprint` (in the sort key) now holds the server's fingerprint and
+`fingerprint_version` the algorithm version; **0 marks rows stored before
+APM-4**, whose `fingerprint` is the SDK's and whose new columns are empty.
+`client_fingerprint` is what the SDK sent. `inner_exceptions` is
+`Type: first line of message` per inner exception, outermost first;
+`throw_site`/`call_site` are `Method (at File:Line)`.
+
+### Admin API
+
+- `/api/exceptions` groups by the server's fingerprint as before and adds
+  `fingerprint_version`, `exception_type`, `message_template`, `throw_site`,
+  `call_site` (of the group's latest occurrence; `message` is now the latest
+  too). Old groups (version 0) have only `message` and `fingerprint`.
+- New `GET /api/exceptions/detail?fingerprint=F` (same filters, default 30
+  days, 404 if nothing matches): the group summary with first/last version,
+  `sample` (the latest occurrence: raw message, stack, embedded exception,
+  client fingerprint, inner exceptions, and `parsed`: the exception chain
+  with method/file/line/in_app per frame, the log call's frames, throw and
+  call site, as parsed now), the latest 20 `occurrences` (session, count,
+  version, build type, device, context, breadcrumbs), and version/device
+  distributions (occurrences). Distribution by any context key:
+  `/api/context/distribution?metric=exceptions&fingerprint=F&key=K`. This is
+  the data APM-11's detail page needs; the page is APM-11.
+
+The admin UI's exception list shows the type, throw site and call site.
+
+### Rolling deploy and rollback
+
+Old and new binaries can serve side by side: the old binary names its insert
+columns, so its rows get the defaults (version 0, its stored fingerprint is
+the SDK's). For events of the new SDK the SDK's fingerprint equals the
+server's, so they group the same whichever binary stored them, and a batch
+re-sent across binaries is still recognised as a duplicate (rehearsed in both
+directions). Events of older SDKs group differently from the deploy on: rows
+stored before keep the SDK's fingerprint (a version-0 group), rows stored
+after get the server's (a new group); the old groups age out with the
+30-day TTL.
+
+**Rollback:** redeploy the previous binary; no schema action. The columns
+stay; its rows read the defaults. An SDK with APM-4 against an older server:
+accepted, the new fields are ignored (no embedded exception, no breadcrumbs
+stored), and the stored fingerprint is the SDK's, i.e. v1 grouping.
+
+### Changing the algorithm later (without an SDK release)
+
+Everything the fingerprint is computed from is stored (`log_type`,
+`message`, `stack`, `embedded_exception`). To change it:
+
+1. Change `internal/fingerprint`, bump `Version`, regenerate the vectors
+   (`go test ./internal/fingerprint -run TestVectors -update`) and review
+   the diff: every changed fingerprint is a regrouping.
+2. Deploy. New events get the new fingerprint and `fingerprint_version`.
+   Stored rows keep theirs (the column says which version made them) and
+   expire with the TTL, so for up to 30 days a bug can show as two groups,
+   one per version.
+3. Port the change to `ExceptionParser.cs` in the next SDK release. Until
+   then the device de-duplicates with the old algorithm, which is harmless
+   as long as it does not group *more* coarsely than the server (a repeat
+   count would be attributed to the first occurrence's group).
+
+An event stored before the bump and re-sent after it (APM-19: the app was
+killed between the server's answer and the local delete) gets the new
+fingerprint, so neither the duplicate lookup nor the ReplacingMergeTree
+(fingerprint is in the sort key) finds the stored copy: it is stored twice.
+This needs the rare re-send to straddle the deploy.
+
+Regrouping stored rows at once is not provided: `fingerprint` is in the sort
+key and cannot be updated in place. It would mean re-inserting the rows with
+the new fingerprint (keeping their `event_id`) and deleting the old ones as
+an admin (`ALTER TABLE ... DELETE`, a mutation), which also double-counts in
+the `apm_exception_daily` view.
+
+### SDK
+
+- The repeat path (the same text again within the 60-second window) is a
+  hash lookup of the message and stack: no parsing and **no allocation**
+  (before: Regex + MD5 + string formatting, about 2.4 KB per call).
+  Measured on Unity's Mono 2022.3 outside Unity (M-series Mac): 0.31 us per
+  repeat of a 700-character error, 3.1 us for an 8 KB one, 0 bytes; the
+  code before APM-4: 2.2 us and 2400 bytes per repeat.
+- Parsing happens once per distinct text and window: 13-14 us and 18 KB for
+  a typical bus error (3 frames), about 70 us and 138 KB for an 8 KB message
+  with a 60-frame inner chain (compacted to 4.4 KB), event and breadcrumbs
+  included. Not measured on a device.
+- Breadcrumbs are recorded without formatting (ring of 50) and formatted
+  only when an exception is first seen; an exception records one breadcrumb
+  per group and window (it was one per log call).
+- `ExceptionParser` is plain C# (no Regex, no UnityEngine, no reflection),
+  IL2CPP and stripping safe; the log callback still swallows everything.
+
+### Verified
+
+- `go test ./...`: unit tests incl. a stack corpus (real output of Unity
+  2022.3's Mono and `UnityEngine.StackTraceUtility`, IL2CPP with and without
+  line numbers, .NET, Unity LogError/LogException formats, the GameEventBus
+  wrapper, inner chains of 2 and 3, AggregateException, async rethrow,
+  ids/GUIDs/numbers), the golden vectors, a fuzz test (33M inputs), hostile
+  input, and ingest of SDK-serialized events. Mono and IL2CPP stacks of the
+  same code, and changed line numbers, give the same fingerprint.
+- Integration tests on ClickHouse 26.1.12, 24.1.8 and 23.8.16: both insert
+  paths round-trip every new column; ingest -> ClickHouse -> admin API for
+  two handlers (two groups with type and throw site), five roomIds (one
+  group, distribution by roomId), an inner chain, an old-SDK event; rows
+  written with the previous binary's INSERT open as version-0 groups.
+- Migration rehearsal on each version (a program outside the repo): the
+  4f0bf21 schema (its `migrate.sql`: ReplacingMergeTree, TTL, four views,
+  APM-5 columns), servers as a copy of the `apm` account (26.1, 24.1; 23.8
+  has no access management for `default`); the 4f0bf21 binary ingesting 25
+  batches/s (new-SDK and old-SDK exceptions, perf samples) while the new
+  binary starts and migrates (about 0.2 s), then both serving: 225 batches,
+  1362 events with ids and 225 old-SDK events each stored exactly once;
+  `apm_exception_daily` equal to the table's `sum(count)`; TTL and engine
+  kept; old-binary rows at version 0 with empty new columns, new-binary rows
+  at version 1 with type, sites, breadcrumbs and embedded exception; the
+  server fingerprint equal to the SDK's for every new-SDK event; the bus
+  errors of two handlers and many roomIds in 2 groups; re-sends old -> new
+  and new -> old dropped as duplicates; admin list and detail of both
+  binaries on the migrated table; then the old binary alone (rollback: 20
+  batches, all stored once) and the new binary again (no migration, no
+  warnings); no warning or error in any server log.
+- SDK: compiles at C# 8 with and without `UNITY_2021_2_OR_NEWER`; the
+  parser matches all 22 golden vectors on .NET 6; on Unity's Mono (outside
+  Unity) 13 of the 19 new EditMode tests run and pass, the 6 that need the
+  Unity runtime (Unity's stack capture, the allocation constraint) were
+  compiled but not run here.
