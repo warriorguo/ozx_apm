@@ -21,6 +21,9 @@ import (
 //	ctx                   key:value, repeatable. The same key repeated is an
 //	                      OR, different keys are ANDed. "key:" matches events
 //	                      without the key. At most models.MaxContextFilters.
+//	first_error           1/true: exceptions only where the occurrence was
+//	                      the first error of its session (APM-3); 0/false or
+//	                      absent: all. Other tables are not filtered.
 //
 // Context keys and values are only ever bound as query arguments.
 func parseAdminFilter(q url.Values, defaultRange time.Duration) (models.AdminFilter, error) {
@@ -46,6 +49,14 @@ func parseAdminFilter(q url.Values, defaultRange time.Duration) (models.AdminFil
 		f.BuildType = bt
 	default:
 		return f, fmt.Errorf("build_type must be one of release, dev, editor, unknown, all")
+	}
+
+	switch fe := q.Get("first_error"); fe {
+	case "", "0", "false":
+	case "1", "true":
+		f.FirstErrorOnly = true
+	default:
+		return f, fmt.Errorf("first_error must be 1, true, 0 or false")
 	}
 
 	ctxParams := q["ctx"]

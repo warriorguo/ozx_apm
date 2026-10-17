@@ -50,6 +50,18 @@ func adminWhere(f models.AdminFilter) (string, []interface{}) {
 	return "WHERE " + strings.Join(conds, " AND "), args
 }
 
+// tableWhere is adminWhere for one table. On apm_exceptions it also applies
+// the exception-only filter first_error (APM-3): only rows whose (first)
+// occurrence was the first error of its session (error_seq = 1). Rows of
+// SDKs before APM-3 have error_seq 0 and never match it.
+func tableWhere(table string, f models.AdminFilter) (string, []interface{}) {
+	where, args := adminWhere(f)
+	if f.FirstErrorOnly && table == TableExceptions.Name {
+		where += " AND error_seq = 1"
+	}
+	return where, args
+}
+
 // GetDashboardSummary returns aggregated metrics for the dashboard
 func (r *Repository) GetDashboardSummary(ctx context.Context, f models.AdminFilter) (*models.DashboardSummary, error) {
 	summary := &models.DashboardSummary{
@@ -74,8 +86,9 @@ func (r *Repository) GetDashboardSummary(ctx context.Context, f models.AdminFilt
 		return nil, fmt.Errorf("crash count: %w", err)
 	}
 
-	excQuery := fmt.Sprintf(`SELECT toInt64(sum(count)) FROM apm_exceptions %s`, whereClause)
-	if err := r.client.conn.QueryRow(ctx, excQuery, args...).Scan(&summary.ExceptionCount); err != nil {
+	excWhere, excArgs := tableWhere(TableExceptions.Name, f)
+	excQuery := fmt.Sprintf(`SELECT toInt64(sum(count)) FROM apm_exceptions %s`, excWhere)
+	if err := r.client.conn.QueryRow(ctx, excQuery, excArgs...).Scan(&summary.ExceptionCount); err != nil {
 		return nil, fmt.Errorf("exception count: %w", err)
 	}
 
@@ -147,8 +160,6 @@ func (r *Repository) GetDashboardSummary(ctx context.Context, f models.AdminFilt
 // GetTimeSeries returns time series data for a metric. interval is one of a
 // fixed set chosen by the handler, never user input.
 func (r *Repository) GetTimeSeries(ctx context.Context, metric, interval string, f models.AdminFilter) ([]models.TimeSeriesPoint, error) {
-	whereClause, args := adminWhere(f)
-
 	// The value is always scanned into a float64, so every expression is
 	// converted to Float64 (count() is UInt64, avg(Float32) can be NaN).
 	var table, value string
@@ -170,6 +181,7 @@ func (r *Repository) GetTimeSeries(ctx context.Context, metric, interval string,
 	default:
 		return nil, fmt.Errorf("unknown metric: %s", metric)
 	}
+	whereClause, args := tableWhere(table, f)
 	query := fmt.Sprintf(`
 		SELECT toStartOfInterval(timestamp, INTERVAL %s) as t, %s
 		FROM %s %s
@@ -515,7 +527,7 @@ func (r *Repository) GetCrashDetail(ctx context.Context, fingerprint string, f m
 
 // GetExceptionGroups returns grouped exception data
 func (r *Repository) GetExceptionGroups(ctx context.Context, f models.AdminFilter, page, pageSize int) ([]models.ExceptionGroup, int64, error) {
-	whereClause, args := adminWhere(f)
+	whereClause, args := tableWhere(TableExceptions.Name, f)
 
 	// Get total count
 	countQuery := fmt.Sprintf(`SELECT toInt64(uniqExact(fingerprint)) FROM apm_exceptions %s`, whereClause)
@@ -564,12 +576,15 @@ const exceptionGroupColumns = `
 			argMax(exception_type, timestamp) as exception_type,
 			argMax(message_template, timestamp) as message_template,
 			argMax(throw_site, timestamp) as throw_site,
-			argMax(call_site, timestamp) as call_site`
+			argMax(call_site, timestamp) as call_site,
+			toInt64(uniqExactIf(session_id, error_seq = 1)) as first_error_sessions,
+			toInt64(sumIf(count, unhandled != '')) as unhandled_count`
 
 func scanExceptionGroup(rows interface{ Scan(dest ...any) error }, e *models.ExceptionGroup) error {
 	var version int64
 	if err := rows.Scan(&e.Fingerprint, &e.Message, &e.Count, &e.SessionCount, &e.FirstSeen, &e.LastSeen,
-		&version, &e.ExceptionType, &e.MessageTemplate, &e.ThrowSite, &e.CallSite); err != nil {
+		&version, &e.ExceptionType, &e.MessageTemplate, &e.ThrowSite, &e.CallSite,
+		&e.FirstErrorSessions, &e.UnhandledCount); err != nil {
 		return err
 	}
 	e.FingerprintVersion = int(version)
@@ -585,7 +600,7 @@ const exceptionOccurrences = 20
 // and breadcrumbs, and the version and device distributions. nil when no row
 // of the group matches the filter.
 func (r *Repository) GetExceptionDetail(ctx context.Context, fp string, f models.AdminFilter) (*models.ExceptionDetail, error) {
-	whereClause, args := adminWhere(f)
+	whereClause, args := tableWhere(TableExceptions.Name, f)
 	whereClause += " AND fingerprint = ?"
 	args = append(args, fp)
 
@@ -606,6 +621,7 @@ func (r *Repository) GetExceptionDetail(ctx context.Context, fp string, f models
 	row := r.client.conn.QueryRow(ctx, query, args...)
 	if err := row.Scan(&detail.Fingerprint, &detail.Message, &detail.Count, &detail.SessionCount, &detail.FirstSeen, &detail.LastSeen,
 		&version, &detail.ExceptionType, &detail.MessageTemplate, &detail.ThrowSite, &detail.CallSite,
+		&detail.FirstErrorSessions, &detail.UnhandledCount,
 		&detail.FirstVersion, &detail.LastVersion); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil
@@ -636,7 +652,7 @@ func (r *Repository) GetExceptionDetail(ctx context.Context, fp string, f models
 
 	occQuery := fmt.Sprintf(`
 		SELECT timestamp, event_id, toInt64(count), app_version, build_type, platform, device_model, os_version,
-			scene, session_id, ctx, breadcrumbs
+			scene, session_id, ctx, breadcrumbs, toInt64(error_seq), toInt64(session_ms), unhandled, ctx_merged = 1
 		FROM apm_exceptions
 		%s
 		ORDER BY timestamp DESC, event_id
@@ -645,7 +661,8 @@ func (r *Repository) GetExceptionDetail(ctx context.Context, fp string, f models
 	err := r.queryRows(ctx, occQuery, args, func(rows driver.Rows) error {
 		var o models.ExceptionOccurrence
 		if err := rows.Scan(&o.Timestamp, &o.EventID, &o.Count, &o.AppVersion, &o.BuildType, &o.Platform, &o.DeviceModel,
-			&o.OSVersion, &o.Scene, &o.SessionID, &o.Context, &o.Breadcrumbs); err != nil {
+			&o.OSVersion, &o.Scene, &o.SessionID, &o.Context, &o.Breadcrumbs,
+			&o.ErrorSeq, &o.SessionMs, &o.Unhandled, &o.CtxMerged); err != nil {
 			return err
 		}
 		if o.Context == nil {
@@ -740,10 +757,10 @@ func contextSourceTables(source string) ([]string, error) {
 // part gets the full argument list: before (arguments that precede the
 // WHERE clause), the filter's, then after.
 func unionOverTables(tables []string, inner string, f models.AdminFilter, before, after []interface{}) (string, []interface{}) {
-	whereClause, whereArgs := adminWhere(f)
 	parts := make([]string, len(tables))
 	var args []interface{}
 	for i, t := range tables {
+		whereClause, whereArgs := tableWhere(t, f)
 		parts[i] = fmt.Sprintf(inner, t, whereClause)
 		args = append(args, before...)
 		args = append(args, whereArgs...)
@@ -834,12 +851,17 @@ const contextDistributionRows = 50
 // GetContextDistribution groups the filtered events of one metric by the
 // value of a context key. fingerprint, if set, narrows exceptions/crashes to
 // one group (ignored for other metrics).
+//
+// Exceptions are counted as occurrences (sum of count). A row whose count
+// merges occurrences in different contexts (ctx_merged, APM-3) and lacks the
+// key had several values for it: such occurrences are reported as Merged,
+// not under the empty value ("key not set"). Total includes them.
 func (r *Repository) GetContextDistribution(ctx context.Context, f models.AdminFilter, metric, key, fingerprint string) (*models.ContextDistribution, error) {
 	m, ok := contextMetrics[metric]
 	if !ok {
 		return nil, fmt.Errorf("unknown metric: %s", metric)
 	}
-	whereClause, whereArgs := adminWhere(f)
+	whereClause, whereArgs := tableWhere(m.table, f)
 	if fingerprint != "" && m.value == "" {
 		whereClause += " AND fingerprint = ?"
 		whereArgs = append(whereArgs, fingerprint)
@@ -855,14 +877,25 @@ func (r *Repository) GetContextDistribution(ctx context.Context, f models.AdminF
 		return nil, fmt.Errorf("total: %w", err)
 	}
 
+	rowsWhere, rowsArgs := whereClause, whereArgs
+	if m.table == TableExceptions.Name {
+		mergedArgs := append(append([]interface{}{}, whereArgs...), key)
+		mergedQuery := fmt.Sprintf(`SELECT toInt64(sum(count)) FROM %s %s AND ctx_merged = 1 AND NOT mapContains(ctx, ?)`, m.table, whereClause)
+		if err := r.client.conn.QueryRow(ctx, mergedQuery, mergedArgs...).Scan(&dist.Merged); err != nil {
+			return nil, fmt.Errorf("merged: %w", err)
+		}
+		rowsWhere += " AND NOT (ctx_merged = 1 AND NOT mapContains(ctx, ?))"
+		rowsArgs = mergedArgs
+	}
+
 	query := fmt.Sprintf(`
 		SELECT ctx[?] AS value, toInt64(%s) AS cnt, toInt64(uniqExact(session_id)) AS sessions, %s AS p50, %s AS p95
 		FROM %s %s
 		GROUP BY value
 		ORDER BY cnt DESC, value
 		LIMIT %d
-	`, m.count, p50, p95, m.table, whereClause, contextDistributionRows+1)
-	args := append([]interface{}{key}, whereArgs...)
+	`, m.count, p50, p95, m.table, rowsWhere, contextDistributionRows+1)
+	args := append([]interface{}{key}, rowsArgs...)
 	err := r.queryRows(ctx, query, args, func(rows driver.Rows) error {
 		var row models.ContextDistributionRow
 		if err := rows.Scan(&row.Value, &row.Count, &row.Sessions, &row.P50, &row.P95); err != nil {

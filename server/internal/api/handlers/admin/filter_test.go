@@ -36,6 +36,21 @@ func TestParseAdminFilter_BuildTypes(t *testing.T) {
 	}
 }
 
+// APM-3: first_error=1 keeps only exceptions that were their session's first error.
+func TestParseAdminFilter_FirstError(t *testing.T) {
+	for v, want := range map[string]bool{"": false, "0": false, "false": false, "1": true, "true": true} {
+		f, err := parseAdminFilter(url.Values{"first_error": {v}}, time.Hour)
+		if err != nil || f.FirstErrorOnly != want {
+			t.Errorf("%q: %v %v", v, f.FirstErrorOnly, err)
+		}
+	}
+	for _, v := range []string{"yes", "2", "1 OR 1=1"} {
+		if _, err := parseAdminFilter(url.Values{"first_error": {v}}, time.Hour); err == nil {
+			t.Errorf("%q accepted", v)
+		}
+	}
+}
+
 func TestParseAdminFilter_Context(t *testing.T) {
 	f, err := parseAdminFilter(url.Values{"ctx": {"levelId:3", "roomId:r:1", "levelId:4", "panel:"}}, time.Hour)
 	if err != nil {

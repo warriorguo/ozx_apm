@@ -133,6 +133,10 @@ export interface ExceptionGroup {
   message_template?: string
   throw_site?: string
   call_site?: string
+  // APM-3: sessions where this group was the first error, and occurrences no
+  // code caught. Absent from older servers, 0 for rows of older SDKs.
+  first_error_sessions?: number
+  unhandled_count?: number
 }
 
 export interface ExceptionListResponse {
@@ -209,6 +213,9 @@ export interface ContextDistribution {
   total: number
   truncated: boolean
   rows: ContextDistributionRow[]
+  // APM-3 (exceptions): occurrences whose value of the key is unknown because
+  // the SDK merged them across contexts; not in rows.
+  merged?: number
 }
 
 export interface PaginationParams {

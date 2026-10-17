@@ -147,6 +147,11 @@ type ExceptionGroup struct {
 	MessageTemplate    string `json:"message_template"`
 	ThrowSite          string `json:"throw_site"`
 	CallSite           string `json:"call_site"`
+	// APM-3: sessions in which this group was the first error (error_seq 1),
+	// and occurrences of it that no code caught (unhandled). 0 for rows of
+	// older SDKs.
+	FirstErrorSessions int64 `json:"first_error_sessions"`
+	UnhandledCount     int64 `json:"unhandled_count"`
 }
 
 // ExceptionDetail is one exception group for the detail page (APM-11): the
@@ -181,7 +186,8 @@ type ExceptionSample struct {
 }
 
 // ExceptionOccurrence is one stored event of the group (a first occurrence
-// in a de-duplication window, or the repeat count of that window).
+// in a de-duplication window, or the repeat count of that window in one game
+// context).
 type ExceptionOccurrence struct {
 	Timestamp   time.Time         `json:"timestamp"`
 	EventID     string            `json:"event_id"`
@@ -195,6 +201,15 @@ type ExceptionOccurrence struct {
 	SessionID   string            `json:"session_id"`
 	Context     map[string]string `json:"context"`
 	Breadcrumbs []string          `json:"breadcrumbs"`
+	// APM-3 (0 / "" / false for rows of older SDKs): which error of its
+	// session the row's first occurrence was, the milliseconds since the
+	// session started, how it was unhandled ("", "domain",
+	// "domain_terminating", "task"), and whether Count merges occurrences in
+	// different contexts (Context then holds only what they shared).
+	ErrorSeq  int64  `json:"error_seq"`
+	SessionMs int64  `json:"session_ms"`
+	Unhandled string `json:"unhandled"`
+	CtxMerged bool   `json:"ctx_merged"`
 }
 
 type ExceptionListResponse struct {
@@ -221,6 +236,9 @@ type AdminFilter struct {
 	Platform   string
 	BuildType  string
 	Context    []ContextFilter
+	// FirstErrorOnly (first_error=1, APM-3) keeps only exception rows whose
+	// occurrence was the first error of its session; other tables ignore it.
+	FirstErrorOnly bool
 }
 
 type ContextFilter struct {
@@ -279,4 +297,7 @@ type ContextDistribution struct {
 	Total     int64                    `json:"total"`
 	Truncated bool                     `json:"truncated"` // more values than rows
 	Rows      []ContextDistributionRow `json:"rows"`
+	// Merged (exceptions, APM-3): occurrences whose value of the key is not
+	// known because the SDK merged them across contexts; not in Rows.
+	Merged int64 `json:"merged"`
 }
