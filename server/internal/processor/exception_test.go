@@ -1,6 +1,8 @@
 package processor
 
 import (
+	"encoding/json"
+	"os"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -59,6 +61,33 @@ func TestApplyFingerprint_LegacyEvent(t *testing.T) {
 	}
 	if d.ExceptionType != "NullReferenceException" || d.Breadcrumbs == nil || d.InnerExceptions == nil {
 		t.Errorf("%+v", d)
+	}
+}
+
+// testdata/sdk_events.jsonl are exception events as the SDK writes them
+// (ExceptionCollector + JsonSerializer, run on Unity's Mono): a bus error,
+// its repeat count, a compacted 60-frame inner chain, a logged exception, a
+// plain error with non-ASCII text and an assert. The server must compute the
+// fingerprint the SDK computed, or the device and the server group differently.
+func TestApplyFingerprint_MatchesTheSDK(t *testing.T) {
+	b, err := os.ReadFile("testdata/sdk_events.jsonl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	for _, line := range strings.Split(strings.TrimSpace(string(b)), "\n") {
+		var e models.Exception
+		if err := json.Unmarshal([]byte(line), &e); err != nil {
+			t.Fatal(err)
+		}
+		ApplyFingerprint(&e)
+		if e.Fingerprint != e.ClientFingerprint {
+			t.Errorf("server %s, SDK %s: %.120q", e.Fingerprint, e.ClientFingerprint, e.Message)
+		}
+		n++
+	}
+	if n != 6 {
+		t.Errorf("%d events", n)
 	}
 }
 
