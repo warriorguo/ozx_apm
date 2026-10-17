@@ -53,23 +53,30 @@ namespace OzxApm.Utils
     }
 
     /// <summary>
-    /// Counts per bucket key (MetricBuckets) in sorted arrays of fixed capacity:
-    /// adding a sample allocates nothing. When a sample needs a new key and
-    /// all Capacity keys are in use, the two lowest keys are merged (their
-    /// samples are then read as the higher one): only quantiles in the lowest
-    /// part of the distribution lose accuracy, and only when one series spans
-    /// more than gamma^Capacity (about 160x at 128 keys) within one window.
-    /// Not thread-safe.
+    /// Counts per bucket key (MetricBuckets) in sorted arrays: adding a sample
+    /// allocates nothing unless the arrays must grow (doubling, up to
+    /// maxCapacity keys; a histogram reused across windows keeps its size).
+    /// When a sample needs a new key and maxCapacity keys are in use, the two
+    /// lowest keys are merged (their samples are then read as the higher one):
+    /// only quantiles in the lowest part of the distribution lose accuracy,
+    /// and only when one series spans more than gamma^maxCapacity (about
+    /// 8e8 x at 512 keys) within one window. Not thread-safe.
     /// </summary>
     internal sealed class MetricHistogram
     {
-        private readonly int[] _keys;
-        private readonly long[] _counts;
+        private int[] _keys;
+        private long[] _counts;
         private int _length;
+        private readonly int _maxCapacity;
 
-        public MetricHistogram(int capacity)
+        public MetricHistogram(int capacity) : this(capacity, capacity)
         {
-            _keys = new int[Math.Max(2, capacity)];
+        }
+
+        public MetricHistogram(int initialCapacity, int maxCapacity)
+        {
+            _maxCapacity = Math.Max(2, maxCapacity);
+            _keys = new int[Math.Max(2, Math.Min(initialCapacity, _maxCapacity))];
             _counts = new long[_keys.Length];
         }
 
@@ -96,6 +103,12 @@ namespace OzxApm.Utils
                 return;
             }
             i = ~i;
+            if (_length == _keys.Length && _keys.Length < _maxCapacity)
+            {
+                int size = Math.Min(_maxCapacity, _keys.Length * 2);
+                Array.Resize(ref _keys, size);
+                Array.Resize(ref _counts, size);
+            }
             if (_length == _keys.Length)
             {
                 Collapsed = true;

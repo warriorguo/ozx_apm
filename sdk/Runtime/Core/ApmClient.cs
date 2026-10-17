@@ -1043,6 +1043,7 @@ namespace OzxApm.Core
             }
             stats.CustomRejected = CustomCollector.RejectedCount;
             stats.TimersSpanningPause = TimerRegistry.SpanningPauseCount;
+            stats.TimersUntracked = TimerRegistry.UntrackedCount;
             if (client._timeline != null)
                 stats.LogLinesSeen = client._timeline.LogLinesSeen;
             stats.LastUpdateMs = client._lastUpdateTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
@@ -1294,6 +1295,9 @@ namespace OzxApm.Core
         {
             try
             {
+                // The current window of custom metrics and counts too (it would
+                // otherwise be lost with the process).
+                _customCollector?.FlushPending();
                 var storage = _offlineStorage;
                 if (storage == null)
                     return;

@@ -12,10 +12,11 @@ namespace OzxApm.Collectors
     /// and the timers.
     ///
     /// Events: every call goes onto the time line (Timeline: the breadcrumbs
-    /// later exceptions and janks carry). The first MaxEventsPerWindow calls
-    /// of a window (ApmConfig.MaxCustomEventsPerMinute) are each sent as an
-    /// event with their properties; further calls are counted per (name,
-    /// game context) and sent as one event per count at the end of the window
+    /// later exceptions and janks carry). Per minute, the first
+    /// ApmConfig.MaxCustomEventsPerMinute calls (at most
+    /// MaxEventsPerNamePerMinute of one name) are each sent as an event with
+    /// their properties; further calls are counted per (name, game context)
+    /// and sent as one event per count at the end of the window
     /// ("aggregated": properties not kept). So sum(count) per name is exact.
     ///
     /// Metrics: samples are aggregated per (name, game context) and window:
@@ -43,7 +44,15 @@ namespace OzxApm.Collectors
         internal const int MaxSeriesPerWindow = 128;
         internal const int MaxSeriesPerName = 16;
         internal const int MaxNamesPerWindow = 64;
-        internal const int HistogramCapacity = 128;
+        // Histogram keys per series: starts small, grows to the maximum (8e8 x
+        // spread at 2%) and keeps its size when the series is reused.
+        internal const int HistogramInitialCapacity = 64;
+        internal const int HistogramMaxCapacity = 512;
+        // Events sent one by one per name within the per-minute budget, so one
+        // frequent name cannot use up the budget of all the others.
+        internal const int MaxEventsPerNamePerMinute = 10;
+        internal const int BudgetMs = 60000;
+        private const int MaxBudgetNames = 64;
         // Names remembered across windows (so a name seen before costs no
         // allocation); beyond this the table is reset at the end of a window.
         private const int MaxRememberedNames = 4 * MaxNamesPerWindow;
@@ -70,7 +79,11 @@ namespace OzxApm.Collectors
         private int _windowId;
         private int _windowGeneration = int.MinValue;
         private string _windowSessionId;
+        // The budget of individually sent events has its own minute: closing a
+        // window (Flush, pause) does not renew it.
+        private int _budgetStartTick;
         private int _eventsSent;
+        private readonly Dictionary<string, int> _sentPerName = new Dictionary<string, int>(StringComparer.Ordinal);
         private int _seriesUsed;
         private int _eventNamesUsed;
         private int _metricNamesUsed;
@@ -154,9 +167,32 @@ namespace OzxApm.Collectors
             {
                 _windowStartMs = Timeline.NowMs();
                 Volatile.Write(ref _windowStartTick, Environment.TickCount);
+                _budgetStartTick = Environment.TickCount;
                 SyncSessionLocked();
             }
         }
+
+        // Caller holds _sync. True if this call of name may be sent on its own.
+        private bool TakeBudgetLocked(string name)
+        {
+            int now = Environment.TickCount;
+            if (unchecked(now - _budgetStartTick) >= BudgetMs)
+            {
+                _budgetStartTick = now;
+                _eventsSent = 0;
+                _sentPerName.Clear();
+            }
+            if (_eventsSent >= MaxEventsPerWindow)
+                return false;
+            _sentPerName.TryGetValue(name, out int sent);
+            if (sent >= MaxEventsPerNamePerMinute || (sent == 0 && _sentPerName.Count >= MaxBudgetNames))
+                return false;
+            _sentPerName[name] = sent + 1;
+            _eventsSent++;
+            return true;
+        }
+
+        internal void ExpireBudgetForTests() => _budgetStartTick = Environment.TickCount - BudgetMs - 1;
 
         public void Update()
         {
@@ -228,7 +264,6 @@ namespace OzxApm.Collectors
             }
             long now = Timeline.NowMs();
             var ctx = GameContext.Current;
-            _timeline?.RecordEvent(name, props, now);
 
             CustomEvent evt = null;
             List<BaseEvent> closed;
@@ -236,11 +271,13 @@ namespace OzxApm.Collectors
             {
                 if (!_isActive)
                     return false;
+                // On the time line only once it is certain to be collected (a
+                // consent withdrawal clears the time line after Stop).
+                _timeline?.RecordEvent(name, props, now);
                 closed = SyncSessionLocked();
                 _eventsTracked++;
-                if (_eventsSent < MaxEventsPerWindow)
+                if (TakeBudgetLocked(name))
                 {
-                    _eventsSent++;
                     evt = new CustomEvent { timestamp = now, name = name, props = props, ctx = ctx };
                 }
                 else
@@ -362,8 +399,9 @@ namespace OzxApm.Collectors
                     return false;
                 closed = SyncSessionLocked();
                 var s = FindSeriesLocked(true, name, ctx, 0);
-                if (s == null)
+                if (s == null || double.IsInfinity(s.Sum + value))
                 {
+                    // Beyond the name limit, or a sum the wire cannot carry.
                     _samplesDropped++;
                 }
                 else
@@ -490,7 +528,7 @@ namespace OzxApm.Collectors
             if (metric)
             {
                 if (s.Hist == null)
-                    s.Hist = new MetricHistogram(HistogramCapacity);
+                    s.Hist = new MetricHistogram(HistogramInitialCapacity, HistogramMaxCapacity);
                 else
                     s.Hist.Clear();
             }
@@ -561,7 +599,6 @@ namespace OzxApm.Collectors
                 if (_metricNames.Count > MaxRememberedNames)
                     _metricNames.Clear();
             }
-            _eventsSent = 0;
             _seriesUsed = 0;
             _eventNamesUsed = 0;
             _metricNamesUsed = 0;

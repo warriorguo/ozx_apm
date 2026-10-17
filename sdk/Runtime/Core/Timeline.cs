@@ -8,36 +8,40 @@ namespace OzxApm.Core
 {
     /// <summary>
     /// What happened before an exception, a crash or a jank (APM-6): one time
-    /// line made of two rings, merged by time when an event is sent.
+    /// line made of three rings, merged in the order things were recorded when
+    /// an event takes a snapshot.
     ///
     /// - Breadcrumbs (MaxBreadcrumbs): custom events (ApmClient.TrackEvent,
     ///   with their properties), scene loads, exceptions (first occurrence of
     ///   a group per window) and ApmClient.RecordBreadcrumb texts.
-    /// - Recent log lines (MaxLogLines): every Warning, Error and Assert line
-    ///   the game logs on any thread (Unity's log callback, shared with
-    ///   ExceptionCollector through ILogSink); not plain Log lines, not
-    ///   exceptions (those are breadcrumbs), not the SDK's own output. A line
-    ///   of the same shape (equal up to the digits, e.g. another roomId) as
-    ///   one of the LogDedupeDepth most recent lines is not stored again: the
-    ///   earlier one counts it ("(x37 until 12:00:05.120)"), so a line logged
-    ///   every frame does not push older ones out. Errors cannot push
-    ///   warnings out of the ring beyond that: both share it.
+    /// - Recent Warning lines (MaxWarningLines) and recent Error/Assert lines
+    ///   (MaxErrorLines) the game logs on any thread (Unity's log callback,
+    ///   shared with ExceptionCollector through ILogSink); not plain Log lines,
+    ///   not exceptions (those are breadcrumbs), not the SDK's own output. A
+    ///   line of the same shape (equal up to the digits, e.g. another roomId)
+    ///   as one of the LogDedupeDepth most recent lines of its ring is not
+    ///   stored again: the earlier one counts it ("(x37 until 12:00:05.120)"),
+    ///   so a line logged every frame does not push older ones out.
     ///
-    /// The two rings are separate so that log spam cannot evict the custom
-    /// events, and custom-event spam cannot evict the warnings.
+    /// The rings are separate so that warning spam cannot evict the errors or
+    /// the custom events, and the other way round.
     ///
     /// Cost: recording stores references (the game's or Unity's strings) and
-    /// the time under a lock: no allocation, no formatting. A log line longer
-    /// than MaxStoredLogLength is stored as a cut copy (only such lines
-    /// allocate), so at most MaxLogLines x MaxStoredLogLength characters are
-    /// kept alive. Text is formatted and cut to its length limit only when an
-    /// event takes a snapshot. Thread-safe; the lock is a leaf (nothing is
-    /// logged or called while it is held).
+    /// the time under a lock: no allocation, no formatting. A new log line
+    /// longer than MaxStoredLogLength is stored as a cut copy (only such lines
+    /// allocate, and only when they are not a repeat), so at most
+    /// (MaxWarningLines + MaxErrorLines) x MaxStoredLogLength characters are
+    /// kept alive. Text is formatted, cut to its length limit and has the
+    /// query strings of http(s) URLs removed only when an event takes a
+    /// snapshot. Thread-safe; the lock is a leaf (nothing is logged or called
+    /// while it is held).
     /// </summary>
     internal sealed class Timeline : ILogSink
     {
         internal const int MaxBreadcrumbs = 50;
-        internal const int MaxLogLines = 32;
+        internal const int MaxWarningLines = 24;
+        internal const int MaxErrorLines = 12;
+        internal const int MaxLogLines = MaxWarningLines + MaxErrorLines;
         internal const int LogDedupeDepth = 8;
         internal const int MaxStoredLogLength = 4096;
         // Characters of a log line hashed for the shape comparison.
@@ -56,23 +60,49 @@ namespace OzxApm.Core
         private int _crumbStart;
         private int _crumbCount;
 
-        private readonly long[] _logTimes = new long[MaxLogLines];
-        private readonly long[] _logLastTimes = new long[MaxLogLines];
-        private readonly string[] _logTexts = new string[MaxLogLines];
-        private readonly int[] _logCounts = new int[MaxLogLines];
-        private readonly ulong[] _logShapes = new ulong[MaxLogLines];
-        private readonly LogType[] _logTypes = new LogType[MaxLogLines];
-        private readonly long[] _logSeqs = new long[MaxLogLines];
-        // Order of recording across both rings: the merge order.
+        private readonly LogRing _warnings = new LogRing(MaxWarningLines);
+        private readonly LogRing _errors = new LogRing(MaxErrorLines);
+        // Order of recording across all rings: the merge order.
         private long _seq;
-        private int _logStart;
-        private int _logCount;
         private long _logLinesSeen;
 
         private readonly StringBuilder _sb = new StringBuilder(256);
-        // Snapshot merge scratch (under _lock).
+        // Snapshot scratch (under _lock).
         private readonly int[] _pickCrumbs = new int[MaxBreadcrumbs];
-        private readonly int[] _pickLogs = new int[MaxLogLines];
+        private readonly LogRing[] _pickLogRing = new LogRing[MaxLogLines];
+        private readonly int[] _pickLogIndex = new int[MaxLogLines];
+
+        /// <summary>One ring of log lines (guarded by the Timeline's lock).</summary>
+        private sealed class LogRing
+        {
+            public readonly int Capacity;
+            public readonly long[] Times, LastTimes, Seqs;
+            public readonly string[] Texts;
+            public readonly int[] Counts;
+            public readonly ulong[] Shapes;
+            public readonly LogType[] Types;
+            public int Start, Count;
+
+            public LogRing(int capacity)
+            {
+                Capacity = capacity;
+                Times = new long[capacity];
+                LastTimes = new long[capacity];
+                Seqs = new long[capacity];
+                Texts = new string[capacity];
+                Counts = new int[capacity];
+                Shapes = new ulong[capacity];
+                Types = new LogType[capacity];
+            }
+
+            public int At(int k) => (Start + k) % Capacity;
+
+            public void Clear()
+            {
+                Array.Clear(Texts, 0, Capacity);
+                Start = Count = 0;
+            }
+        }
 
         /// <summary>Warning/Error/Assert lines recorded (repeats counted) since start.</summary>
         internal long LogLinesSeen
@@ -134,7 +164,7 @@ namespace OzxApm.Core
         /// ILogSink: called by ExceptionCollector's log callback for every log
         /// line, on the logging thread. Records Warning, Error and Assert lines;
         /// true if the line is on the time line. Never throws, never logs; no
-        /// allocation unless the line is longer than MaxStoredLogLength.
+        /// allocation unless a new line is longer than MaxStoredLogLength.
         /// </summary>
         public bool OnLog(string message, string stackTrace, LogType type, bool mainThread)
         {
@@ -143,35 +173,36 @@ namespace OzxApm.Core
             if (string.IsNullOrEmpty(message) || message.StartsWith(ApmClient.LogPrefix, StringComparison.Ordinal))
                 return false;
             ulong shape = ShapeHash(message);
-            string stored = message.Length > MaxStoredLogLength ? message.Substring(0, MaxStoredLogLength) : message;
+            var ring = type == LogType.Warning ? _warnings : _errors;
             lock (_lock)
             {
                 long now = NowMs();
                 _logLinesSeen++;
-                int depth = Math.Min(LogDedupeDepth, _logCount);
+                int depth = Math.Min(LogDedupeDepth, ring.Count);
                 for (int k = 0; k < depth; k++)
                 {
-                    int j = (_logStart + _logCount - 1 - k) % MaxLogLines;
-                    if (_logShapes[j] == shape && _logTypes[j] == type)
+                    int j = ring.At(ring.Count - 1 - k);
+                    if (ring.Shapes[j] == shape && ring.Types[j] == type)
                     {
-                        if (_logCounts[j] < int.MaxValue)
-                            _logCounts[j]++;
-                        _logLastTimes[j] = now;
+                        if (ring.Counts[j] < int.MaxValue)
+                            ring.Counts[j]++;
+                        ring.LastTimes[j] = now;
                         return true;
                     }
                 }
-                int i = (_logStart + _logCount) % MaxLogLines;
-                if (_logCount == MaxLogLines)
-                    _logStart = (_logStart + 1) % MaxLogLines;
+                int i = ring.At(ring.Count);
+                if (ring.Count == ring.Capacity)
+                    ring.Start = (ring.Start + 1) % ring.Capacity;
                 else
-                    _logCount++;
-                _logTimes[i] = now;
-                _logSeqs[i] = ++_seq;
-                _logLastTimes[i] = now;
-                _logTexts[i] = stored;
-                _logCounts[i] = 1;
-                _logShapes[i] = shape;
-                _logTypes[i] = type;
+                    ring.Count++;
+                ring.Times[i] = now;
+                ring.LastTimes[i] = now;
+                ring.Seqs[i] = ++_seq;
+                // Only a new, very long line is copied (a repeat is only counted).
+                ring.Texts[i] = message.Length > MaxStoredLogLength ? message.Substring(0, MaxStoredLogLength) : message;
+                ring.Counts[i] = 1;
+                ring.Shapes[i] = shape;
+                ring.Types[i] = type;
             }
             return true;
         }
@@ -183,16 +214,17 @@ namespace OzxApm.Core
             {
                 Array.Clear(_crumbTexts, 0, MaxBreadcrumbs);
                 Array.Clear(_crumbProps, 0, MaxBreadcrumbs);
-                Array.Clear(_logTexts, 0, MaxLogLines);
                 _crumbStart = _crumbCount = 0;
-                _logStart = _logCount = 0;
+                _warnings.Clear();
+                _errors.Clear();
             }
         }
 
         /// <summary>
         /// The time line as sent with an event, oldest first: the most recent
-        /// maxBreadcrumbs breadcrumbs and maxLogs log lines at or after sinceMs,
-        /// merged in the order they were recorded, as "[HH:mm:ss.fff] text" (UTC), breadcrumbs cut to
+        /// maxBreadcrumbs breadcrumbs and maxLogs log lines (warnings and errors
+        /// together) at or after sinceMs, merged in the order they were
+        /// recorded, as "[HH:mm:ss.fff] text" (UTC), breadcrumbs cut to
         /// maxBreadcrumbLength characters, log lines to maxLogLength. A log line
         /// recorded once whose text is excludeLog (the same string instance:
         /// the error being reported) is left out. Allocates the list and its strings.
@@ -210,17 +242,32 @@ namespace OzxApm.Core
                         continue;
                     _pickCrumbs[nc++] = i;
                 }
+
+                // The newest maxLogs lines of both log rings, newest first.
                 int nl = 0;
-                for (int k = _logCount - 1; k >= 0 && nl < maxLogs; k--)
+                int kw = _warnings.Count - 1, ke = _errors.Count - 1;
+                while (nl < maxLogs && nl < MaxLogLines && (kw >= 0 || ke >= 0))
                 {
-                    int i = (_logStart + k) % MaxLogLines;
+                    LogRing ring;
+                    int idx;
+                    if (ke < 0 || (kw >= 0 && _warnings.Seqs[_warnings.At(kw)] > _errors.Seqs[_errors.At(ke)]))
+                    {
+                        ring = _warnings;
+                        idx = _warnings.At(kw--);
+                    }
+                    else
+                    {
+                        ring = _errors;
+                        idx = _errors.At(ke--);
+                    }
                     // Not break: a line counted again recently may sit before
-                    // newer ones (the ring is in order of first occurrence).
-                    if (_logLastTimes[i] < sinceMs)
+                    // newer ones (a ring is in order of first occurrence).
+                    if (ring.LastTimes[idx] < sinceMs)
                         continue;
-                    if (excludeLog != null && _logCounts[i] == 1 && ReferenceEquals(_logTexts[i], excludeLog))
+                    if (excludeLog != null && ring.Counts[idx] == 1 && ReferenceEquals(ring.Texts[idx], excludeLog))
                         continue;
-                    _pickLogs[nl++] = i;
+                    _pickLogRing[nl] = ring;
+                    _pickLogIndex[nl++] = idx;
                 }
 
                 var list = new List<string>(nc + nl);
@@ -228,20 +275,20 @@ namespace OzxApm.Core
                 int c = nc - 1, l = nl - 1;
                 while (c >= 0 || l >= 0)
                 {
-                    bool takeCrumb = l < 0 || (c >= 0 && CrumbFirst(_pickCrumbs[c], _pickLogs[l]));
+                    bool takeCrumb = l < 0 || (c >= 0 && _crumbSeqs[_pickCrumbs[c]] < _pickLogRing[l].Seqs[_pickLogIndex[l]]);
                     if (takeCrumb)
+                    {
                         list.Add(FormatCrumbLocked(_pickCrumbs[c--], maxBreadcrumbLength));
+                    }
                     else
-                        list.Add(FormatLogLocked(_pickLogs[l--], maxLogLength));
+                    {
+                        list.Add(FormatLogLocked(_pickLogRing[l], _pickLogIndex[l], maxLogLength));
+                        _pickLogRing[l--] = null;
+                    }
                 }
                 return list;
             }
         }
-
-        // In the order they were recorded (one lock for both rings), which is
-        // their real order; the times only label them (a breadcrumb may carry
-        // a time read just before the lock).
-        private bool CrumbFirst(int crumb, int log) => _crumbSeqs[crumb] < _logSeqs[log];
 
         private string FormatCrumbLocked(int i, int maxLength)
         {
@@ -262,30 +309,75 @@ namespace OzxApm.Core
             {
                 AppendCut(sb, _crumbTexts[i], maxLength);
             }
+            StripUrlQueries(sb, 15);
             Cut(sb, maxLength);
             return sb.ToString();
         }
 
-        private string FormatLogLocked(int i, int maxLength)
+        private string FormatLogLocked(LogRing ring, int i, int maxLength)
         {
             var sb = _sb;
             sb.Length = 0;
-            AppendTime(sb, _logTimes[i]);
-            var type = _logTypes[i];
+            AppendTime(sb, ring.Times[i]);
+            var type = ring.Types[i];
             sb.Append(type == LogType.Warning ? "Warning: " : type == LogType.Assert ? "Assert: " : "Error: ");
-            int count = _logCounts[i];
+            int count = ring.Counts[i];
             // " (x2147483647 until 00:00:00.000)": at most 33 characters.
             int room = count > 1 ? maxLength - 34 : maxLength;
-            AppendCut(sb, _logTexts[i], room);
+            // A query string removed below may make room: append generously.
+            AppendCut(sb, ring.Texts[i], room > int.MaxValue / 2 ? room : room * 2);
+            StripUrlQueries(sb, 15);
             Cut(sb, room);
             if (count > 1)
             {
                 sb.Append(" (x").Append(count).Append(" until ");
-                AppendClock(sb, _logLastTimes[i]);
+                AppendClock(sb, ring.LastTimes[i]);
                 sb.Append(')');
             }
             return sb.ToString();
         }
+
+        /// <summary>
+        /// Removes the query string and fragment of every http(s) URL in
+        /// sb[from..] (privacy: tokens in UnityWebRequest error messages; the
+        /// same rule as the network log's URLs): "https://h/p?token=x" becomes
+        /// "https://h/p?...".
+        /// </summary>
+        internal static void StripUrlQueries(StringBuilder sb, int from)
+        {
+            for (int i = Math.Max(0, from); i + 7 < sb.Length; i++)
+            {
+                if ((sb[i] | 0x20) != 'h' || !(StartsWith(sb, i, "http://") || StartsWith(sb, i, "https://")))
+                    continue;
+                int j = i + 7;
+                while (j < sb.Length && !EndsUrl(sb[j]) && sb[j] != '?' && sb[j] != '#')
+                    j++;
+                if (j < sb.Length && (sb[j] == '?' || sb[j] == '#'))
+                {
+                    int end = j + 1;
+                    while (end < sb.Length && !EndsUrl(sb[end]))
+                        end++;
+                    sb.Remove(j, end - j);
+                    sb.Insert(j, "?...");
+                    j += 4;
+                }
+                i = j;
+            }
+        }
+
+        private static bool StartsWith(StringBuilder sb, int at, string s)
+        {
+            if (at + s.Length > sb.Length)
+                return false;
+            for (int k = 0; k < s.Length; k++)
+            {
+                if (char.ToLowerInvariant(sb[at + k]) != s[k])
+                    return false;
+            }
+            return true;
+        }
+
+        private static bool EndsUrl(char c) => char.IsWhiteSpace(c) || c == '"' || c == '\'' || c == '<' || c == '>' || c == ')' || c == ']';
 
         // Appends at most what fits in maxLength (the rest would be cut anyway).
         private static void AppendCut(StringBuilder sb, string s, int maxLength)

@@ -61,6 +61,8 @@ namespace OzxApm.Core
         public int CustomRejected;
         /// <summary>Timers not recorded because the app was paused while they ran.</summary>
         public long TimersSpanningPause;
+        /// <summary>StartTimer calls not remembered by name (more than 256 names pending: timers started and never stopped?).</summary>
+        public long TimersUntracked;
         /// <summary>Warning/error/assert lines seen by the time line (repeats included).</summary>
         public long LogLinesSeen;
         /// <summary>"release", "dev" or "editor"; null before Initialize.</summary>

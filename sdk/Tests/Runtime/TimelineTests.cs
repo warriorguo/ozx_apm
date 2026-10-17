@@ -90,14 +90,43 @@ namespace OzxApm.Tests
         }
 
         [Test]
-        public void LogSpam_DoesNotEvictCustomEvents()
+        public void LogSpam_DoesNotEvictCustomEventsOrErrors()
         {
             _t.RecordEvent("room_enter", null, Timeline.NowMs());
+            _t.OnLog("[JsonDataRepository] Error loading enemies.json", "", LogType.Error, true);
             for (int i = 0; i < 200; i++)
                 _t.OnLog("warning kind " + (char)('a' + i % 26) + (char)('a' + i / 26), "", LogType.Warning, true);
             var lines = All();
-            Assert.AreEqual(1 + Timeline.MaxLogLines, lines.Count);
+            Assert.AreEqual(2 + Timeline.MaxWarningLines, lines.Count);
             Assert.AreEqual("Event: room_enter", Body(lines[0]));
+            Assert.AreEqual("Error: [JsonDataRepository] Error loading enemies.json", Body(lines[1]));
+            // An exception takes the 10 most recent log lines: the error is not
+            // among them, but it stays on the time line for later events.
+            Assert.AreEqual(1 + 10, _t.Snapshot(20, 10, 200, 300).Count);
+        }
+
+        [Test]
+        public void ErrorSpam_DoesNotEvictWarnings()
+        {
+            _t.OnLog("Asset not found: anim/arack_red", "", LogType.Warning, true);
+            for (int i = 0; i < 100; i++)
+                _t.OnLog("error kind " + (char)('a' + i % 26) + (char)('a' + i / 26), "", LogType.Error, true);
+            var lines = All();
+            Assert.AreEqual(1 + Timeline.MaxErrorLines, lines.Count);
+            Assert.AreEqual("Warning: Asset not found: anim/arack_red", Body(lines[0]));
+        }
+
+        [Test]
+        public void UrlQueryStrings_AreRemovedWhenSent()
+        {
+            _t.OnLog("Request failed: https://api.ozx.example/v1/save?token=SECRET&uid=42 (500)", "", LogType.Warning, true);
+            _t.RecordText("Loaded http://cdn.ozx.example/a.bundle#frag and HTTPS://x.example/p?k=v");
+            var lines = All().Select(Body).ToList();
+            CollectionAssert.AreEqual(new[]
+            {
+                "Warning: Request failed: https://api.ozx.example/v1/save?... (500)",
+                "Loaded http://cdn.ozx.example/a.bundle?... and HTTPS://x.example/p?..."
+            }, lines);
         }
 
         [Test]
@@ -187,6 +216,10 @@ namespace OzxApm.Tests
             Assert.That(() => { _t.OnLog(warning, stack, LogType.Warning, true); }, Is.Not.AllocatingGCMemory());
             Assert.That(() => { _t.OnLog(other, stack, LogType.Error, false); }, Is.Not.AllocatingGCMemory());
             Assert.That(() => { _t.OnLog(other, stack, LogType.Log, true); }, Is.Not.AllocatingGCMemory());
+            // A long line logged again is only counted: no copy.
+            string longLine = new string('w', Timeline.MaxStoredLogLength + 1000);
+            _t.OnLog(longLine, stack, LogType.Warning, true);
+            Assert.That(() => { _t.OnLog(longLine, stack, LogType.Warning, true); }, Is.Not.AllocatingGCMemory());
         }
 
         [Test]

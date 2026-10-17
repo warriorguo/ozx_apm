@@ -160,10 +160,87 @@ namespace OzxApm.Tests
             Assert.AreEqual(4, all.Single(e => e.aggregated && e.name == "enemy_killed" && e.ctx.TryGetValue("roomId", out var r) && r == "2").count);
             Assert.AreEqual(1, all.Single(e => e.name == "chest_open").count);
 
-            // A new window has a new budget.
+            // Closing a window (Flush, pause) does not renew the budget: a minute does.
+            c.TrackEvent("chest_open", null);
+            Assert.AreEqual(3, Events().Count(e => !e.aggregated));
+            c.ExpireBudgetForTests();
             c.TrackEvent("chest_open", null);
             Assert.IsFalse(Events().Last().aggregated);
+            Assert.AreEqual(4, Events().Count(e => !e.aggregated));
             Assert.AreEqual(9, _timeline.Snapshot(50, 0, 200, 200).Count(l => l.Contains("Event: enemy_killed")));
+        }
+
+        // A game calling Flush often must not lift the per-minute budget.
+        [Test]
+        public void FrequentFlushes_DoNotRenewTheBudget()
+        {
+            var c = NewCollector(new ApmConfig { MaxCustomEventsPerMinute = 60 });
+            for (int i = 0; i < 600; i++)
+            {
+                c.TrackEvent("e" + (i % 20), null);
+                if (i % 50 == 49)
+                    c.FlushPending();
+            }
+            c.FlushPending();
+            var all = Events();
+            Assert.AreEqual(60, all.Count(e => !e.aggregated));
+            Assert.AreEqual(600, all.Sum(e => e.count));
+        }
+
+        // One frequent name cannot use up the budget of the others.
+        [Test]
+        public void OneFrequentName_KeepsBudgetForOthers()
+        {
+            for (int i = 0; i < 100; i++)
+                _collector.TrackEvent("enemy_killed", null);
+            _collector.TrackEvent("boss_spawn", new[] { "boss", "hydra" });
+            var sent = Events();
+            Assert.AreEqual(CustomCollector.MaxEventsPerNamePerMinute, sent.Count(e => e.name == "enemy_killed"));
+            Assert.AreEqual("hydra", sent.Single(e => e.name == "boss_spawn").props[1]);
+            _collector.FlushPending();
+            Assert.AreEqual(100, Events().Where(e => e.name == "enemy_killed").Sum(e => e.count));
+        }
+
+        [Test]
+        public void SumOverflow_IsDroppedAndCounted()
+        {
+            _collector.RecordMetric("huge", 1e308, null);
+            _collector.RecordMetric("huge", 1e308, null);
+            _collector.FlushPending();
+            var m = Metrics().Single();
+            Assert.AreEqual(1, m.count);
+            Assert.AreEqual(1e308, m.sum);
+            _collector.GetStats(out _, out _, out _, out long samples, out long dropped);
+            Assert.AreEqual(1, samples);
+            Assert.AreEqual(1, dropped);
+        }
+
+        // A wide metric (0.1 ms .. 1000 ms in one minute) keeps 2% on every quantile.
+        [Test]
+        public void WideMetric_KeepsTheErrorBound()
+        {
+            var rnd = new System.Random(3);
+            var values = new List<double>();
+            for (int i = 0; i < 1000; i++)
+            {
+                double v = Math.Pow(10, rnd.NextDouble() * 4 - 1);
+                values.Add(v);
+                _collector.RecordMetric("load_ms", v, "ms");
+            }
+            _collector.FlushPending();
+            var m = Metrics().Single();
+            values.Sort();
+            long total = 0;
+            int k = 0;
+            double p10Exact = values[(int)Math.Ceiling(0.1 * values.Count) - 1];
+            for (; k < m.hist_keys.Length; k++)
+            {
+                total += m.hist_counts[k];
+                if (total >= 100)
+                    break;
+            }
+            double p10 = MetricBuckets.Value(m.hist_keys[k]);
+            Assert.LessOrEqual(Math.Abs(p10 - p10Exact) / p10Exact, MetricBuckets.RelativeAccuracy + 1e-12);
         }
 
         // ---- Metrics ----
