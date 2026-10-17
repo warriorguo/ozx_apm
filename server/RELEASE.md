@@ -1116,8 +1116,16 @@ distribution by a context key are right there too.
     write everything to disk (`OfflineStorage.Flush` + `WaitIdle`, as on
     pause) before returning, so the next launch uploads it.
   - Whether an unhandled exception in a managed thread ends the process
-    depends on the runtime and the player; `IsTerminating` says so and both
-    cases are handled. Not yet observed on an IL2CPP device (device test U2).
+    depends on the runtime and the player; both cases are handled. On
+    Android IL2CPP (Unity 2022.3, A33, device test U1) the event arrives with
+    `IsTerminating = true` but the process keeps running: such rows read
+    `domain_terminating` although the app did not end. Unity's log of the
+    same exception was recognised as its echo there (one row, count 1).
+  - `"task"` is best effort: .NET raises `UnobservedTaskException` only when
+    the faulted task is finalized. On IL2CPP's conservative GC a task can stay
+    uncollected for a long time; in device test U2, 3 of 5 faulted tasks were
+    reported (correct type and throw site), 2 were never finalized in the
+    test's 50 s.
     Exceptions on the main thread are caught by Unity and arrive as logged
     exceptions (as before).
 - The SDK never captures its own output (`[OzxApm]` prefix), never throws
@@ -1206,9 +1214,21 @@ bytes (30 keys). The main thread does not allocate at idle (pooled sample,
 cached context; `ExceptionCollector.Update` 0 bytes). What still allocates,
 on the storage worker: opening and sealing a segment every `BatchSize` (20)
 events, about 6 KB, i.e. 3 times a minute at idle, and the uploads (one per
-`LowValueUploadIntervalSeconds` = 120 s at idle). Expected on the device:
-about 3-5 frames with allocations and 20-40 KB per idle minute (device test
-I1), down from 65 / 192 KB.
+`LowValueUploadIntervalSeconds` = 120 s at idle).
+
+Measured on the A33 (dev arm64 build, 60 s idle, 30 fps; APM-4 build and
+APM-3 build alternated twice under the same conditions):
+
+| Build | Frames with allocations | Bytes per minute | `Update` p50 | `Update` p99 |
+|---|---|---|---|---|
+| APM-4, no context | 65-67 | 206 KB | 0.035-0.036 ms | 0.20-0.30 ms |
+| APM-3, no context | 12-13 | 87 KB | 0.039-0.041 ms | 0.18-0.21 ms |
+| APM-4, 30-key context | 65 | 397 KB | 0.036-0.037 ms | 0.14-0.27 ms |
+| APM-3, 30-key context | 11-13 | 120 KB | 0.039-0.041 ms | 0.24-0.37 ms |
+
+The remaining allocations are about 12 frames a minute; the largest single
+frame (47-80 KB) is an upload. `Update` p99 varies as much between two runs
+of the same build as between builds; p50 is about 3 us higher.
 
 ### SDK: cost of the error path
 
@@ -1239,8 +1259,13 @@ bytes each) is 1272 bytes for `busspam` (521-character message +
 bytes/frame at 30 fps), which this change removes. The repeat path itself
 allocates 0 bytes. Once any log callback is registered (the game's own, a
 crash reporter's or the SDK's), every log line costs this conversion; it
-does not grow with the number of handlers. Expected after APM-3: SDK on minus
-off = 1272 / 1576 bytes/frame.
+does not grow with the number of handlers. Measured after APM-3 (A33, dev
+build, same test as APM-4 T6): SDK on minus off = 14157 - 12825 = 1332
+bytes/frame for `busspam` (APM-4: 1404) and 18372 - 16735 = 1637 for
+`busspamvar` (APM-4: 1710); bus p50 on minus off 0.08-0.10 ms (Unity's
+string conversion and callback dispatch included); 0 SDK warnings. A
+background thread logging 2776 errors in 10 s arrived as sum(count) = 2776
+in 2 events.
 
 ### Schema
 
