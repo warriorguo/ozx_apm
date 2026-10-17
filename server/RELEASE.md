@@ -1081,3 +1081,247 @@ the `apm_exception_daily` view.
   Unity) 16 of the 23 new EditMode tests run and pass, the 7 that need the
   Unity runtime (Unity's stack capture, the allocation constraint) were
   compiled but not run here.
+
+## APM-3: complete exception capture, per-context counts, session error sequence, idle GC (additive schema change)
+
+Deploy order: **server, then SDK builds.** The admin UI needs no change (the
+new fields are additive; APM-11 builds the UI on them). An SDK with APM-3
+against an older server works: the new fields are ignored, and the
+per-context repeat counts are still separate rows, so `sum(count)` and the
+distribution by a context key are right there too.
+
+### SDK: what is captured
+
+- **Every thread.** The SDK subscribes to `Application.logMessageReceivedThreaded`
+  only (one callback, called on the logging thread, the main thread
+  included; subscribing to `logMessageReceived` as well would report
+  main-thread logs twice). Unity's own log output is unchanged.
+- **Unhandled exceptions.** `AppDomain.CurrentDomain.UnhandledException`
+  (`unhandled: "domain"`, or `"domain_terminating"` when `IsTerminating`) and
+  `TaskScheduler.UnobservedTaskException` (`"task"`; a single inner exception
+  is reported as itself, so it groups with the same exception logged by the
+  game; the task is not marked observed, the default behaviour stays). The
+  exception's `ToString()` is sent as the embedded exception of an `error`
+  whose message is its first line, so it is parsed and grouped like any
+  other.
+  - Unity's `UnhandledExceptionHandler` may also `Debug.LogException` it, on
+    the same thread, before or after the SDK's handler. Both are one
+    occurrence: a logged exception followed (within 2 s, same thread, same
+    fingerprint) by the unhandled report is marked unhandled (a first
+    occurrence logged as an exception off the main thread waits 100 ms
+    before it is enqueued for that; a repeat moves to an unhandled count);
+    an unhandled report followed by the log drops the log.
+  - Terminating: the handler records the exception, closes the
+    de-duplication window and waits up to 500 ms for the storage worker to
+    write everything to disk (`OfflineStorage.Flush` + `WaitIdle`, as on
+    pause) before returning, so the next launch uploads it.
+  - Whether an unhandled exception in a managed thread ends the process
+    depends on the runtime and the player; `IsTerminating` says so and both
+    cases are handled. Not yet observed on an IL2CPP device (device test U2).
+    Exceptions on the main thread are caught by Unity and arrive as logged
+    exceptions (as before).
+- The SDK never captures its own output (`[OzxApm]` prefix), never throws
+  from a callback, and never logs or enqueues while holding its lock.
+
+### Wire format (SDK -> server)
+
+Exception events may carry, next to the APM-4 fields:
+
+```json
+{"type":"exception", ..., "count":40, "error_seq":3, "session_ms":846,
+ "unhandled":"task", "ctx_merged":true, "ctx":{"levelId":"3"}}
+```
+
+- `error_seq`: which error of its session the event's (first) occurrence
+  was, counting every occurrence of every error, repeats included: 1 is the
+  session's first error. Restarts with every new session. `session_ms`: the
+  milliseconds from the session start to that occurrence. A first-occurrence
+  event carries its own; a repeat count carries those of its first repeat.
+- `unhandled`: absent for logged errors; `domain`, `domain_terminating`,
+  `task`.
+- `ctx_merged`: the count merges occurrences in different game contexts;
+  `ctx` holds only the entries they all had.
+- `ctx` of every exception event is now the context **when it happened**
+  (before: the first occurrence's context at enqueue, which was the same
+  moment, and the repeat count's at its first repeat).
+
+### SDK: de-duplication and limits
+
+Per window of 60 s (also closed by `Flush`, going to background, shutdown):
+
+| What | Limit | Beyond it |
+|---|---|---|
+| First occurrences sent at once (with breadcrumbs) | 30 fingerprints | reported at the end of the window, still with their own time, `error_seq`, context and count, without breadcrumbs |
+| Repeat counts per fingerprint | one event per (context, unhandled kind), at most 8 | one merged count (`ctx_merged`) per fingerprint |
+| Repeat counts in all | 64 | merged counts |
+| Fingerprints tracked | 100 | counted in one summary event per window, `log_type` `error`, message `[OzxApm] N errors of M kinds not reported one by one: ...` (its own group); tracked normally in the next window |
+| Distinct texts remembered for the cheap repeat path | 512 | parsed every time (correct, slower) |
+
+So no occurrence is lost from `sum(count)`, and the first occurrence of a
+fingerprint is always sent unless more than 100 different errors occur within
+a minute. At most 30 + 64 + 100 + 1 = 195 exception events per window (about
+30 first occurrences of 3-25 KB, the rest 1-17 KB each, mostly the error's
+text: the server recomputes the fingerprint from it). In practice an error
+logged every frame in one room is one event per minute.
+
+First occurrences are persisted within milliseconds; the counts of the
+current window live in memory until it closes (60 s, `Flush`, going to
+background, shutdown, an unhandled exception that ends the process). If the
+process is killed in the foreground (OOM, native crash, force-stop), the
+counts of that last window are lost, as before APM-3.
+
+`ApmStats` has `ErrorsSeen`, `ErrorEvents` and `ErrorsInSummary`.
+
+APM-6 plugs its recent-logs ring into the same callback (`ILogSink` on the
+collector: called for every log type, on the logging thread, before the
+error path).
+
+### SDK: idle GC and serialization
+
+The storage worker serialized every event into a string, counted its UTF-8
+bytes and encoded it again: per perf sample (once a second) about 1.8 KB,
+6 KB with a 30-key context (measured on the A33 in APM-5: 65 frames with
+allocations and 192 KB per idle minute, 68 frames / 444 KB with 30 keys).
+Events are now written straight into a reused UTF-8 buffer (`JsonLine`):
+the context as UTF-8 bytes built once per context change, numbers and the
+32-hex-digit event id without strings (the id is 128 bits from two SplitMix64
+streams seeded once from a Guid, instead of a Guid string per event), floats
+digit for digit as `float.ToString("F2", InvariantCulture)` on Unity's class
+library (checked against it for every float below 0.03125 and every 13th up
+to 1e15: 0 differences in 290 million). **The disk and wire format is
+unchanged.**
+
+Measured on Unity's Mono outside Unity (M-series Mac), steady state: writing
+a perf sample to its segment allocates 4.5 bytes/event on average (the seq
+file is rewritten every 1000 events), before 1839 bytes (no context) / 5979
+bytes (30 keys). The main thread does not allocate at idle (pooled sample,
+cached context; `ExceptionCollector.Update` 0 bytes). What still allocates,
+on the storage worker: opening and sealing a segment every `BatchSize` (20)
+events, about 6 KB, i.e. 3 times a minute at idle, and the uploads (one per
+`LowValueUploadIntervalSeconds` = 120 s at idle). Expected on the device:
+about 3-5 frames with allocations and 20-40 KB per idle minute (device test
+I1), down from 65 / 192 KB.
+
+### SDK: cost of the error path
+
+Unity's Mono outside Unity (M-series Mac), 645 + 110 character bus error:
+
+| Path | Time | Allocated |
+|---|---|---|
+| Repeat, same text | 0.92 us | 0 |
+| Repeat, roomId changing every call | 0.92 us | 0 |
+| Repeat with a 30-key context | 0.93 us | 0 |
+| Repeat on another thread | 1.8 us | 0 |
+| A warning (not captured) | 0.01 us | 0 |
+| `Update` when nothing is due | 0.02 us | 0 |
+| First occurrence (parse, event, breadcrumbs) | 10.5 us | 7.8 KB |
+
+On the A33 these are a few microseconds; the APM-4 measurement (T6) put the
+SDK's share of a per-frame bus error at 0.01-0.07 ms/frame (p50).
+
+**The 1.4-1.7 KB per frame measured in APM-4 T6** (SDK on minus SDK off,
+14229 - 12825 bytes/frame for `busspam`, 18445 - 16735 for `busspamvar`) is
+not SDK code. Unity calls `Application.CallLogCallback(string logString,
+string stackTrace, ...)` with both strings converted from native memory, and
+only when a log callback is registered (`SetLogCallbackDefined`); the
+handlers then get those same strings. Their managed size (20 + 2 x length
+bytes each) is 1272 bytes for `busspam` (521-character message +
+92-character stack) and 1576 for `busspamvar` (673 + 92); the rest, 132 and
+134 bytes/frame, is the idle serialization above (192 KB/min = 107-115
+bytes/frame at 30 fps), which this change removes. The repeat path itself
+allocates 0 bytes. Once any log callback is registered (the game's own, a
+crash reporter's or the SDK's), every log line costs this conversion; it
+does not grow with the number of handlers. Expected after APM-3: SDK on minus
+off = 1272 / 1576 bytes/frame.
+
+### Schema
+
+`Migrate` adds four columns to `apm_exceptions` (also in `scripts/migrate.sql`):
+
+```sql
+ALTER TABLE apm_exceptions ADD COLUMN IF NOT EXISTS error_seq UInt32 DEFAULT 0;
+ALTER TABLE apm_exceptions ADD COLUMN IF NOT EXISTS session_ms UInt64 DEFAULT 0;
+ALTER TABLE apm_exceptions ADD COLUMN IF NOT EXISTS unhandled LowCardinality(String) DEFAULT '';
+ALTER TABLE apm_exceptions ADD COLUMN IF NOT EXISTS ctx_merged UInt8 DEFAULT 0;
+```
+
+Metadata only, idempotent, within the `apm` account's `ALTER ADD COLUMN`
+grant; fresh and migrated tables have the same columns in the same order.
+Rows of older SDKs and of the previous binary read 0 / `''`. Ingest clamps
+`error_seq` to [0, 2^32-1] and `session_ms` to [0, 366 days], and stores an
+unknown `unhandled` as `''`; it never rejects an event for these fields.
+
+### Admin API
+
+- `first_error=1` (or `true`; `0`/`false`/absent: all; anything else is a
+  400) keeps only exception rows whose occurrence was the first error of its
+  session (`error_seq = 1`), wherever `apm_exceptions` is read: the list, the
+  detail, `/api/context/keys|values|distribution` (exceptions), the
+  exceptions time series and the dashboard's exception count. Other tables
+  are not filtered. Rows of older SDKs never match. With it, a group's
+  `count` is the number of sessions it started.
+- Exception groups (list and detail) add `first_error_sessions` (sessions in
+  which the group was the first error) and `unhandled_count` (its
+  occurrences no code caught).
+- Occurrences in the detail add `error_seq`, `session_ms`, `unhandled`,
+  `ctx_merged`.
+- `/api/context/distribution?metric=exceptions` counts occurrences
+  (`sum(count)`, as before) and adds `merged`: occurrences in merged counts
+  that lack the key, i.e. whose value is not known. They are not reported
+  under `""` ("key not set"); `total` includes them.
+
+### Rolling deploy and rollback
+
+Old and new binaries can serve side by side: the old binary names its insert
+columns, so its rows get the defaults; its admin API ignores `first_error`.
+**Rollback:** redeploy the previous binary; no schema action. The columns
+stay; the previous binary does not read them.
+
+### Verified
+
+- `go vet`, `go test ./...`: 369 unit tests (215 top level) pass, among them
+  the bounds of the new fields, ingest of APM-3/APM-4/older events, the
+  `first_error` parameter, and events serialized by the APM-3 SDK on Unity's
+  Mono (`processor/testdata/sdk_events_apm3.jsonl`: unhandled with an inner
+  chain, task, a logged exception marked unhandled, per-room and merged
+  counts, the summary) whose fingerprints the server reproduces.
+- Integration tests on ClickHouse 26.1.12, 24.1.8 and 23.8.16 (38 / 38 / 36
+  pass, 0 fail; 23.8 skips 2 that need access management): ingest router ->
+  ClickHouse -> admin router on both insert paths for an Awake root cause
+  and cascading NREs in three rooms with a merged count, a second session, an
+  unhandled task exception and an older SDK's event: group counts,
+  `first_error=1` (also with a context filter), detail fields, the roomId
+  distribution weighted by count with `merged`, context values and time
+  series with `first_error`, a 400; rows of the previous binary's INSERT.
+- Migration rehearsal (a program outside the repo) on each version, twice:
+  from the schema after APM-4 (c8c05c2's `migrate.sql`) with the c8c05c2
+  binary, and from today's production schema (c392f9f) with the c392f9f
+  binary (APM-4 and APM-3 deployed together). Servers as a copy of the `apm`
+  account (26.1, 24.1; 23.8 has no access management for `default`). The old
+  binary ingests 25 batches/s (APM-3 SDK sessions: root cause, first NRE,
+  three per-room counts, a merged count, an unhandled task; an APM-4 SDK
+  event; an old-SDK event; perf samples) while the new binary starts and
+  migrates (0.2-0.9 s), then both serve: every acknowledged event stored
+  exactly once (about 2600 per run), `sum(count)` equal to what was sent
+  (about 23000), `apm_exception_daily` equal to the table, TTL and engine
+  kept; old-binary rows with the APM-3 columns at defaults, new-binary rows
+  with them (error_seq on 7 events per batch, one first error, one merged,
+  one task); re-sends across binaries dropped as duplicates; the new admin
+  API's `first_error=1` shows only the root cause (one per new-binary
+  session) and the roomId distribution adds up (rows + merged = total); the
+  old admin API works on the migrated table; then the old binary alone
+  (rollback) and the new binary again; no warning or error in any log.
+- SDK: compiles at C# 8 with and without `UNITY_2021_2_OR_NEWER`. Unity
+  EditMode could not run here (the sandbox blocks the licensing client); on
+  Unity's Mono outside Unity 134 runtime tests pass (all new logic tests of
+  `ExceptionCaptureTests`, `JsonSerializerTests`, the storage and context
+  tests), 2 fail for the environment (no `JSONSerializeModule`, no native
+  gzip), 82 need the Unity runtime (allocation constraints, Unity's stack
+  capture, MonoBehaviour); a 15 s stress run of 6 threads (repeats, 2 million
+  occurrences beyond the fingerprint limit, unhandled reports, task
+  exceptions, context changes) against window flushes counted all 10 million
+  occurrences exactly once with unique sequence numbers.
+- Not yet run on a device (A33 IL2CPP): background-thread errors, unhandled
+  thread and task exceptions, per-frame spam with and without the SDK, three
+  rooms in one window, the first-error filter after an Awake failure, idle
+  GC with and without 30 context keys, offline/kill.
