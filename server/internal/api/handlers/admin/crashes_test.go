@@ -12,6 +12,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/warriorguo/ozx_apm/server/internal/models"
+	"github.com/warriorguo/ozx_apm/server/internal/storage"
 )
 
 // Tests for actual CrashHandler and ExceptionHandler with nil repository
@@ -71,6 +72,26 @@ func TestExceptionHandler_ListExceptions_NilRepo(t *testing.T) {
 
 	if w.Code != http.StatusInternalServerError {
 		t.Errorf("expected status %d, got %d", http.StatusInternalServerError, w.Code)
+	}
+}
+
+func TestExceptionHandler_GetExceptionDetail_NilRepo(t *testing.T) {
+	handler := NewExceptionHandler(nil, zap.NewNop())
+	w := httptest.NewRecorder()
+	handler.GetExceptionDetail(w, httptest.NewRequest(http.MethodGet, "/exceptions/detail?fingerprint=f", nil))
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("expected status %d, got %d", http.StatusInternalServerError, w.Code)
+	}
+}
+
+func TestExceptionHandler_GetExceptionDetail_BadRequests(t *testing.T) {
+	handler := NewExceptionHandler(&storage.Repository{}, zap.NewNop())
+	for _, path := range []string{"/exceptions/detail", "/exceptions/detail?fingerprint=", "/exceptions/detail?fingerprint=f&build_type=x"} {
+		w := httptest.NewRecorder()
+		handler.GetExceptionDetail(w, httptest.NewRequest(http.MethodGet, path, nil))
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("%s: status %d", path, w.Code)
+		}
 	}
 }
 

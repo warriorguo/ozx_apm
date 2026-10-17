@@ -48,6 +48,7 @@ func NewAdminRouter(cfg *config.Config, repo *storage.Repository, logger *zap.Lo
 		// Exception handlers
 		exceptionHandler := admin.NewExceptionHandler(repo, logger)
 		r.Get("/exceptions", exceptionHandler.ListExceptions)
+		r.Get("/exceptions/detail", exceptionHandler.GetExceptionDetail)
 
 		// Game context (APM-5)
 		contextHandler := admin.NewContextHandler(repo, logger)

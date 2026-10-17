@@ -1,6 +1,10 @@
 package models
 
-import "time"
+import (
+	"time"
+
+	"github.com/warriorguo/ozx_apm/server/internal/fingerprint"
+)
 
 // Dashboard types
 
@@ -126,6 +130,10 @@ type OSDist struct {
 
 // Exception types
 
+// ExceptionGroup is one fingerprint. The descriptive fields are those of the
+// group's most recent occurrence. FingerprintVersion 0 marks a group of rows
+// stored before APM-4 (the SDK's fingerprint; ExceptionType, MessageTemplate,
+// ThrowSite and CallSite are then empty and Message is all there is).
 type ExceptionGroup struct {
 	Fingerprint  string    `json:"fingerprint"`
 	Message      string    `json:"message"`
@@ -133,6 +141,60 @@ type ExceptionGroup struct {
 	SessionCount int64     `json:"session_count"`
 	FirstSeen    time.Time `json:"first_seen"`
 	LastSeen     time.Time `json:"last_seen"`
+	// APM-4
+	FingerprintVersion int    `json:"fingerprint_version"`
+	ExceptionType      string `json:"exception_type"`
+	MessageTemplate    string `json:"message_template"`
+	ThrowSite          string `json:"throw_site"`
+	CallSite           string `json:"call_site"`
+}
+
+// ExceptionDetail is one exception group for the detail page (APM-11): the
+// summary, a representative sample (the most recent occurrence) with its raw
+// text and its parsed stack, the latest occurrences, and distributions.
+// Distributions by context key are served by /api/context/distribution
+// with metric=exceptions&fingerprint=F.
+type ExceptionDetail struct {
+	ExceptionGroup
+	FirstVersion string                `json:"first_version"`
+	LastVersion  string                `json:"last_version"`
+	Sample       ExceptionSample       `json:"sample"`
+	Occurrences  []ExceptionOccurrence `json:"occurrences"`
+	VersionDist  []VersionDist         `json:"version_distribution"`
+	DeviceDist   []DeviceDist          `json:"device_distribution"`
+}
+
+// ExceptionSample is the representative occurrence: what the SDK sent, and
+// the stack parsed from it by the server's current parser
+// (internal/fingerprint), outermost exception first.
+type ExceptionSample struct {
+	Timestamp          time.Time          `json:"timestamp"`
+	EventID            string             `json:"event_id"`
+	LogType            string             `json:"log_type"`
+	Message            string             `json:"message"`
+	Stack              string             `json:"stack"`
+	EmbeddedException  string             `json:"embedded_exception"`
+	ClientFingerprint  string             `json:"client_fingerprint"`
+	FingerprintVersion int                `json:"fingerprint_version"`
+	InnerExceptions    []string           `json:"inner_exceptions"`
+	Parsed             fingerprint.Result `json:"parsed"`
+}
+
+// ExceptionOccurrence is one stored event of the group (a first occurrence
+// in a de-duplication window, or the repeat count of that window).
+type ExceptionOccurrence struct {
+	Timestamp   time.Time         `json:"timestamp"`
+	EventID     string            `json:"event_id"`
+	Count       int64             `json:"count"`
+	AppVersion  string            `json:"app_version"`
+	BuildType   string            `json:"build_type"`
+	Platform    string            `json:"platform"`
+	DeviceModel string            `json:"device_model"`
+	OSVersion   string            `json:"os_version"`
+	Scene       string            `json:"scene"`
+	SessionID   string            `json:"session_id"`
+	Context     map[string]string `json:"context"`
+	Breadcrumbs []string          `json:"breadcrumbs"`
 }
 
 type ExceptionListResponse struct {

@@ -9,6 +9,7 @@ import (
 
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
 
+	"github.com/warriorguo/ozx_apm/server/internal/fingerprint"
 	"github.com/warriorguo/ozx_apm/server/internal/models"
 )
 
@@ -526,24 +527,18 @@ func (r *Repository) GetExceptionGroups(ctx context.Context, f models.AdminFilte
 	// Get exception groups
 	offset := (page - 1) * pageSize
 	query := fmt.Sprintf(`
-		SELECT
-			fingerprint,
-			any(message) as message,
-			toInt64(sum(count)) as cnt,
-			toInt64(uniqExact(session_id)) as session_count,
-			min(timestamp) as first_seen,
-			max(timestamp) as last_seen
+		SELECT %s
 		FROM apm_exceptions
 		%s
 		GROUP BY fingerprint
 		ORDER BY cnt DESC, fingerprint
 		LIMIT %d OFFSET %d
-	`, whereClause, pageSize, offset)
+	`, exceptionGroupColumns, whereClause, pageSize, offset)
 
 	exceptions := []models.ExceptionGroup{}
 	err := r.queryRows(ctx, query, args, func(rows driver.Rows) error {
 		var e models.ExceptionGroup
-		if err := rows.Scan(&e.Fingerprint, &e.Message, &e.Count, &e.SessionCount, &e.FirstSeen, &e.LastSeen); err != nil {
+		if err := scanExceptionGroup(rows, &e); err != nil {
 			return err
 		}
 		exceptions = append(exceptions, e)
@@ -553,6 +548,160 @@ func (r *Repository) GetExceptionGroups(ctx context.Context, f models.AdminFilte
 		return nil, 0, err
 	}
 	return exceptions, totalCount, nil
+}
+
+// exceptionGroupColumns aggregates one exception group (GROUP BY
+// fingerprint). The descriptive columns come from the most recent row;
+// fingerprint_version is the highest (0 only for groups of pre-APM-4 rows).
+const exceptionGroupColumns = `
+			fingerprint,
+			argMax(message, timestamp) as message,
+			toInt64(sum(count)) as cnt,
+			toInt64(uniqExact(session_id)) as session_count,
+			min(timestamp) as first_seen,
+			max(timestamp) as last_seen,
+			toInt64(max(fingerprint_version)) as version,
+			argMax(exception_type, timestamp) as exception_type,
+			argMax(message_template, timestamp) as message_template,
+			argMax(throw_site, timestamp) as throw_site,
+			argMax(call_site, timestamp) as call_site`
+
+func scanExceptionGroup(rows interface{ Scan(dest ...any) error }, e *models.ExceptionGroup) error {
+	var version int64
+	if err := rows.Scan(&e.Fingerprint, &e.Message, &e.Count, &e.SessionCount, &e.FirstSeen, &e.LastSeen,
+		&version, &e.ExceptionType, &e.MessageTemplate, &e.ThrowSite, &e.CallSite); err != nil {
+		return err
+	}
+	e.FingerprintVersion = int(version)
+	return nil
+}
+
+// exceptionOccurrences is how many of a group's most recent rows the detail returns.
+const exceptionOccurrences = 20
+
+// GetExceptionDetail returns one exception group (APM-11's detail page):
+// summary, the most recent occurrence as the representative sample with its
+// stack parsed by the current parser, the latest occurrences with context
+// and breadcrumbs, and the version and device distributions. nil when no row
+// of the group matches the filter.
+func (r *Repository) GetExceptionDetail(ctx context.Context, fp string, f models.AdminFilter) (*models.ExceptionDetail, error) {
+	whereClause, args := adminWhere(f)
+	whereClause += " AND fingerprint = ?"
+	args = append(args, fp)
+
+	detail := &models.ExceptionDetail{
+		Occurrences: []models.ExceptionOccurrence{},
+		VersionDist: []models.VersionDist{},
+		DeviceDist:  []models.DeviceDist{},
+	}
+	query := fmt.Sprintf(`
+		SELECT %s,
+			argMin(app_version, timestamp),
+			argMax(app_version, timestamp)
+		FROM apm_exceptions
+		%s
+		GROUP BY fingerprint
+	`, exceptionGroupColumns, whereClause)
+	var version int64
+	row := r.client.conn.QueryRow(ctx, query, args...)
+	if err := row.Scan(&detail.Fingerprint, &detail.Message, &detail.Count, &detail.SessionCount, &detail.FirstSeen, &detail.LastSeen,
+		&version, &detail.ExceptionType, &detail.MessageTemplate, &detail.ThrowSite, &detail.CallSite,
+		&detail.FirstVersion, &detail.LastVersion); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("exception group: %w", err)
+	}
+	detail.FingerprintVersion = int(version)
+
+	sampleQuery := fmt.Sprintf(`
+		SELECT timestamp, event_id, log_type, message, stack, embedded_exception, client_fingerprint,
+			toInt64(fingerprint_version), inner_exceptions
+		FROM apm_exceptions
+		%s
+		ORDER BY timestamp DESC, event_id
+		LIMIT 1
+	`, whereClause)
+	s := &detail.Sample
+	var sampleVersion int64
+	if err := r.client.conn.QueryRow(ctx, sampleQuery, args...).Scan(&s.Timestamp, &s.EventID, &s.LogType, &s.Message, &s.Stack,
+		&s.EmbeddedException, &s.ClientFingerprint, &sampleVersion, &s.InnerExceptions); err != nil {
+		return nil, fmt.Errorf("exception sample: %w", err)
+	}
+	s.FingerprintVersion = int(sampleVersion)
+	if s.InnerExceptions == nil {
+		s.InnerExceptions = []string{}
+	}
+	s.Parsed = fingerprint.Analyze(fingerprint.Input{LogType: s.LogType, Message: s.Message, Stack: s.Stack, Embedded: s.EmbeddedException})
+
+	occQuery := fmt.Sprintf(`
+		SELECT timestamp, event_id, toInt64(count), app_version, build_type, platform, device_model, os_version,
+			scene, session_id, ctx, breadcrumbs
+		FROM apm_exceptions
+		%s
+		ORDER BY timestamp DESC, event_id
+		LIMIT %d
+	`, whereClause, exceptionOccurrences)
+	err := r.queryRows(ctx, occQuery, args, func(rows driver.Rows) error {
+		var o models.ExceptionOccurrence
+		if err := rows.Scan(&o.Timestamp, &o.EventID, &o.Count, &o.AppVersion, &o.BuildType, &o.Platform, &o.DeviceModel,
+			&o.OSVersion, &o.Scene, &o.SessionID, &o.Context, &o.Breadcrumbs); err != nil {
+			return err
+		}
+		if o.Context == nil {
+			o.Context = map[string]string{}
+		}
+		if o.Breadcrumbs == nil {
+			o.Breadcrumbs = []string{}
+		}
+		detail.Occurrences = append(detail.Occurrences, o)
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("occurrences: %w", err)
+	}
+
+	// Occurrences (sum of count), not rows.
+	versionQuery := fmt.Sprintf(`
+		SELECT app_version, toInt64(sum(count)) as cnt
+		FROM apm_exceptions
+		%s
+		GROUP BY app_version
+		ORDER BY cnt DESC, app_version
+		LIMIT 50
+	`, whereClause)
+	err = r.queryRows(ctx, versionQuery, args, func(rows driver.Rows) error {
+		var vd models.VersionDist
+		if err := rows.Scan(&vd.Version, &vd.Count); err != nil {
+			return err
+		}
+		detail.VersionDist = append(detail.VersionDist, vd)
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("version distribution: %w", err)
+	}
+
+	deviceQuery := fmt.Sprintf(`
+		SELECT device_model, toInt64(sum(count)) as cnt
+		FROM apm_exceptions
+		%s
+		GROUP BY device_model
+		ORDER BY cnt DESC, device_model
+		LIMIT 10
+	`, whereClause)
+	err = r.queryRows(ctx, deviceQuery, args, func(rows driver.Rows) error {
+		var dd models.DeviceDist
+		if err := rows.Scan(&dd.Device, &dd.Count); err != nil {
+			return err
+		}
+		detail.DeviceDist = append(detail.DeviceDist, dd)
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("device distribution: %w", err)
+	}
+	return detail, nil
 }
 
 // contextSources maps the "source" parameter of the context endpoints to

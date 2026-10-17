@@ -167,3 +167,39 @@ func (h *ExceptionHandler) ListExceptions(w http.ResponseWriter, r *http.Request
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
 }
+
+// GetExceptionDetail serves /api/exceptions/detail?fingerprint=F (APM-4, for
+// APM-11's detail page). Same filters as the list; default range 30 days.
+func (h *ExceptionHandler) GetExceptionDetail(w http.ResponseWriter, r *http.Request) {
+	if h.repo == nil {
+		http.Error(w, "repository not configured", http.StatusInternalServerError)
+		return
+	}
+
+	q := r.URL.Query()
+	fingerprint := q.Get("fingerprint")
+	if fingerprint == "" {
+		http.Error(w, "fingerprint parameter required", http.StatusBadRequest)
+		return
+	}
+
+	f, err := parseAdminFilter(q, 30*24*time.Hour)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	detail, err := h.repo.GetExceptionDetail(r.Context(), fingerprint, f)
+	if err != nil {
+		h.logger.Error("failed to get exception detail", zap.Error(err), zap.String("fingerprint", fingerprint))
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if detail == nil {
+		http.Error(w, "exception not found", http.StatusNotFound)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(detail)
+}
