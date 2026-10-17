@@ -1699,3 +1699,348 @@ that matters. To remove the tables after a permanent rollback (admin):
   percentiles within 2%; 14 kill/restart cycles: 1713 rows, no duplicate
   sequence number, event ids unique, gaps only at the 1000-number reservation
   boundaries.
+
+## APM-11 and APM-15: exception detail page and session time line (additive index)
+
+Deploy order: **server, then admin UI.** No SDK change: everything both pages
+show is already sent by the APM-6 SDK (exceptions with context, error
+sequence, breadcrumbs and recent log lines; custom events and metrics; every
+event's context). The admin UI needs this server (it calls the new
+endpoints); this server works with the previous admin UI.
+
+### Admin API
+
+All endpoints take the common filter (`start_time`, `end_time`,
+`app_version`, `platform`, `build_type` default release incl. `''`,
+repeatable `ctx=key:value`, `first_error`) unless said otherwise; counts are
+`toInt64`, floats finite, every value a bound argument, results bounded.
+
+Exceptions (APM-11):
+
+- `GET /api/exceptions` adds `sort=count|sessions|first_seen|last_seen`
+  (default `count`; the dates newest first; anything else is a 400) and, per
+  group, `sessions_with_seq`: sessions whose rows carry an error sequence
+  (SDK with APM-3). `first_error_sessions / sessions_with_seq` is the share of
+  sessions in which the group was the session's first error (rows of older
+  SDKs are in neither).
+- `GET /api/exceptions/detail` (default 30 days) adds `sessions_with_seq`,
+  `trend` (`interval_seconds`, `points[{timestamp, count, sessions}]`:
+  occurrences per bucket; the interval is the smallest of 1 min, 5 min,
+  15 min, 1 h, 3 h, 6 h, 1 day giving at most 200 buckets over the range) and
+  `device_id` on each occurrence.
+- `GET /api/exceptions/occurrences?fingerprint=F[&page=N][&page_size=M]`
+  (default 30 days, page size 10, at most 50) -> `{fingerprint, occurrences,
+  total_count, page, page_size}`: the group's rows, most recent first, each
+  with time, count, version, build type, device, OS, scene, `session_id`,
+  `device_id`, `context`, `breadcrumbs`, `error_seq`, `session_ms`,
+  `unhandled`, `ctx_merged` (the fields of the detail's latest 20). The page
+  is found by `(timestamp, event_id)` only, then the full rows (context,
+  breadcrumbs) are read for its ids alone (one row per id). Only the 10000
+  most recent rows can be paged through: a page beyond is a 400 saying so
+  (narrow the time range for older ones).
+- `GET /api/exceptions/distribution?fingerprint=F` and one of
+  `by=app_version|build_type|device_model|platform|os_version` (default
+  `app_version`) or `key=<context key>` (default 30 days) ->
+  `{fingerprint, group_by, total, merged, truncated, rows[{value, count,
+  sessions}]}`: occurrences (`sum(count)`) per value, top 50. For a context
+  key, occurrences of counts the SDK merged across contexts that lack the key
+  are `merged` (not under `""`, "key not set"), as in
+  `/api/context/distribution` (APM-3).
+
+Sessions (APM-15; these two take only a time range, not the common filter: a
+session is shown whole):
+
+- `GET /api/sessions/timeline?session_id=S[&at=T][&start_time&end_time][&perf=1]`
+  -> `{session_id, start_time, end_time, found, session, items, counts,
+  truncated, duplicate_breadcrumbs, perf, perf_interval_seconds}`.
+  Range: as given; else `at` +- 24 h; else the last 7 days; at most 31 days
+  (400). `session`: first and last row's time, `started_at` (from an
+  exception's `session_ms`, when one carries it), device id, version, build
+  type, platform, device, OS of the latest row, row count. `items`, sorted by
+  time (then: context change, breadcrumb, rows by the SDK's `seq`), each with
+  `time` and `type`:
+  - `custom_event` (`name`, `props`, `count`; `aggregated`: a count of calls
+    beyond the SDK's per-minute budget, from `time` to the end of that
+    minute, without properties), `custom_metric` (one window aggregate:
+    `count`, `sum`, `min`, `max`, `unit`, `window_ms`), `exception` (one row:
+    first occurrence or repeat count, with `count`, `error_seq`,
+    `session_ms`, `unhandled`, type, throw/call site, message cut to 2000
+    characters, `fingerprint`), `crash` (type, fingerprint, the first 300
+    characters of the stack), `jank` (with `recent_events`),
+    `scene_load`, `startup`; each with its `context`.
+  - `breadcrumb`: the lines exceptions (`breadcrumbs`), janks
+    (`recent_events`) and crashes carry, with `kind` (`event`, `scene`,
+    `warning`, `error`, `assert`, `exception`, `text`), `text`, `repeats` and
+    `repeat_until` for a log line the SDK counted ("x37 until ..."), `source`.
+    A line has only a time of day ("[HH:mm:ss.fff]", UTC): its date is that
+    of the carrying row (the previous day if the time is later than the
+    row's). A line carried by several rows is shown once (the highest count;
+    compared on time, kind and the first 120 characters, since carriers cut
+    lines at different lengths: a counted log line keeps ~140 characters of
+    text in a jank, ~240 in an exception). A line that stands for a row on
+    the time line is dropped: `Event: <name>` within 1 s of an individually
+    sent custom event of that name, `Exception: <first line>` within 1 s of
+    an exception row with that first line, `Error:`/`Assert: <text>` within
+    1 s of an exception row of log type error/assert with that first line (a
+    `Debug.LogError` is both), `Scene: <name>` within 5 s of a scene load of
+    that scene. Both are counted in `duplicate_breadcrumbs`. Lines without a
+    time (older SDKs) get the carrying row's time and `time_unknown`, and are
+    shown once per source, kind and text (old SDKs repeat them on every
+    jank).
+  - `context`: a change of the game context, derived server-side (below):
+    `changes[{key, from, to}]` (`""` = not set), `source`: the type of the
+    row it was first seen on, `context`: the whole context after it.
+  - Limits: 1000 rows per type (exceptions 500), 2000 breadcrumbs, 1000
+    context changes; a type with more is listed in `truncated`, and the rows
+    nearest to `at` are kept (the earliest without `at`; context changes:
+    always the earliest). `counts` per type after the limits.
+  - `perf=1`: `perf[{time, samples, fps_avg, fps_min, frame_ms_max,
+    mem_mb_max}]`, the session's perf samples in at most 240 buckets of
+    `perf_interval_seconds` (1 s to 1 day; `perf` in `truncated` if cut).
+  - After the first query (the session's span) the per-type, context and
+    perf queries run in parallel, cancelled with the request or after 25 s
+    (below the admin server's 30 s write timeout). They run on a context
+    without a deadline: clickhouse-go 2.17 writes `max_execution_time` into
+    the settings map of a `clickhouse.Context` with a deadline on every query,
+    which crashes concurrent queries (found by the perf probe below).
+  - `found: false` (200, empty lists) when the session has no row in the range.
+- `GET /api/sessions?device_id=D[&start_time&end_time]` (default 7 days, at
+  most 31) -> `{device_id, start_time, end_time, sessions[{session_id,
+  first_seen, last_seen, rows, exceptions, crashes, app_version, platform,
+  device_model, build_type}], truncated}`: most recent first, at most 100.
+
+### Context changes: derived, no SDK change
+
+Every event carries the context current when it was recorded (APM-5). The
+time line orders the session's rows of all eight tables by time and the
+SDK's `seq` and reports a change where a row's context (its sorted entries,
+hashed) differs from the previous row's (`lagInFrame` window in ClickHouse
+over time, `seq`, source and hash only; the contexts of the changed rows are
+then fetched by hash, and the diff is computed in Go). Counts
+merged across contexts (`ctx_merged = 1`: their context is only what the
+merged occurrences shared) are left out. Limits, honestly:
+
+- A change is visible only at the next row that carries the context: with
+  perf sampling on (one sample a second) within about a second; without it,
+  at the next custom event, exception, jank or scene load, possibly much
+  later. A context set and changed again between two rows is never seen.
+- Metric and aggregated custom event rows carry the context of their first
+  sample/call (`timestamp` = that moment), so they agree with the rest.
+- Rows of the same millisecond are ordered by `seq` (the order the SDK
+  stored them), not by when the context was read.
+
+An SDK event "context changed" would remove the first two limits; it is not
+needed for the tickets' scenarios and is left for when it is.
+
+### Schema: `idx_session_id`
+
+```sql
+ALTER TABLE <t> ADD INDEX IF NOT EXISTS idx_session_id session_id TYPE bloom_filter(0.01) GRANULARITY 1;
+```
+
+for the eight event tables; in `CREATE TABLE` for new installs and in
+`scripts/migrate.sql`. `session_id` is in no sort key: without the index a
+session's time line reads the `session_id` column of every row of every
+table in the range. Metadata only; parts written afterwards carry the index;
+existing parts get it when merged, or at once with (optional, a background
+mutation per table that reads the column and writes the index):
+
+```sql
+ALTER TABLE <t> MATERIALIZE INDEX idx_session_id;
+```
+
+**Privileges.** `Migrate` adds the index where it may. The production `apm`
+account (SELECT, INSERT, CREATE TABLE, ALTER ADD COLUMN) may not (ClickHouse
+also checks the privilege when the index exists, so tables that have it are
+skipped): the server starts, serves, and logs **one** warning per start,
+`could not add the session_id index; ...`, naming the tables, until an admin
+runs (on n192, as an admin):
+
+```sh
+clickhouse-client -d ozx_apm --multiquery <<'SQL'
+ALTER TABLE apm_perf_samples ADD INDEX IF NOT EXISTS idx_session_id session_id TYPE bloom_filter(0.01) GRANULARITY 1;
+ALTER TABLE apm_janks ADD INDEX IF NOT EXISTS idx_session_id session_id TYPE bloom_filter(0.01) GRANULARITY 1;
+ALTER TABLE apm_startups ADD INDEX IF NOT EXISTS idx_session_id session_id TYPE bloom_filter(0.01) GRANULARITY 1;
+ALTER TABLE apm_scene_loads ADD INDEX IF NOT EXISTS idx_session_id session_id TYPE bloom_filter(0.01) GRANULARITY 1;
+ALTER TABLE apm_exceptions ADD INDEX IF NOT EXISTS idx_session_id session_id TYPE bloom_filter(0.01) GRANULARITY 1;
+ALTER TABLE apm_crashes ADD INDEX IF NOT EXISTS idx_session_id session_id TYPE bloom_filter(0.01) GRANULARITY 1;
+ALTER TABLE apm_custom_events ADD INDEX IF NOT EXISTS idx_session_id session_id TYPE bloom_filter(0.01) GRANULARITY 1;
+ALTER TABLE apm_custom_metrics ADD INDEX IF NOT EXISTS idx_session_id session_id TYPE bloom_filter(0.01) GRANULARITY 1;
+SQL
+# optional, existing parts at once:
+# for t in apm_perf_samples apm_janks apm_startups apm_scene_loads apm_exceptions apm_crashes apm_custom_events apm_custom_metrics; do
+#   clickhouse-client -d ozx_apm -q "ALTER TABLE $t MATERIALIZE INDEX idx_session_id"; done
+clickhouse-client -d ozx_apm -q "SELECT name FROM system.tables WHERE database = 'ozx_apm' AND position(create_table_query, 'INDEX idx_session_id ') > 0"   # the 8 tables
+```
+
+(the same statements as in `scripts/migrate.sql`). The `apm` account's
+grants are not changed. The order does not matter: the server works before
+and after the admin step (only slower before), and the next start after it
+logs no warning. Size, measured on the data below: 0.02% of
+`apm_perf_samples`, 0.2% of `apm_exceptions`, under 1% of the smaller tables
+(1.1 MB for 14 M rows).
+
+### Cost
+
+Measured on ClickHouse 26.1 locally, a scratch database with 7 days of
+50,000 sessions of 30 minutes (about 150 at once), 20,000 devices, 3
+versions: 10 M perf samples, 3 M exception rows (200 groups, one with a third
+of the rows; a third of the rows with 10 breadcrumbs), 500 k custom events,
+200 k metric rows, 200 k janks, 200 k scene loads, 50 k startups, 5 k
+crashes; median of 3 runs; the query condition cache of 26.1 off, so every
+run reads what a first request reads (`/tmp/claude-501/apm11/perf`):
+
+| Request | Queries | Rows read, no index | With `idx_session_id` | Time no index / with |
+|---|---|---|---|---|
+| Time line from an occurrence (at, session's range) | 10 | 4.7 M (163 MB) | 0.61 M (59 MB) | 49 / 48 ms |
+| Time line by id, 7 or 30 days | 10 | 16.2 M (453 MB) | 0.78 M (63 MB) | 58 / 46-60 ms |
+| Unknown session, 30 days | 1 | 14.2 M (358 MB) | 0.14 M (3.5 MB) | 29 / 24 ms |
+| + perf track | +1 | | +16 k | 47 ms |
+| Sessions of a device, 7 days | 1 | 14.2 M (177 MB) | same (no device index) | 41 ms |
+| Exception list, 24 h / 7 d | 2 | 1.5 M / 6.0 M | unchanged | 42 / 87-97 ms |
+| Detail, largest group / small group, 30 d | 6 | 12.1 M / 5.7 M | unchanged | 132 / 80 ms |
+| Occurrences, page 1 or 100 | 3 | 4.0 M (175-189 MB) | unchanged | 35-40 ms |
+| Distribution by roomId / by version, 30 d | 3 / 2 | 6.0 M / 4.0 M | unchanged | 53 / 34 ms |
+
+The time line's queries after the first run in parallel, so its time is about
+that of its slowest query, not their sum (the "ch ms" sum is 70-86 ms).
+
+- The time line's first query finds the session's first and last row; the
+  others read only that span (one or two daily partitions). Per-type limits
+  bound what is returned; the context query sorts the session's rows of all
+  tables by time with only (time, seq, source, hash) (a few thousand rows per
+  hour of play; a session kept open for days is bounded by the 31-day range).
+- The detail's new trend query reads the group's `timestamp`, `count`,
+  `session_id` (0.9 M rows, 31 MB, 9 ms for the small group over 30 days).
+  The list's new `sessions_with_seq` is one more `uniqExactIf` over the
+  same rows.
+- The exception queries filter on `fingerprint` (second column of the sort
+  key) and the time range, as the APM-4 detail did. An occurrence page sorts
+  only `(timestamp, event_id)` of the group's rows (offset at most 10000),
+  then reads context and breadcrumbs of its 10 ids.
+- Sessions of a device read the `device_id` column of every table in the
+  range (the search box offers up to 30 days: about 4 times the 7-day
+  figure). A `device_id` bloom filter (tried: 0.5 M rows instead of 14 M,
+  1.2 MB) is not part of this release; add it the same way if device lookups
+  become slow.
+
+### Admin UI
+
+- Exceptions: sort (occurrences, affected sessions, first seen, last seen),
+  "First error of the session only", a "First error in" column, rows open the
+  detail page.
+- Exception detail (`/exceptions/detail?fingerprint=F`, all filters of the
+  filter bar apply): summary (occurrences, sessions, share of sessions where
+  it was the first error, unhandled, first and last seen with their
+  versions), trend, the stack as parsed by the server (inner exception
+  chain, in-app frames, file:line where the build has them; for an exception
+  logged inside an error, e.g. by the event bus, "logged from <LogError call
+  site>" and the log call's stack; the raw text as sent), distribution by
+  version, build type, device, platform, OS or any context key ("Filter"
+  adds it to the filter bar), occurrences page by page (context, breadcrumbs
+  and recent log lines by kind on a time line, session id, error number in
+  the session, time into the session, device id, unhandled and merged
+  flags) with links to the session time line at that moment and to the
+  device's sessions.
+- Sessions (`/sessions`): the time line (filter by type, optional FPS track,
+  anchored and scrolled to the occurrence it was opened from, session start
+  and "last data" markers), search by session id, a device's sessions.
+- Game text (messages, breadcrumbs, context values, ids) is only rendered as
+  text; links are built with `URLSearchParams`. Missing fields (old SDK rows,
+  an older server) render as empty, never as an error or a blank page.
+
+### Rolling deploy and rollback
+
+Old and new binaries can serve side by side: the old binary does not read or
+write the index (it is a skip index; inserts maintain it whoever inserts).
+The admin UI of this release needs this server; the previous UI works with
+it. **Rollback:** redeploy the previous server (and admin UI); no schema
+action. The index stays and keeps being maintained on insert (harmless); to
+remove it (admin): `ALTER TABLE <t> DROP INDEX IF EXISTS idx_session_id` per
+table.
+
+### Verified
+
+- Server: `go vet`, unit tests (253 passing test functions, 407 with
+  subtests): breadcrumb parsing (kinds, midnight, counted lines, malformed
+  and hostile text), de-duplication and the rows that cover a line
+  (custom event, exception, LogError/assert, scene), context diffs, the
+  order of same-millisecond items, the nearest-to-`at` cut, the SQL builders
+  (every value bound, every part limited to the session and range, merged
+  counts left out of the context), intervals, sorts, the handlers' 400s and
+  defaults, the parallel query context under `-race`.
+- Integration on ClickHouse 26.1.12, 24.1.8, 23.8.16 (46 / 46 / 44 test
+  functions pass, 0 fail; 23.8 skips 2 that need access management), both
+  insert paths, ingest router -> ClickHouse -> admin router:
+  - the ticket's "room only half built" session: the time line is, in
+    order, context levelId, startup, scene load, roomId -> r-11, room_enter
+    r-11, room_ready r-11, the metric aggregate, the counted warning, roomId
+    -> r-12, room_enter r-12, the bus exception (first error), its repeat
+    count, the aggregated custom event count, a LogError (shown once), an
+    error line, the jank, and nothing after the last perf sample; session
+    start from `session_ms`; 7 lines dropped as duplicates; perf track;
+    the device's sessions; unknown session; 400s;
+  - 1200 custom events in a session: 1000 returned, the ones nearest to
+    `at`, truncated reported;
+  - APM-11: the bus exception in three rooms (41/25/10 occurrences and a
+    merged count of 7: by roomId 3 rooms, merged 7, total 83), by build type
+    with a dev row, by version/device/platform/OS, trend adding up to the
+    count, first error only (the Awake root cause), sorts, occurrences page
+    by page without repeats, past the end, with a context filter;
+  - rows written by the pre-APM-5 binary's INSERT: time line, occurrences,
+    detail and distribution work and read the defaults;
+  - migration: fresh install and the production fixture get the index; the
+    service account gets one warning naming the 6 tables it could not
+    index (the 2 it creates have it), the time line works without the
+    index, and after the admin statements from `migrate.sql` a restart is
+    quiet.
+- Admin UI: `tsc`, 127 vitest tests (new: the detail page with stack,
+  file:line, call site, first-error share, occurrence context/breadcrumbs by
+  kind, encoded session and device links, roomId distribution with merged;
+  an old SDK's group and an old server's response; 404; the time line of
+  the half-built room in order, anchored on the exception, type filters,
+  perf track, not found, a 400, an old session, search by session and
+  device; `<script>`/`<img onerror>` in game text rendered as text), `vite
+  build`.
+- Migration rehearsal (a program outside the repo,
+  `/tmp/claude-501/apm11/rehearsal`) on each version: production schema of
+  a7cd2bc (its `migrate.sql`), servers as a copy of the `apm` account (26.1,
+  24.1; 23.8: default, which adds the index itself); the a7cd2bc binary
+  ingesting 25 batches/s (the half-built room: room_enter, the bus
+  exception with breadcrumbs, a repeat count, an aggregated custom event,
+  perf samples; an old-SDK event) while the new binary starts and migrates
+  (0.2-0.9 s, one index warning naming the 8 tables), both serving; the
+  admin step (ADD INDEX and MATERIALIZE INDEX on the 8 tables, 70 ms) under
+  that load; every acknowledged event stored exactly once (~1500 per run),
+  `sum(count)` exact, daily views equal the tables; re-sends across
+  binaries dropped as duplicates; the new admin API's time line of a
+  session the old binary stored and of one stored during the deploy (same
+  order as above), occurrences with device and context, distribution by
+  roomId, detail on both binaries, a device's sessions; rollback to the old
+  binary alone on the indexed tables and its admin API; the new binary
+  again with no warning. 37 checks per version, all passed (after the
+  review fixes, with the final binary).
+- Performance: above.
+- A code review (another agent) found: every `Debug.LogError` shown twice
+  on the time line (its row and its log line); deep occurrence pages
+  sorting the full rows; the time line's queries run one after the other
+  with no deadline; the context query sorting the maps; long lines of
+  different carriers and untimed lines of old SDKs not de-duplicated; the
+  device link without a range; the occurrence page not reset on a filter
+  change; trend lines drawn across empty periods; the perf track cut
+  silently; crash stacks sent in full; all fixed with tests. Running the
+  perf probe on the parallel version then found the clickhouse-go settings
+  map race (above), fixed with a test.
+
+### Not verified
+
+- On a device and on n192: nothing of this release (the plan is in
+  `/tmp/claude-501/apm11/verify_plan.txt`; the test app needs the two new
+  driver commands `fullroom=` / `halfroom=` from
+  `/tmp/claude-501/apm11/ApmTestDriver.cs`, which compiles against this
+  branch's SDK). File and line on a release build need OZX-1277.
+- Production volume: the numbers above are a local scratch database; the
+  production row counts per day are not known here.
+- Crash rows: the SDK sends none yet; the time line shows them from test
+  rows only.
+- The admin pages were tested with vitest (jsdom), not in a browser.
