@@ -806,10 +806,16 @@ namespace OzxApm.Core
         }
 
         // Profiler markers (development builds only; compiled out of release players).
-        private static readonly ProfilerMarker s_collectorsMarker = new ProfilerMarker("OzxApm.Collectors");
-        private static readonly ProfilerMarker s_uploadMarker = new ProfilerMarker("OzxApm.Upload");
+        // In their own class, so that ApmClient's type initializer does not call
+        // into the engine (Log and ReportInternalError run on any thread, and the
+        // SDK's plain C# parts can be tested outside Unity).
+        private static class Markers
+        {
+            internal static readonly ProfilerMarker Collectors = new ProfilerMarker("OzxApm.Collectors");
+            internal static readonly ProfilerMarker Upload = new ProfilerMarker("OzxApm.Upload");
+            internal static readonly ProfilerMarker Enqueue = new ProfilerMarker("OzxApm.Enqueue");
+        }
         private readonly List<ProfilerMarker> _collectorMarkers = new List<ProfilerMarker>();
-        private static readonly ProfilerMarker s_enqueueMarker = new ProfilerMarker("OzxApm.Enqueue");
 
         private void UpdateInternal()
         {
@@ -831,7 +837,7 @@ namespace OzxApm.Core
             }
 
             // Update collectors
-            using (s_collectorsMarker.Auto())
+            using (Markers.Collectors.Auto())
             {
                 for (int i = 0; i < _collectors.Count; i++)
                 {
@@ -854,7 +860,7 @@ namespace OzxApm.Core
                 _netType = DeviceInfo.GetNetworkType();
             }
 
-            using (s_uploadMarker.Auto())
+            using (Markers.Upload.Auto())
             {
                 try
                 {
@@ -1015,7 +1021,7 @@ namespace OzxApm.Core
                 evt.scene = _currentScene;
                 StampContext(evt, _buildType, _gpu, _ramClass, _netType);
 
-                using (s_enqueueMarker.Auto())
+                using (Markers.Enqueue.Auto())
                     _offlineStorage.Enqueue(evt);
             }
             catch (Exception ex)
