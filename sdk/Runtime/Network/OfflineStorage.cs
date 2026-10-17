@@ -214,6 +214,11 @@ namespace OzxApm.Network
         private DateTime _lastWarningUtc = DateTime.MinValue;
         private int _suppressedWarnings;
 
+        // Serialization buffer and event-id generator (worker only).
+        private readonly JsonLine _line = new JsonLine();
+        private ulong _idState0, _idState1;
+        private bool _idSeeded;
+
         // Pooled buffers for the upload path.
         private byte[] _readBuffer = new byte[16 * 1024];
         private readonly MemoryStream _bodyBuffer = new MemoryStream(16 * 1024);
@@ -1064,13 +1069,15 @@ namespace OzxApm.Network
                     var evt = events[next];
                     if (evt.seq == 0)
                         evt.seq = ++_seq; // kept if the write is retried
-                    if (string.IsNullOrEmpty(evt.event_id))
-                        evt.event_id = Guid.NewGuid().ToString("N"); // client-unique id, generated off the main thread
+                    if (string.IsNullOrEmpty(evt.event_id) && (evt.id_hi | evt.id_lo) == 0)
+                        NextEventId(out evt.id_hi, out evt.id_lo); // kept if the write is retried
 
-                    string line;
+                    // Serialized straight into a reused UTF-8 buffer: no allocation
+                    // per event (APM-3).
+                    _line.Clear();
                     try
                     {
-                        line = JsonSerializer.SerializeEvent(evt);
+                        JsonSerializer.WriteEvent(_line, evt);
                     }
                     catch (Exception ex)
                     {
@@ -1078,9 +1085,10 @@ namespace OzxApm.Network
                         PerfSamplePool.Return(evt);
                         continue;
                     }
+                    _line.Byte((byte)'\n');
 
                     var w = IsHighValueEvent(evt) ? _highWriter : _lowWriter;
-                    int lineBytes = Encoding.UTF8.GetByteCount(line) + 1;
+                    int lineBytes = _line.Length;
                     if (w.OpenEvents > 0 && w.Open.Bytes + w.Buffer.Length + lineBytes > maxBytes)
                     {
                         CommitLineBuffer(w);
@@ -1090,9 +1098,7 @@ namespace OzxApm.Network
                     if (w.Open == null)
                         OpenSegment(w);
 
-                    var bytes = Encoding.UTF8.GetBytes(line);
-                    w.Buffer.Write(bytes, 0, bytes.Length);
-                    w.Buffer.WriteByte((byte)'\n');
+                    w.Buffer.Write(_line.Buffer, 0, lineBytes);
                     w.Buffered.Add(evt);
                     currentBuffered = true;
 
@@ -1117,6 +1123,40 @@ namespace OzxApm.Network
 
         private SegmentWriter[] _writers;
         private SegmentWriter[] Writers => _writers ?? (_writers = new[] { _highWriter, _lowWriter });
+
+        /// <summary>
+        /// A new client-unique event id (128 bits; written as 32 hex digits, like
+        /// the Guid it replaces). Two SplitMix64 streams seeded once from a random
+        /// Guid: unique per install without allocating a Guid string per event.
+        /// The ids only de-duplicate re-sent events (APM-19); they are not secrets.
+        /// Worker thread.
+        /// </summary>
+        private void NextEventId(out ulong hi, out ulong lo)
+        {
+            if (!_idSeeded)
+            {
+                var seed = Guid.NewGuid().ToByteArray();
+                _idState0 = BitConverter.ToUInt64(seed, 0);
+                _idState1 = BitConverter.ToUInt64(seed, 8);
+                _idSeeded = true;
+            }
+            do
+            {
+                hi = SplitMix64(ref _idState0);
+                lo = SplitMix64(ref _idState1);
+            } while ((hi | lo) == 0);
+        }
+
+        private static ulong SplitMix64(ref ulong state)
+        {
+            unchecked
+            {
+                ulong z = state += 0x9E3779B97F4A7C15UL;
+                z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9UL;
+                z = (z ^ (z >> 27)) * 0x94D049BB133111EBUL;
+                return z ^ (z >> 31);
+            }
+        }
 
         private static bool IsHighValueEvent(BaseEvent evt)
         {

@@ -1,18 +1,27 @@
 using System;
 using System.Collections.Generic;
 using System.Globalization;
+using System.Runtime.InteropServices;
 using System.Text;
 using OzxApm.Models;
 
 namespace OzxApm.Utils
 {
     /// <summary>
-    /// Minimal JSON serializer to avoid GC allocations from Unity's JsonUtility
+    /// Serializes events to one line of JSON each: the on-disk record and the
+    /// element of the upload batch. Output does not depend on the current culture.
+    ///
+    /// The storage worker writes events straight into a reused UTF-8 buffer
+    /// (<see cref="JsonLine"/>), so persisting an event allocates nothing once
+    /// the buffer has grown to the largest line (APM-3: the once-per-second perf
+    /// sample used to allocate its JSON three times over: string, byte count,
+    /// bytes, about 3 KB, and 7 KB with a 30-key context). The string methods
+    /// are for tests and diagnostics and produce the same text.
     /// </summary>
     public static class JsonSerializer
     {
-        private static readonly StringBuilder _builder = new StringBuilder(4096);
         private static readonly object _lock = new object();
+        private static readonly JsonLine _line = new JsonLine();
 
         /// <summary>
         /// Serializes an event batch to JSON
@@ -21,175 +30,168 @@ namespace OzxApm.Utils
         {
             lock (_lock)
             {
-                _builder.Clear();
-                _builder.Append("{\"events\":[");
-
+                _line.Clear();
+                _line.Ascii("{\"events\":[");
                 for (int i = 0; i < events.Count; i++)
                 {
-                    if (i > 0) _builder.Append(',');
-                    SerializeEvent(_builder, events[i]);
+                    if (i > 0) _line.Byte((byte)',');
+                    WriteEvent(_line, events[i]);
                 }
-
-                _builder.Append("]}");
-                return _builder.ToString();
+                _line.Ascii("]}");
+                return _line.ToUtf8String();
             }
         }
 
         /// <summary>
-        /// Serializes a single event to one line of JSON (no newlines inside).
-        /// This is both the on-disk record and the element of the upload batch.
-        /// Output does not depend on the current culture.
+        /// Serializes a single event to one line of JSON (no newlines inside),
+        /// exactly the bytes the storage worker writes for it.
         /// </summary>
         public static string SerializeEvent(BaseEvent evt)
         {
             lock (_lock)
             {
-                _builder.Clear();
-                SerializeEvent(_builder, evt);
-                return _builder.ToString();
+                _line.Clear();
+                WriteEvent(_line, evt);
+                return _line.ToUtf8String();
             }
         }
 
-        private static void SerializeEvent(StringBuilder sb, BaseEvent evt)
+        /// <summary>
+        /// Appends the event as one line of JSON (no newline) to w. Allocates
+        /// nothing unless w has to grow. Any thread, one writer per thread.
+        /// </summary>
+        internal static void WriteEvent(JsonLine w, BaseEvent evt)
         {
-            sb.Append('{');
+            w.Byte((byte)'{');
 
             // Common fields
-            AppendField(sb, "type", evt.type, true);
-            AppendField(sb, "event_id", evt.event_id);
-            AppendField(sb, "seq", evt.seq);
-            AppendField(sb, "timestamp", evt.timestamp);
-            AppendField(sb, "app_version", evt.app_version);
-            AppendField(sb, "platform", evt.platform);
-            AppendField(sb, "device_model", evt.device_model);
-            AppendField(sb, "os_version", evt.os_version);
-            AppendField(sb, "session_id", evt.session_id);
-            AppendField(sb, "device_id", evt.device_id);
-            if (!string.IsNullOrEmpty(evt.scene))
-                AppendField(sb, "scene", evt.scene);
-            if (!string.IsNullOrEmpty(evt.build_type))
-                AppendField(sb, "build_type", evt.build_type);
-            if (!string.IsNullOrEmpty(evt.gpu))
-                AppendField(sb, "gpu", evt.gpu);
-            if (!string.IsNullOrEmpty(evt.ram_class))
-                AppendField(sb, "ram_class", evt.ram_class);
-            if (!string.IsNullOrEmpty(evt.net_type))
-                AppendField(sb, "net_type", evt.net_type);
+            w.Ascii("\"type\":");
+            w.String(evt.type);
+            w.Name("event_id");
+            if (string.IsNullOrEmpty(evt.event_id) && (evt.id_hi | evt.id_lo) != 0)
+                w.Id(evt.id_hi, evt.id_lo);
+            else
+                w.String(evt.event_id);
+            w.Name("seq");
+            w.Long(evt.seq);
+            w.Name("timestamp");
+            w.Long(evt.timestamp);
+            Field(w, "app_version", evt.app_version);
+            Field(w, "platform", evt.platform);
+            Field(w, "device_model", evt.device_model);
+            Field(w, "os_version", evt.os_version);
+            Field(w, "session_id", evt.session_id);
+            Field(w, "device_id", evt.device_id);
+            OptionalField(w, "scene", evt.scene);
+            OptionalField(w, "build_type", evt.build_type);
+            OptionalField(w, "gpu", evt.gpu);
+            OptionalField(w, "ram_class", evt.ram_class);
+            OptionalField(w, "net_type", evt.net_type);
 
             // Type-specific fields
             switch (evt)
             {
                 case PerfSampleEvent perf:
-                    AppendField(sb, "fps", perf.fps);
-                    AppendField(sb, "frame_time_ms", perf.frame_time_ms);
-                    AppendField(sb, "main_thread_ms", perf.main_thread_ms);
-                    AppendField(sb, "gc_alloc_kb", perf.gc_alloc_kb);
-                    AppendField(sb, "mem_mb", perf.mem_mb);
+                    Field(w, "fps", perf.fps);
+                    Field(w, "frame_time_ms", perf.frame_time_ms);
+                    Field(w, "main_thread_ms", perf.main_thread_ms);
+                    Field(w, "gc_alloc_kb", perf.gc_alloc_kb);
+                    Field(w, "mem_mb", perf.mem_mb);
                     break;
 
                 case JankEvent jank:
-                    AppendField(sb, "duration_ms", jank.duration_ms);
-                    AppendField(sb, "max_frame_ms", jank.max_frame_ms);
-                    AppendField(sb, "recent_gc_count", jank.recent_gc_count);
-                    AppendField(sb, "recent_gc_alloc_kb", jank.recent_gc_alloc_kb);
-                    AppendFieldArray(sb, "recent_events", jank.recent_events);
+                    Field(w, "duration_ms", jank.duration_ms);
+                    Field(w, "max_frame_ms", jank.max_frame_ms);
+                    w.Name("recent_gc_count");
+                    w.Long(jank.recent_gc_count);
+                    Field(w, "recent_gc_alloc_kb", jank.recent_gc_alloc_kb);
+                    ArrayField(w, "recent_events", jank.recent_events);
                     break;
 
                 case StartupEvent startup:
-                    AppendField(sb, "phase1_ms", startup.phase1_ms);
-                    AppendField(sb, "phase2_ms", startup.phase2_ms);
-                    AppendField(sb, "tti_ms", startup.tti_ms);
+                    Field(w, "phase1_ms", startup.phase1_ms);
+                    Field(w, "phase2_ms", startup.phase2_ms);
+                    Field(w, "tti_ms", startup.tti_ms);
                     break;
 
                 case SceneLoadEvent scene:
-                    AppendField(sb, "scene_name", scene.scene_name);
-                    AppendField(sb, "load_ms", scene.load_ms);
-                    AppendField(sb, "activate_ms", scene.activate_ms);
+                    Field(w, "scene_name", scene.scene_name);
+                    Field(w, "load_ms", scene.load_ms);
+                    Field(w, "activate_ms", scene.activate_ms);
                     break;
 
                 case ExceptionEvent exc:
-                    AppendField(sb, "fingerprint", exc.fingerprint);
-                    AppendField(sb, "message", exc.message);
-                    AppendField(sb, "stack", exc.stack);
-                    AppendField(sb, "count", exc.count);
+                    Field(w, "fingerprint", exc.fingerprint);
+                    Field(w, "message", exc.message);
+                    Field(w, "stack", exc.stack);
+                    w.Name("count");
+                    w.Long(exc.count);
                     // APM-4; absent fields are what older SDKs send.
-                    if (!string.IsNullOrEmpty(exc.log_type))
-                        AppendField(sb, "log_type", exc.log_type);
-                    if (!string.IsNullOrEmpty(exc.embedded_exception))
-                        AppendField(sb, "embedded_exception", exc.embedded_exception);
+                    OptionalField(w, "log_type", exc.log_type);
+                    OptionalField(w, "embedded_exception", exc.embedded_exception);
                     if (exc.breadcrumbs != null && exc.breadcrumbs.Count > 0)
-                        AppendFieldArray(sb, "breadcrumbs", exc.breadcrumbs);
+                        ArrayField(w, "breadcrumbs", exc.breadcrumbs);
                     break;
 
                 case CrashEvent crash:
-                    AppendField(sb, "crash_type", crash.crash_type);
-                    AppendField(sb, "fingerprint", crash.fingerprint);
-                    AppendField(sb, "stack", crash.stack);
-                    AppendFieldArray(sb, "breadcrumbs", crash.breadcrumbs);
+                    Field(w, "crash_type", crash.crash_type);
+                    Field(w, "fingerprint", crash.fingerprint);
+                    Field(w, "stack", crash.stack);
+                    ArrayField(w, "breadcrumbs", crash.breadcrumbs);
                     break;
             }
 
-            // The game context, last: its JSON was built once per context change
-            // and is shared by every event until the next one (APM-5).
+            // The game context, last: its UTF-8 JSON was built once per context
+            // change and is shared by every event until the next one (APM-5).
             var ctx = evt.ctx;
-            if (ctx != null && ctx.Json != null)
-                sb.Append(",\"ctx\":").Append(ctx.Json);
+            if (ctx != null && ctx.JsonUtf8 != null)
+            {
+                w.Ascii(",\"ctx\":");
+                w.Bytes(ctx.JsonUtf8);
+            }
 
-            sb.Append('}');
+            w.Byte((byte)'}');
         }
 
-        private static void AppendField(StringBuilder sb, string name, string value, bool first = false)
+        private static void Field(JsonLine w, string name, string value)
         {
-            if (!first) sb.Append(',');
-            sb.Append('"').Append(name).Append("\":\"");
-            AppendEscapedString(sb, value ?? "");
-            sb.Append('"');
+            w.Name(name);
+            w.String(value);
         }
 
-        // All numbers are formatted with InvariantCulture: under e.g. de-DE the
-        // default formatting writes "59,50", which is invalid JSON and gets the
-        // whole batch rejected.
-        private static void AppendField(StringBuilder sb, string name, long value, bool addComma = true)
+        private static void OptionalField(JsonLine w, string name, string value)
         {
-            if (addComma) sb.Append(',');
-            sb.Append('"').Append(name).Append("\":").Append(value.ToString(CultureInfo.InvariantCulture));
+            if (string.IsNullOrEmpty(value))
+                return;
+            w.Name(name);
+            w.String(value);
         }
 
-        private static void AppendField(StringBuilder sb, string name, int value, bool addComma = true)
+        private static void Field(JsonLine w, string name, float value)
         {
-            if (addComma) sb.Append(',');
-            sb.Append('"').Append(name).Append("\":").Append(value.ToString(CultureInfo.InvariantCulture));
+            w.Name(name);
+            w.Float2(value);
         }
 
-        private static void AppendField(StringBuilder sb, string name, float value, bool addComma = true)
+        private static void ArrayField(JsonLine w, string name, List<string> values)
         {
-            if (addComma) sb.Append(',');
-            sb.Append('"').Append(name).Append("\":");
-            if (float.IsNaN(value) || float.IsInfinity(value))
-                sb.Append("null"); // JSON has no NaN/Infinity
-            else
-                sb.Append(value.ToString("F2", CultureInfo.InvariantCulture));
-        }
-
-        private static void AppendFieldArray(StringBuilder sb, string name, List<string> values, bool addComma = true)
-        {
-            if (addComma) sb.Append(',');
-            sb.Append('"').Append(name).Append("\":[");
-
+            w.Name(name);
+            w.Byte((byte)'[');
             if (values != null)
             {
                 for (int i = 0; i < values.Count; i++)
                 {
-                    if (i > 0) sb.Append(',');
-                    sb.Append('"');
-                    AppendEscapedString(sb, values[i] ?? "");
-                    sb.Append('"');
+                    if (i > 0) w.Byte((byte)',');
+                    w.String(values[i]);
                 }
             }
-
-            sb.Append(']');
+            w.Byte((byte)']');
         }
 
+        /// <summary>
+        /// Appends value to sb as the body of a JSON string (no quotes): the
+        /// same escaping as <see cref="JsonLine.String"/>.
+        /// </summary>
         internal static void AppendEscapedString(StringBuilder sb, string value)
         {
             foreach (char c in value)
@@ -218,6 +220,286 @@ namespace OzxApm.Utils
         {
             // Rough estimate: 200-500 bytes per event
             return events.Count * 350;
+        }
+    }
+
+    /// <summary>
+    /// A reusable buffer holding one line of JSON as UTF-8. Writing allocates
+    /// only when the buffer has to grow. Not thread-safe.
+    ///
+    /// Strings are escaped as before APM-3 (quote, backslash, \n, \r, \t,
+    /// other control characters as \u00xx) and encoded like Encoding.UTF8
+    /// (a lone surrogate becomes U+FFFD). Floats are written like
+    /// float.ToString("F2", CultureInfo.InvariantCulture) on Unity's Mono and
+    /// IL2CPP class libraries, digit for digit (checked against it for every
+    /// float below 0.03125 and every 13th one up to 1e15).
+    /// </summary>
+    internal sealed class JsonLine
+    {
+        private const int InitialCapacity = 4096;
+        // A buffer grown beyond this (a huge exception) is dropped on Clear,
+        // so one big line does not stay resident.
+        private const int MaxRetainedCapacity = 64 * 1024;
+
+        private byte[] _buf;
+        private int _len;
+
+        public JsonLine(int capacity = InitialCapacity)
+        {
+            _buf = new byte[Math.Max(16, capacity)];
+        }
+
+        public byte[] Buffer => _buf;
+        public int Length => _len;
+
+        public void Clear()
+        {
+            _len = 0;
+            if (_buf.Length > MaxRetainedCapacity)
+                _buf = new byte[InitialCapacity];
+        }
+
+        public string ToUtf8String() => Encoding.UTF8.GetString(_buf, 0, _len);
+
+        private void Ensure(int extra)
+        {
+            if (_len + extra <= _buf.Length)
+                return;
+            int size = Math.Max(_buf.Length * 2, _len + extra);
+            var bigger = new byte[size];
+            System.Buffer.BlockCopy(_buf, 0, bigger, 0, _len);
+            _buf = bigger;
+        }
+
+        public void Byte(byte b)
+        {
+            if (_len == _buf.Length)
+                Ensure(1);
+            _buf[_len++] = b;
+        }
+
+        public void Bytes(byte[] bytes)
+        {
+            Ensure(bytes.Length);
+            System.Buffer.BlockCopy(bytes, 0, _buf, _len, bytes.Length);
+            _len += bytes.Length;
+        }
+
+        /// <summary>Writes s, which must be ASCII (field names, literals), as is.</summary>
+        public void Ascii(string s)
+        {
+            Ensure(s.Length);
+            for (int i = 0; i < s.Length; i++)
+                _buf[_len++] = (byte)s[i];
+        }
+
+        /// <summary>Writes ,"name": (name is ASCII and needs no escaping).</summary>
+        public void Name(string name)
+        {
+            Ensure(name.Length + 4);
+            _buf[_len++] = (byte)',';
+            _buf[_len++] = (byte)'"';
+            for (int i = 0; i < name.Length; i++)
+                _buf[_len++] = (byte)name[i];
+            _buf[_len++] = (byte)'"';
+            _buf[_len++] = (byte)':';
+        }
+
+        /// <summary>Writes a quoted, escaped JSON string; null is written as "".</summary>
+        public void String(string s)
+        {
+            Byte((byte)'"');
+            if (s != null)
+            {
+                // At most 6 bytes per UTF-16 unit (\u00xx); reserve in chunks.
+                int n = s.Length;
+                for (int i = 0; i < n; i++)
+                {
+                    if (_buf.Length - _len < 8)
+                        Ensure(Math.Max(8, (n - i) * 3 + 8));
+                    char c = s[i];
+                    if (c < 0x80)
+                    {
+                        switch (c)
+                        {
+                            case '"': _buf[_len++] = (byte)'\\'; _buf[_len++] = (byte)'"'; break;
+                            case '\\': _buf[_len++] = (byte)'\\'; _buf[_len++] = (byte)'\\'; break;
+                            case '\n': _buf[_len++] = (byte)'\\'; _buf[_len++] = (byte)'n'; break;
+                            case '\r': _buf[_len++] = (byte)'\\'; _buf[_len++] = (byte)'r'; break;
+                            case '\t': _buf[_len++] = (byte)'\\'; _buf[_len++] = (byte)'t'; break;
+                            default:
+                                if (c < 32)
+                                {
+                                    _buf[_len++] = (byte)'\\';
+                                    _buf[_len++] = (byte)'u';
+                                    _buf[_len++] = (byte)'0';
+                                    _buf[_len++] = (byte)'0';
+                                    _buf[_len++] = HexDigit(c >> 4);
+                                    _buf[_len++] = HexDigit(c & 0xF);
+                                }
+                                else
+                                {
+                                    _buf[_len++] = (byte)c;
+                                }
+                                break;
+                        }
+                    }
+                    else if (c < 0x800)
+                    {
+                        _buf[_len++] = (byte)(0xC0 | (c >> 6));
+                        _buf[_len++] = (byte)(0x80 | (c & 0x3F));
+                    }
+                    else if (char.IsHighSurrogate(c) && i + 1 < n && char.IsLowSurrogate(s[i + 1]))
+                    {
+                        int cp = char.ConvertToUtf32(c, s[i + 1]);
+                        i++;
+                        _buf[_len++] = (byte)(0xF0 | (cp >> 18));
+                        _buf[_len++] = (byte)(0x80 | ((cp >> 12) & 0x3F));
+                        _buf[_len++] = (byte)(0x80 | ((cp >> 6) & 0x3F));
+                        _buf[_len++] = (byte)(0x80 | (cp & 0x3F));
+                    }
+                    else if (char.IsSurrogate(c))
+                    {
+                        // A lone surrogate: U+FFFD, as Encoding.UTF8 writes it.
+                        _buf[_len++] = 0xEF;
+                        _buf[_len++] = 0xBF;
+                        _buf[_len++] = 0xBD;
+                    }
+                    else
+                    {
+                        _buf[_len++] = (byte)(0xE0 | (c >> 12));
+                        _buf[_len++] = (byte)(0x80 | ((c >> 6) & 0x3F));
+                        _buf[_len++] = (byte)(0x80 | (c & 0x3F));
+                    }
+                }
+            }
+            Byte((byte)'"');
+        }
+
+        private static byte HexDigit(int v) => (byte)(v < 10 ? '0' + v : 'a' + v - 10);
+
+        /// <summary>Writes a quoted 32-digit lowercase hex id (as Guid.ToString("N")).</summary>
+        public void Id(ulong hi, ulong lo)
+        {
+            Ensure(34);
+            _buf[_len++] = (byte)'"';
+            for (int shift = 60; shift >= 0; shift -= 4)
+                _buf[_len++] = HexDigit((int)((hi >> shift) & 0xF));
+            for (int shift = 60; shift >= 0; shift -= 4)
+                _buf[_len++] = HexDigit((int)((lo >> shift) & 0xF));
+            _buf[_len++] = (byte)'"';
+        }
+
+        /// <summary>Writes an integer in invariant form.</summary>
+        public void Long(long value)
+        {
+            Ensure(20);
+            ulong u;
+            if (value < 0)
+            {
+                _buf[_len++] = (byte)'-';
+                u = (ulong)(-(value + 1)) + 1; // also for long.MinValue
+            }
+            else
+            {
+                u = (ulong)value;
+            }
+            int start = _len;
+            do
+            {
+                _buf[_len++] = (byte)('0' + (int)(u % 10));
+                u /= 10;
+            } while (u != 0);
+            Array.Reverse(_buf, start, _len - start);
+        }
+
+        [StructLayout(LayoutKind.Explicit)]
+        private struct FloatBits
+        {
+            [FieldOffset(0)] public float Float;
+            [FieldOffset(0)] public int Int;
+        }
+
+        private static readonly decimal[] s_pow10 =
+        {
+            1m, 10m, 100m, 1000m, 10000m, 100000m, 1000000m, 10000000m, 100000000m, 1000000000m,
+            10000000000m, 100000000000m, 1000000000000m, 10000000000000m, 100000000000000m, 1000000000000000m
+        };
+
+        /// <summary>
+        /// Writes value with two decimals, as float.ToString("F2", InvariantCulture)
+        /// does on Unity's class libraries: the exact value is rounded to 7
+        /// significant digits (half away from zero), then to 2 decimals; no
+        /// sign on zero. NaN and infinities are written as null (JSON has none).
+        /// </summary>
+        public void Float2(float value)
+        {
+            if (float.IsNaN(value) || float.IsInfinity(value))
+            {
+                Ascii("null");
+                return;
+            }
+            float a = Math.Abs(value);
+            if (a >= 1e15f)
+            {
+                // Never a metric; allocates.
+                Ascii(value.ToString("F2", CultureInfo.InvariantCulture));
+                return;
+            }
+
+            long hundredths;
+            if (a < 0.03125f)
+            {
+                // Below 2^-5 the exact value needs more than 28 decimals; only
+                // these 7-digit ties decide between 0.00 and 0.03.
+                double x = a;
+                hundredths = x >= 0.024999995 ? 3 : x >= 0.014999995 ? 2 : x >= 0.0049999995 ? 1 : 0;
+            }
+            else
+            {
+                decimal d = Math.Round(RoundSignificant7(ExactDecimal(a)), 2, MidpointRounding.AwayFromZero);
+                hundredths = (long)(d * 100m);
+            }
+
+            Ensure(24);
+            if (value < 0 && hundredths != 0)
+                _buf[_len++] = (byte)'-';
+            Long(hundredths / 100);
+            _buf[_len++] = (byte)'.';
+            int frac = (int)(hundredths % 100);
+            _buf[_len++] = (byte)('0' + frac / 10);
+            _buf[_len++] = (byte)('0' + frac % 10);
+        }
+
+        // The exact value of a float in [2^-5, 1e15): m * 2^e fits a decimal
+        // (at most 28 decimals, m * 5^28 < 2^96).
+        private static decimal ExactDecimal(float a)
+        {
+            int bits = new FloatBits { Float = a }.Int;
+            int e = ((bits >> 23) & 0xFF) - 150;
+            long m = (bits & 0x7FFFFF) | 0x800000;
+            if (e >= 0)
+                return m * (decimal)(1L << e);
+            return m / (decimal)(1L << -e);
+        }
+
+        private static decimal RoundSignificant7(decimal d)
+        {
+            if (d >= 1m)
+            {
+                int intDigits = 1;
+                while (intDigits < s_pow10.Length && d >= s_pow10[intDigits])
+                    intDigits++;
+                int decimals = 7 - intDigits;
+                if (decimals >= 0)
+                    return Math.Round(d, decimals, MidpointRounding.AwayFromZero);
+                decimal scale = s_pow10[-decimals];
+                return Math.Round(d / scale, 0, MidpointRounding.AwayFromZero) * scale;
+            }
+            int zeros = 0; // after the decimal point, before the first digit
+            while (d * s_pow10[zeros + 1] < 1m)
+                zeros++;
+            return Math.Round(d, 7 + zeros, MidpointRounding.AwayFromZero);
         }
     }
 }

@@ -35,6 +35,13 @@ namespace OzxApm.Models
 
         /// <summary>Came from an event pool; returned to it after serialization.</summary>
         [NonSerialized] internal bool pooled;
+
+        /// <summary>
+        /// The event id as 128 bits, assigned by the storage worker when event_id
+        /// is empty and written as its 32 hex digits: no string per event (APM-3).
+        /// </summary>
+        [NonSerialized] internal ulong id_hi;
+        [NonSerialized] internal ulong id_lo;
     }
 
     [Serializable]

@@ -24,12 +24,16 @@ namespace OzxApm.Core
         /// <summary>The context as a JSON object ({"key":"value",...}); null when empty.</summary>
         internal readonly string Json;
 
+        /// <summary>Json as UTF-8, copied as is into every event's line (APM-3); null when empty.</summary>
+        internal readonly byte[] JsonUtf8;
+
         internal ContextSnapshot(int version, string[] keys, string[] values)
         {
             Version = version;
             _keys = keys;
             _values = values;
             Json = keys.Length == 0 ? null : BuildJson(keys, values);
+            JsonUtf8 = Json == null ? null : Encoding.UTF8.GetBytes(Json);
         }
 
         public int Count => _keys.Length;

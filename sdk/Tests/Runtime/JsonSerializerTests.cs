@@ -1,5 +1,6 @@
 using System.Collections.Generic;
 using System.Globalization;
+using System.Text;
 using System.Threading;
 using NUnit.Framework;
 using UnityEngine;
@@ -124,6 +125,95 @@ namespace OzxApm.Tests
 
             StringAssert.Contains("\"fps\":null", json);
             StringAssert.Contains("\"frame_time_ms\":null", json);
+        }
+
+        // APM-3: floats are formatted without allocating, digit for digit as
+        // float.ToString("F2", InvariantCulture) on this runtime's class library.
+        [Test]
+        public void Float2_MatchesToStringF2()
+        {
+            var values = new List<float>
+            {
+                0f, -0f, 0.001f, -0.004f, 0.005f, 0.015f, 0.025f, 0.0149999959f, 0.0249999985f, 0.03125f, 0.125f, 1.005f,
+                59.5f, 59.995f, 99.995f, -1.995f, 150109.25f, 2071466.5f, 16777217f, 9999999.5f, 1e14f, 999999999999999f
+            };
+            var random = new System.Random(3);
+            var bits = new byte[4];
+            while (values.Count < 200000)
+            {
+                random.NextBytes(bits);
+                float v = System.BitConverter.ToSingle(bits, 0);
+                if (!float.IsNaN(v) && !float.IsInfinity(v) && System.Math.Abs(v) < 1e15f)
+                    values.Add(v);
+                values.Add((float)(random.NextDouble() * 240));
+                values.Add(random.Next(-100000, 100000) / 200f);
+            }
+
+            var line = new JsonLine();
+            int mismatches = 0;
+            string first = null;
+            foreach (float v in values)
+            {
+                line.Clear();
+                line.Float2(v);
+                string mine = Encoding.ASCII.GetString(line.Buffer, 0, line.Length);
+                string expected = v.ToString("F2", CultureInfo.InvariantCulture);
+                if (mine != expected)
+                {
+                    mismatches++;
+                    first = first ?? v.ToString("R", CultureInfo.InvariantCulture) + ": " + mine + " != " + expected;
+                }
+            }
+            Assert.AreEqual(0, mismatches, first);
+        }
+
+        // The worker writes UTF-8 bytes directly; they are what Encoding.UTF8
+        // makes of the old string (a lone surrogate becomes U+FFFD in both).
+        [Test]
+        public void WriteEvent_Utf8_MatchesEncodingOfTheText()
+        {
+            // e-acute, u-umlaut, CJK, an emoji (surrogate pair), escapes, controls, DEL, U+2028, lone surrogates.
+            string text = "\u00e9 \u00fc \u4e2d\u6587 \U0001F600 \"q\" \\ \t\n\r \u0001 \u007f " + (char)0x2028 + " lone:" + (char)0xD800 + " end:" + (char)0xDC00;
+            var evt = new ExceptionEvent { fingerprint = "f", message = text, stack = text, count = 1, event_id = "e" };
+            var line = new JsonLine(16); // grows while writing
+            JsonSerializer.WriteEvent(line, evt);
+            var bytes = new byte[line.Length];
+            System.Buffer.BlockCopy(line.Buffer, 0, bytes, 0, line.Length);
+
+            string json = Encoding.UTF8.GetString(bytes);
+            CollectionAssert.AreEqual(Encoding.UTF8.GetBytes(json), bytes);
+            string expected = "\"message\":\"\u00e9 \u00fc \u4e2d\u6587 \U0001F600 \\\"q\\\" \\\\ \\t\\n\\r \\u0001 \u007f " + (char)0x2028 + " lone:" + (char)0xFFFD + " end:" + (char)0xFFFD + "\"";
+            StringAssert.Contains(expected, json);
+        }
+
+        [Test]
+        public void WriteEvent_WorkerAssignedId_IsWrittenAs32HexDigits()
+        {
+            var evt = new PerfSampleEvent { id_hi = 0x0123456789abcdefUL, id_lo = 0xfedcba9876543210UL };
+            StringAssert.Contains("\"event_id\":\"0123456789abcdeffedcba9876543210\"", JsonSerializer.SerializeEvent(evt));
+            evt.event_id = "given";
+            StringAssert.Contains("\"event_id\":\"given\"", JsonSerializer.SerializeEvent(evt), "an id set by the caller wins");
+        }
+
+        [Test]
+        public void WriteEvent_LongAndContext()
+        {
+            var evt = new PerfSampleEvent { seq = long.MaxValue, timestamp = -1 };
+            string json = JsonSerializer.SerializeEvent(evt);
+            StringAssert.Contains("\"seq\":9223372036854775807", json);
+            StringAssert.Contains("\"timestamp\":-1", json);
+
+            OzxApm.Core.GameContext.ResetForTests();
+            try
+            {
+                OzxApm.Core.GameContext.Set("roomId", "r-\"12\"");
+                evt.ctx = OzxApm.Core.GameContext.Current;
+                StringAssert.EndsWith(",\"ctx\":{\"roomId\":\"r-\\\"12\\\"\"}}", JsonSerializer.SerializeEvent(evt));
+            }
+            finally
+            {
+                OzxApm.Core.GameContext.ResetForTests();
+            }
         }
 
         [Test]

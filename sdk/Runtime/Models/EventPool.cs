@@ -69,6 +69,8 @@ namespace OzxApm.Models
             // Every field: a stale event_id/seq/timestamp would be kept by the worker.
             evt.timestamp = 0;
             evt.event_id = null;
+            evt.id_hi = 0;
+            evt.id_lo = 0;
             evt.seq = 0;
             evt.app_version = null;
             evt.platform = null;

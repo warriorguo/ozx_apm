@@ -135,5 +135,48 @@ namespace OzxApm.Tests
                 _store.Enqueue(e);
             }, Is.Not.AllocatingGCMemory());
         }
+
+        // APM-3 idle zero GC: writing a sample (with a 30-key context) to its open
+        // segment allocates nothing either: no JSON string, no byte array, no
+        // event id string. (Opening and sealing a segment, every BatchSize
+        // events, and the seq reservation, every 1000, still allocate.)
+        [Test]
+        public void PersistingASample_DoesNotAllocate()
+        {
+            GameContext.ResetForTests();
+            try
+            {
+                for (int i = 0; i < 30; i++)
+                    GameContext.Set("key" + i, "value " + i + " " + new string('v', 20));
+                var config = new ApmConfig { BatchSize = 1000, FlushIntervalSeconds = 3600f, LowValueUploadIntervalSeconds = 0f, LogLevel = LogLevel.None };
+                var store = new OfflineStorage(config, _dir + "_persist", false);
+                try
+                {
+                    for (int i = 0; i < 8; i++)
+                    {
+                        var warm = Rent(i);
+                        warm.ctx = GameContext.Current;
+                        store.Enqueue(warm);
+                        store.Pump();
+                    }
+                    var e = Rent(59.5f);
+                    e.ctx = GameContext.Current;
+                    store.Enqueue(e);
+
+                    Assert.That(() => store.Pump(), Is.Not.AllocatingGCMemory());
+                    StringAssert.Contains("\"fps\":59.50", File.ReadAllText(Directory.GetFiles(_dir + "_persist", "*.open")[0]));
+                }
+                finally
+                {
+                    store.Shutdown(0);
+                    if (Directory.Exists(_dir + "_persist"))
+                        Directory.Delete(_dir + "_persist", true);
+                }
+            }
+            finally
+            {
+                GameContext.ResetForTests();
+            }
+        }
     }
 }
