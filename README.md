@@ -162,6 +162,31 @@ ApmClient.ClearContext();
   network type. The admin shows release builds by default. In the Unity Editor
   events are stored but not uploaded unless `ApmConfig.UploadInEditor = true`.
 
+### Custom events, metrics and timers
+
+```csharp
+ApmClient.TrackEvent("room_enter", "roomId", roomId);   // uploaded, and a breadcrumb
+ApmClient.RecordMetric("gold_delta", delta, "count");
+
+var t = ApmClient.StartTimer("room_switch_ms");          // a struct: nothing allocated
+// ... set the new room's context, then:
+ApmClient.StopTimer(t);                                   // or StopTimer("room_switch_ms")
+```
+
+- Custom events go onto the breadcrumb time line that later exceptions and
+  janks carry, together with the recent Warning/Error log lines (not plain
+  logs): an exception shows, in order, e.g. `Event: room_enter roomId=12`,
+  `Warning: Asset not found: anim/arack_red`, then the NRE. The first 60 events
+  a minute (`ApmConfig.MaxCustomEventsPerMinute`) are uploaded one by one with
+  their properties; more are uploaded as counts per name and context.
+- Metrics and timers are aggregated on the device per name, game context and
+  minute (count, sum, min, max, histogram): the admin's Custom page shows
+  p50/p95/p99 per context value (roomId...), version or device, within 2%.
+- Names and property keys: `[A-Za-z0-9_.-]{1,64}`; property values up to 256
+  characters, at most 64 properties (the context's limits). **Never put personal
+  data in names, properties or units.** Technical data: collected only with
+  technical consent; business events (purchases, funnels) are not for this API.
+
 ### Privacy consent
 
 Two categories, each `Undecided`, `Granted` or `Denied`: `Technical`
@@ -254,6 +279,11 @@ curl -X POST http://localhost:8081/api/privacy/verify -H "Authorization: Bearer 
 | `scene_load` | Scene load and activation time |
 | `exception` | Non-fatal exceptions |
 | `crash` | Fatal crashes with breadcrumbs |
+| `custom_event` | `ApmClient.TrackEvent` (APM-6) |
+| `custom_metric` | `RecordMetric` / timers, aggregated per name, context and minute (APM-6) |
+
+Other types (`asset_load`, `http`: planned) are rejected with a reason in the
+response (`errors`, `rejected_types`).
 
 ## Performance Budget
 
