@@ -177,8 +177,9 @@ ApmClient.StopTimer(t);                                   // or StopTimer("room_
   janks carry, together with the recent Warning/Error log lines (not plain
   logs): an exception shows, in order, e.g. `Event: room_enter roomId=12`,
   `Warning: Asset not found: anim/arack_red`, then the NRE. The first 60 events
-  a minute (`ApmConfig.MaxCustomEventsPerMinute`) are uploaded one by one with
-  their properties; more are uploaded as counts per name and context.
+  a minute (`ApmConfig.MaxCustomEventsPerMinute`, at most 10 of one name) are
+  uploaded one by one with their properties; more are uploaded as counts per
+  name and context.
 - Metrics and timers are aggregated on the device per name, game context and
   minute (count, sum, min, max, histogram): the admin's Custom page shows
   p50/p95/p99 per context value (roomId...), version or device, within 2%.

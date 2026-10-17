@@ -1363,3 +1363,307 @@ stay; the previous binary does not read them.
   thread and task exceptions, per-frame spam with and without the SDK, three
   rooms in one window, the first-error filter after an Awake failure, idle
   GC with and without 30 context keys, offline/kill.
+
+## APM-6: custom events, custom metrics and timers, recent warnings on the breadcrumb time line (additive schema change)
+
+Deploy order: **server (it creates the two tables), then admin UI, then SDK
+builds.** An older server rejects `custom_event` / `custom_metric` events
+("unknown type", counted in `rejected`, batch `stored: true`), and the SDK
+deletes a stored batch once the server answers: game builds with this SDK
+must only ship once this server runs everywhere, or their custom events and
+metrics are lost (everything else in the batch is stored).
+
+### SDK: API
+
+```csharp
+ApmClient.TrackEvent("room_enter");                              // + overloads: one/two properties,
+ApmClient.TrackEvent("room_enter", "roomId", roomId);            //   IDictionary<string,string>
+ApmClient.RecordMetric("gold_delta", -15);                       // or (name, value, unit)
+ApmTimer t = ApmClient.StartTimer("room_switch_ms");             // a readonly struct
+ApmClient.StopTimer(t);                                          // or StopTimer("room_switch_ms")
+ApmClient.CancelTimer("room_switch_ms");
+```
+
+- All of them: any thread, never throw, return false / -1 when nothing was
+  recorded (before Initialize, without technical consent,
+  `ApmConfig.EnableCustomEvents = false`, invalid name). Technical data
+  (APM-14 `TechnicalAllowed`): nothing is recorded or kept without technical
+  consent; Denied also clears the in-memory time line. Business/operations
+  events (retention, funnels, purchases) are APM-12, not this API.
+- Names and property keys: `[A-Za-z0-9_.-]{1,64}`. Properties: the game
+  context's limits (at most 64, values cut to 256 characters, about 4 KB);
+  invalid keys and empty values are left out, the event is kept. Refusals and
+  cuts log a warning (first 10) and count in `ApmStats.CustomRejected`.
+  **Names, properties and units are stored as sent: they must never contain
+  personal data** (player names, e-mail, account or payment ids, chat or other
+  input text, precise location).
+- Timers: `StopTimer` records the elapsed milliseconds (Stopwatch) as a
+  sample of the metric, unit `ms`, **with the game context at the time it is
+  stopped**: for a room switch, set the new `roomId` first, then stop. A timer
+  that spans a pause of the app (`OnApplicationPause(true)`) is not recorded
+  (`ApmStats.TimersSpanningPause`); `StopTimer` still returns the time. Named
+  timers: one pending per name (a second `StartTimer(name)` replaces it; at
+  most 256 pending names; `ApmStats.TimersUntracked` counts starts beyond that).
+
+### SDK: what is sent
+
+- **Custom events**: every call goes onto the breadcrumb time line (below).
+  Per minute (its own clock: `Flush` and pauses do not renew it), the first
+  `ApmConfig.MaxCustomEventsPerMinute` (60) calls, at most 10 of one name (so
+  one per-frame event cannot use up the budget of the others), are each sent
+  with their properties at once; further calls are counted per (name, game
+  context) and sent as one event per count at the end of the window
+  (`aggregated`, no properties). Every call reaches
+  `sum(count)`, except calls of names beyond 64 distinct names per window
+  (dropped, `ApmStats.CustomEventsDropped`; still on the time line).
+- **Custom metrics**: never one row per sample. Per window, the samples of a
+  (name, game context) series are aggregated into count, sum, min, max and a
+  histogram, sent as one event when the window ends.
+  - Histogram: logarithmic buckets of relative width gamma = 1.02/0.98 (the
+    DDSketch construction): bucket i holds (gamma^(i-1), gamma^i] and reads back
+    as 2 gamma^i / (gamma + 1). Counts are exact and add up across rows and
+    devices (ClickHouse `sumMap`), so **p50/p95/p99 have the exact rank
+    (nearest rank) and a value within 2% of the true sample at that rank**, for
+    magnitudes in [1e-9, 4e15] (0 and negatives work; below 1e-9 reads as 0),
+    clamped to the exact min/max. Chosen over a t-digest: exact and simple to
+    merge server-side in SQL, a fixed error bound, no allocation per sample.
+    Version 1 (`hist_v`); SDK `Utils/MetricHistogram.cs` and server
+    `internal/metrics/buckets.go` must change together (a vector of SDK keys is
+    in the server's tests).
+  - Bucket keys per series and window: arrays start at 64 and grow to 512 (a
+    spread of 8e8 x at 2%; a series reused in later windows keeps its size);
+    beyond that the two lowest keys merge (only the lowest quantiles lose
+    accuracy). A sample that would make the sum infinite is dropped and counted.
+  - Per window: 16 contexts per name and 128 series in all; further contexts
+    go to the name's overflow series, whose context is what its samples shared
+    (`ctx_merged`); names beyond 64 are dropped and counted
+    (`ApmStats.MetricSamplesDropped`).
+- Window: 60 s, also ended by `Flush`, going to background, shutdown, and a
+  new session (counts keep the session they happened in). Custom events and
+  metrics are low-value data (held up to `LowValueUploadIntervalSeconds` like
+  perf samples). An unhandled exception that ends the process flushes the
+  window before the process dies (with APM-3's exception counts); a process
+  killed in the foreground (OOM, native crash, force-stop) loses the counts of
+  its current window; individual custom events are on disk within milliseconds.
+
+### SDK: the breadcrumb time line (exceptions, crashes, janks)
+
+`Core/Timeline.cs`, shared by the collectors: three rings merged in the order
+they were recorded when an event takes a snapshot:
+
+- Breadcrumbs (50): custom events (`Event: room_enter roomId=12`), scene loads
+  (`Scene: Main`), exceptions (`Exception: <first line>`, once per group and
+  window), `ApmClient.RecordBreadcrumb` texts.
+- Recent log lines, 24 warnings and 12 errors/asserts in separate rings (warning
+  spam cannot push errors out, nor the other way round): every **Warning, Error
+  and Assert** line the game logs
+  on any thread (`Warning: Asset not found: anim/arack_red`); not plain `Log`
+  lines, not exceptions (those are the breadcrumbs above), never the SDK's own
+  `[OzxApm]` lines. Fed by APM-3's single log callback (`ILogSink`): the line is
+  stored by reference (Unity hands the string over anyway) with its time, under
+  a leaf lock: **no allocation, no formatting per log line** (0 bytes, 0.09 us on
+  Unity's Mono on a Mac). A new line longer than 4096 characters is stored cut
+  (only it allocates; a repeat of it is only counted). A line of the same shape (equal up to digits, e.g. another
+  enemy id) as one of the 8 most recent ones is counted on that one instead of
+  stored (`Warning: Pool not found for enemy 12 (x300 until 10:00:05.120)`), so
+  a warning logged every frame does not push the cause out. The two rings are
+  separate so log spam cannot evict custom events and vice versa.
+- Privacy: log lines are the game's own text and now reach the server inside
+  breadcrumbs. When a snapshot is formatted, the query string and fragment of
+  every http(s) URL are replaced by `?...` (tokens in UnityWebRequest errors);
+  other personal data must not be logged at Warning/Error level by the game.
+- Exceptions carry the 20 most recent breadcrumbs (200 characters each) and the
+  10 most recent log lines (300 characters each), merged, oldest first; the
+  error being reported is not among its own lines, and an error or assert
+  line on the time line is not added again as an `Exception:` breadcrumb. At
+  most ~7.5 KB per first occurrence (was ~4.5 KB).
+- Janks: `recent_events` (empty before APM-6: `JankDetector.RecordEvent` had no
+  caller) now holds the breadcrumbs (10) and log lines (5) of the 10 s before the
+  jank, 200 characters each.
+- Crashes: the SDK sends no crash events yet (native crash capture is not part
+  of this); an unhandled managed exception that ends the process is an
+  exception event (APM-3) and carries the time line.
+- Wire format of breadcrumbs unchanged (`Array(String)`, `[HH:mm:ss.fff] text`, UTC).
+
+### SDK: cost
+
+Unity's Mono outside Unity (M-series Mac), steady state, 30-key context
+(`/tmp/claude-501/apm6/monoharness/Bench6.cs`):
+
+| Path | Time | Allocated |
+|---|---|---|
+| `RecordMetric`, known name and context | 0.10 us | 0 |
+| ... with a window closed every 1000 samples | 0.09 us | 0.7 B/sample (the window's events) |
+| `StartTimer` + `StopTimer` (handle or name), recorded | 0.18 us | 0 |
+| `TrackEvent` beyond the budget (counted) | 0.11 us | 0 |
+| `TrackEvent` sent, no properties / one property | 0.17 / 0.20 us | 192 / 240 B |
+| Log callback, a warning (time line + exception path) | 0.10 us | 0 |
+| Log callback, a repeated error (APM-3 repeat path + time line) | 0.77 us | 0 |
+| Plain `Log` line | 0.002 us | 0 |
+| `CustomCollector.Update` / window close with nothing recorded | 0.02 / 0.07 us | 0 |
+| Breadcrumb snapshot of a first occurrence (20 + 10 lines) | 2.5-4.3 us | 4.4 KB |
+| Serializing a metric event (storage worker) | 1.6 us | 0 (integral values; a non-integral sum/min/max is written in round-trip form: one short string each) |
+
+Idle (nothing recorded) allocates nothing more than before on the main thread.
+
+### Wire format (SDK -> server)
+
+```json
+{"type":"custom_event", <common fields>, "name":"room_enter", "count":1,
+ "props":{"seed":"991","mode":"hard"}, "ctx":{"levelId":"3","roomId":"r-12"}}
+{"type":"custom_event", ..., "name":"enemy_killed", "count":5, "aggregated":true, "ctx_merged":true, "ctx":{...}}
+{"type":"custom_metric", ..., "name":"room_switch_ms", "unit":"ms", "count":10,
+ "sum":10160.875, "min":640.25, "max":2210.125, "window_ms":60000, "hist_v":1,
+ "hist_keys":[1162,1164,1166], "hist_counts":[1,2,7], "ctx":{...}}
+```
+
+`processor/testdata/sdk_events_apm6.jsonl` are events serialized by the SDK on
+Unity's Mono; the ingest tests store them.
+
+Server validation: `custom_event`: the name rule (else rejected); props
+validated like `ctx` (entries dropped or cut and counted, the event kept); a
+missing or non-positive `count` reads as 1. `custom_metric` is decoded
+strictly and **rejected unless consistent**: positive `count`, finite `sum`,
+`min`, `max` with min <= max, `hist_v` 1, equal-length `hist_keys` /
+`hist_counts` (1-2048) with valid keys and positive counts adding up to
+`count`; an unprintable or over-long (> 16) unit is dropped.
+
+### Ingest: unsupported types are rejected with a reason
+
+Before: an unknown type was counted in `rejected` with the reason "unknown
+type" (the response was already truthful; failed inserts were already never
+accepted, APM-2/19). Now:
+
+- `asset_load` and `http` (planned: APM-7 / APM-8) are rejected with
+  `event <i>: type "http" is not supported yet`; any other unknown type with
+  `event <i>: unknown type "<type>"` (quoted, cut to 64 characters).
+- New response field `rejected_types`: rejected events per such type
+  (`{"http":2}`); absent when none.
+- `errors` holds at most 50 entries, then `... and <n> more` (a batch of 1000
+  bad events produced 1000 strings).
+- Unchanged: rejected events never make `stored` false (resending cannot help);
+  a failed insert is retried server-side, then counted in `failed` (never in
+  `accepted`) and answered 503 + `retry` (integration-tested for the new tables
+  too).
+
+### Schema
+
+`Migrate` creates (also in `scripts/migrate.sql`; `CREATE TABLE IF NOT
+EXISTS`, within the `apm` account's grant, idempotent, no change to existing
+tables):
+
+- `apm_custom_events`: common columns, `name`, `count UInt32`, `aggregated
+  UInt8`, `ctx_merged UInt8`, `props Map(LowCardinality(String), String)`, the
+  APM-2/5 columns; `ReplacingMergeTree`, `ORDER BY (app_version, name,
+  timestamp, event_id)`, the event_id bloom filter index, TTL 30 days.
+- `apm_custom_metrics`: common columns, `name`, `unit`, `count UInt64`,
+  `value_sum`, `value_min`, `value_max Float64`, `window_ms UInt32`,
+  `hist_version UInt8`, `hist_keys Array(Int16)`, `hist_counts Array(UInt64)`,
+  `ctx_merged UInt8`, the APM-2/5 columns; same engine, key, index and TTL.
+- Daily views (the one-year aggregated retention of CLAUDE.md; nothing in the
+  server reads them yet): `apm_custom_event_daily` (SummingMergeTree,
+  `total_count` per date, version, platform, build type, name) and
+  `apm_custom_metric_daily` (AggregatingMergeTree: `sumState(count)`,
+  `sumState(value_sum)`, `minState`, `maxState`, `sumMapState(hist_keys,
+  hist_counts)`, so daily percentiles can be computed from it), both
+  `TTL date + INTERVAL 365 DAY`. Like APM-17's views: created by `Migrate` when
+  the account may (it may on 24.1 and 26.1 with CREATE TABLE; otherwise one
+  warning per view at start, and an admin runs the two statements from
+  `migrate.sql`). They only see rows inserted after they exist; `Migrate`
+  creates them right after the tables, before the new binary serves.
+
+Duplicates (APM-19): the ingest-time lookup covers the new tables (key column
+`name`); the ReplacingMergeTree drops what slips through. Privacy deletion
+(APM-14) finds the new tables by their `device_id` column (integration-tested:
+a device's custom rows are deleted, the daily views are not touched).
+
+### Admin API
+
+All take the common filter (time range, `app_version`, `platform`,
+`build_type` default release incl. `''`, repeatable `ctx=key:value`); default
+range 7 days; numbers are `toInt64` counts and finite floats.
+
+- `GET /api/custom/events` -> `{"events":[{"name","count","sessions","devices","last_seen"}],"truncated"}`:
+  calls (`sum(count)`) per name, top 200.
+- `GET /api/custom/metrics` -> `{"metrics":[{"name","unit","count","sessions","avg","min","max","p50","p90","p95","p99"}],"truncated"}`:
+  samples and percentiles per name over the filter.
+- `GET /api/custom/events/distribution?name=N&<group>` and
+  `GET /api/custom/metrics/distribution?name=N&<group>` with exactly one of
+  `key=<ctx key>`, `prop=<property key>` (events), `by=app_version|platform|device_model|os_version|build_type`
+  (default `by=app_version`) -> `{"name","group_by","unit","total","merged","truncated","rows":[{"value","count","sessions",...percentiles for metrics}]}`,
+  top 50 values. `merged`: calls/samples whose value is not known (counts the
+  SDK merged across contexts and that lack the key; for `prop`, the aggregated
+  events without properties); not in `rows`, included in `total`. A bad
+  parameter is a 400.
+- `/api/context/keys|values` accept `source=custom_events|custom_metrics`; `all`
+  now includes the two tables.
+- Percentiles are computed in Go from the merged histogram
+  (`sumMapIf(hist_keys, hist_counts, hist_version = 1)`): exact rank, value
+  within 2%, clamped to the exact min/max.
+
+Admin UI: a **Custom** page (metrics: list with p50/p95/p99, then per context
+key, version, device...; events: counts per context key, property or column;
+a row adds a context filter).
+
+### Rolling deploy and rollback
+
+Old and new binaries can serve side by side: the old one does not know the
+new tables (it rejects custom events with "unknown type" and stores the rest of
+the batch), the new one stores everything. **Rollback:** redeploy the previous
+binary; no schema action; the tables and views stay (unused; their rows expire
+by TTL). Custom events sent while the old binary serves are rejected and lost
+for good (the SDK drops rejected events): roll back the SDK builds first if
+that matters. To remove the tables after a permanent rollback (admin):
+`DROP VIEW apm_custom_event_daily; DROP VIEW apm_custom_metric_daily; DROP TABLE apm_custom_events; DROP TABLE apm_custom_metrics;`
+
+### Verified
+
+- Server: `go vet`, unit tests (383 passing test functions, among them the
+  bucket math against a vector of keys and values computed by the SDK on
+  Unity's Mono, p50/p95 of merged histograms within 2%, the SDK-serialized
+  fixture stored as sent, validation and rejections, the 50-error cap, failed
+  inserts of the new tables answered 503 and resent without duplicates, the
+  admin parameter checks); admin UI: `tsc`, 96 vitest tests, `vite build`.
+- Integration on ClickHouse 26.1.12, 24.1.8, 23.8.16 (58 / 58 / 54 pass, 0
+  fail; 23.8 skips 2 that need access management), both insert paths: room
+  switch times in 3 rooms x 6 sessions, two versions, a merged series and dev
+  rows through ingest -> ClickHouse -> admin: per-room and per-version p50/p95
+  within 2% of the exact nearest-rank percentiles, counts exact, `merged`,
+  `build_type`, ctx filters, context keys; event counts by context and by
+  property with `merged`; the daily views equal the tables (and give the same
+  p95); asset_load/http/unknown rejected with reasons and stored nowhere; a
+  re-sent batch dropped and `OPTIMIZE FINAL` keeping one row in the new tables;
+  privacy deletion of a device's custom rows; fresh/legacy/service-account
+  migration with 6 views.
+- Migration rehearsal (a program outside the repo, `/tmp/claude-501/apm6/rehearsal`)
+  on each version: production schema of 087940c (its `migrate.sql`), servers as a
+  copy of the `apm` account (26.1, 24.1; 23.8: default), the 087940c binary
+  ingesting 25 batches/s (APM-3 exceptions, an old-SDK event, perf samples and
+  three APM-6 events) while the new binary starts and migrates (0.2-0.8 s), both
+  serving: the old binary rejects the APM-6 events as unknown types and stores
+  the rest; every acknowledged event stored exactly once (~1350 per run), exception
+  `sum(count)`, custom event counts and metric samples exact, rejected events
+  stored nowhere, daily views = tables; re-sends across binaries dropped as
+  duplicates (and the custom events the old binary rejected stored by the new
+  one); new admin API p50/p95 within 2%; old admin API on the migrated database;
+  rollback to the old binary alone and redeploy of the new one; no warning or
+  error in any server log. 37 checks per version, all passed (twice: before and
+  after the review fixes).
+- SDK: compiles at C# 8 with and without `UNITY_2021_2_OR_NEWER`; on Unity's
+  Mono outside Unity 182 runtime tests pass (all logic tests of the new
+  fixtures: time line, budget, aggregation, windows and sessions, histograms,
+  timers, wire format, the warning-then-NRE breadcrumbs), 2 fail for the
+  environment as before (JSONSerializeModule, gzip), 87 need the Unity runtime
+  (among them the 5 new allocation tests and the `CustomApiTests` fixture).
+  Unity EditMode could not run here (the sandbox blocks the licensing client).
+- A code review (another agent) found two defects (a repeated long warning was
+  copied on every call, ~8 KB; the per-minute budget was renewed by every
+  `Flush`) and risks (errors evicted by warning spam, histogram collapse for
+  wide metrics, window lost on a fatal exception, URL tokens in log lines, one
+  name using up the budget, `apm17_fix_schema.sh` not knowing the new
+  tables); all fixed with tests before the numbers above. Not changed: metric
+  and aggregated rows carry the scene current when the window is sent, not
+  where each sample was taken.
+- Not yet run on a device (A33 IL2CPP): see `/tmp/claude-501/apm6/device_test_plan.txt`
+  (warning then NRE, room-switch p50/p95, timers across a pause, warning spam,
+  budget, janks, consent, idle GC with metrics every frame, warning-spam cost).
