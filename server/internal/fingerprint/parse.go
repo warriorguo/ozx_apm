@@ -253,7 +253,7 @@ const maxEmbeddedCandidates = 8
 
 // FindEmbedded returns the index in msg where an embedded Exception.ToString()
 // starts ("System.InvalidOperationException: ..." followed by stack frames or
-// an inner exception), or -1. Only a type name ending in "Exception" counts,
+// an inner exception, see hasExceptionBody), or -1. Only a type name ending in "Exception" counts,
 // at the start of the message or after a space, a colon or an opening
 // bracket or quote.
 func FindEmbedded(msg string) int {
@@ -284,16 +284,41 @@ func FindEmbedded(msg string) int {
 			continue
 		}
 		tries++
-		chain := parseExceptionText(msg[s:])
-		frames := 0
-		for _, e := range chain {
-			frames += len(e.Frames)
-		}
-		if frames > 0 || len(chain) > 1 {
+		if hasExceptionBody(msg[s:]) {
 			return s
 		}
 	}
 	return -1
+}
+
+// hasExceptionBody reports whether text, which starts with an exception
+// type, continues like Exception.ToString(): a stack frame on some line, an
+// inner exception (" ---> " before the first frame or marker line), or an
+// AggregateException inner block. It stops at the first frame.
+func hasExceptionBody(text string) bool {
+	inHeader := true
+	for len(text) > 0 {
+		line := text
+		if i := strings.IndexByte(text, '\n'); i >= 0 {
+			line, text = text[:i], text[i+1:]
+		} else {
+			text = ""
+		}
+		t := strings.TrimSpace(line)
+		switch {
+		case strings.HasPrefix(t, aggregateInnerTag):
+			return true
+		case strings.HasPrefix(t, endOfInnerMarker) || strings.HasPrefix(t, endOfStackMarker):
+			inHeader = false
+			continue
+		case inHeader && strings.Contains(line, innerSeparator):
+			return true
+		}
+		if _, ok := parseFrame(line); ok {
+			return true
+		}
+	}
+	return false
 }
 
 func isTypeByte(c byte) bool {

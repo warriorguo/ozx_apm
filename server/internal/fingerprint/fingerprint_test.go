@@ -397,14 +397,16 @@ func TestParseFrame(t *testing.T) {
 
 func TestFindEmbedded(t *testing.T) {
 	for msg, want := range map[string]int{
-		busPrefix + spawnerNREMono:                                len(busPrefix),
-		spawnerNREIL2CPP:                                          0,
-		"Failed: (" + spawnerNREDotNet + ")":                      len("Failed: ("),
-		busPrefix + "System.Exception: no stack":                  -1, // a message, not an exception dump
-		"ExceptionHandler:Run failed\n  at A.B () [0x0] in <x>:0": -1, // not a type ending in Exception
-		"MyException: a ---> System.IO.IOException: b":            0,  // inner exception, no frames
-		"foo-System.Exception: glued\n  at A.B () [0x0] in <x>:0": -1, // no boundary before the type
-		"Plain error with no exception at all":                    -1,
+		busPrefix + spawnerNREMono:                                                           len(busPrefix),
+		spawnerNREIL2CPP:                                                                     0,
+		"Failed: (" + spawnerNREDotNet + ")":                                                 len("Failed: ("),
+		busPrefix + "System.Exception: no stack":                                             -1, // a message, not an exception dump
+		"ExceptionHandler:Run failed\n  at A.B () [0x0] in <x>:0":                            -1, // not a type ending in Exception
+		"MyException: a ---> System.IO.IOException: b":                                       0,  // inner exception, no frames
+		"x: System.AggregateException: a\n---> (Inner Exception #0) System.Exception: b<---": 3,  // aggregate block, no frames
+		"x: SomeException: a\n--- End of inner exception stack trace ---\nb ---> c":          -1, // "--->" after the header
+		"foo-System.Exception: glued\n  at A.B () [0x0] in <x>:0":                            -1, // no boundary before the type
+		"Plain error with no exception at all":                                               -1,
 	} {
 		if got := FindEmbedded(msg); got != want {
 			t.Errorf("FindEmbedded(%.60q) = %d, want %d", msg, got, want)
