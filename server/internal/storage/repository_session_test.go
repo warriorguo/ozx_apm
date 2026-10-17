@@ -1,10 +1,52 @@
 package storage
 
 import (
+	"context"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/ClickHouse/clickhouse-go/v2"
 )
+
+// The time line's concurrent queries must not run on a context with a
+// deadline (clickhouse-go 2.17 then writes max_execution_time into the
+// settings map of a clickhouse.Context from each query: a fatal concurrent
+// map write), yet they stop with the request or after the timeout.
+func TestParallelQueryContext(t *testing.T) {
+	withSettings := clickhouse.Context(context.Background(), clickhouse.WithSettings(clickhouse.Settings{"log_comment": "x"}))
+	parent, cancelParent := context.WithTimeout(withSettings, time.Hour)
+	ctx, cancel := parallelQueryContext(parent, time.Hour)
+	if _, ok := ctx.Deadline(); ok {
+		t.Error("deadline inherited")
+	}
+	// What each concurrent query does with its context (run with -race).
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() { defer wg.Done(); _ = clickhouse.Context(ctx) }()
+	}
+	wg.Wait()
+	if ctx.Err() != nil {
+		t.Error("cancelled early")
+	}
+	cancelParent()
+	select {
+	case <-ctx.Done():
+	case <-time.After(time.Second):
+		t.Error("not cancelled with the parent")
+	}
+	cancel()
+
+	ctx, cancel = parallelQueryContext(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	select {
+	case <-ctx.Done():
+	case <-time.After(time.Second):
+		t.Error("not cancelled after the timeout")
+	}
+}
 
 func TestSessionQueries_BindEveryValue(t *testing.T) {
 	evil := "s' OR 1=1 --"

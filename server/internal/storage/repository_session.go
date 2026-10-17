@@ -250,6 +250,23 @@ func PerfInterval(first, last time.Time) int {
 // left running after the client got a cut-off answer.
 const sessionTimeout = 25 * time.Second
 
+// parallelQueryContext returns a context for queries run concurrently: it is
+// cancelled when parent is or after timeout, but has no deadline. clickhouse-go
+// (2.17) writes max_execution_time into the settings map of a context made by
+// clickhouse.Context whenever that context has a deadline: concurrent queries
+// on such a context would write the same map at once (a fatal error).
+// Without a deadline the map is only read.
+func parallelQueryContext(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(context.WithoutCancel(parent))
+	stopParent := context.AfterFunc(parent, cancel)
+	timer := time.AfterFunc(timeout, cancel)
+	return ctx, func() {
+		timer.Stop()
+		stopParent()
+		cancel()
+	}
+}
+
 type sourceResult struct {
 	items  []models.TimelineItem
 	crumbs []models.TimelineItem
@@ -260,8 +277,8 @@ type sourceResult struct {
 // GetSessionTimeline returns everything stored for one session in the range,
 // merged by time. After the first query (the session's span), the per-type,
 // context and perf queries run in parallel.
-func (r *Repository) GetSessionTimeline(ctx context.Context, q SessionQuery) (*models.SessionTimeline, error) {
-	ctx, cancel := context.WithTimeout(ctx, sessionTimeout)
+func (r *Repository) GetSessionTimeline(parent context.Context, q SessionQuery) (*models.SessionTimeline, error) {
+	ctx, cancel := parallelQueryContext(parent, sessionTimeout)
 	defer cancel()
 	tl := &models.SessionTimeline{
 		SessionID: q.SessionID, StartTime: q.Start.UTC(), EndTime: q.End.UTC(),
