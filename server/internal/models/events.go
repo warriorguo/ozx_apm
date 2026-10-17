@@ -188,11 +188,47 @@ type Exception struct {
 // (the same, ending the process) or "task" (an unobserved faulted task).
 // CtxMerged: the count merges occurrences in different contexts (beyond the
 // SDK's per-window limit); the context then holds only what they shared.
+//
+// The numbers and the flag are decoded leniently (a value of the wrong JSON
+// type reads as 0 / false): they never make ingest reject the event.
 type ExceptionOccurrenceInfo struct {
-	ErrorSeq  int64  `json:"error_seq"`
-	SessionMs int64  `json:"session_ms"`
-	Unhandled string `json:"unhandled"`
-	CtxMerged bool   `json:"ctx_merged"`
+	ErrorSeq  LenientInt    `json:"error_seq"`
+	SessionMs LenientInt    `json:"session_ms"`
+	Unhandled LenientString `json:"unhandled"`
+	CtxMerged LenientBool   `json:"ctx_merged"`
+}
+
+// LenientString decodes a JSON string; anything else reads as "".
+type LenientString string
+
+func (v *LenientString) UnmarshalJSON(b []byte) error {
+	var s string
+	if err := json.Unmarshal(b, &s); err != nil {
+		s = ""
+	}
+	*v = LenientString(s)
+	return nil
+}
+
+// LenientInt decodes a JSON integer; anything else (a string, a fraction, a
+// number out of the int64 range, an object) reads as 0 instead of an error.
+type LenientInt int64
+
+func (v *LenientInt) UnmarshalJSON(b []byte) error {
+	var n int64
+	if err := json.Unmarshal(b, &n); err != nil {
+		n = 0
+	}
+	*v = LenientInt(n)
+	return nil
+}
+
+// LenientBool decodes JSON true as true; anything else reads as false.
+type LenientBool bool
+
+func (v *LenientBool) UnmarshalJSON(b []byte) error {
+	*v = LenientBool(string(b) == "true")
+	return nil
 }
 
 // Values of ExceptionOccurrenceInfo.Unhandled ("" for a logged error).

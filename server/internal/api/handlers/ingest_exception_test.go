@@ -97,8 +97,11 @@ func TestIngest_ExceptionOccurrenceInfo(t *testing.T) {
 		sdkEventJSON("exception", "e3", 3, `,"fingerprint":"f","message":"System.Exception: y","stack":"","count":1,"log_type":"error","embedded_exception":"System.Exception: y","error_seq":8,"session_ms":9100,"unhandled":"task"`),
 		sdkEventJSON("exception", "e4", 4, `,"fingerprint":"f","message":"z","stack":"","count":1,"error_seq":-5,"session_ms":-1,"unhandled":"bogus"`),
 		sdkEventJSON("exception", "", 0, `,"fingerprint":"f","message":"old sdk","stack":"","count":2`),
+		// Wrong JSON types: read as 0 / false, the event is kept.
+		sdkEventJSON("exception", "e6", 6, `,"fingerprint":"f","message":"w","stack":"","count":1,"error_seq":1.5,"session_ms":"9","ctx_merged":1,"unhandled":7`),
+		sdkEventJSON("exception", "e7", 7, `,"fingerprint":"f","message":"w","stack":"","count":1,"error_seq":99999999999999999999,"session_ms":{},"ctx_merged":"true"`),
 	), nil)
-	if resp.Accepted != 5 || resp.Rejected != 0 || len(store.exceptions) != 5 {
+	if resp.Accepted != 7 || resp.Rejected != 0 || len(store.exceptions) != 7 {
 		t.Fatalf("response %+v, stored %d", resp, len(store.exceptions))
 	}
 	got := func(i int) models.ExceptionOccurrenceInfo { return store.exceptions[i].ExceptionOccurrenceInfo }
@@ -116,5 +119,10 @@ func TestIngest_ExceptionOccurrenceInfo(t *testing.T) {
 	}
 	if g := got(4); g != (models.ExceptionOccurrenceInfo{}) {
 		t.Errorf("old SDK: %+v", g)
+	}
+	for i := 5; i < 7; i++ {
+		if g := got(i); g != (models.ExceptionOccurrenceInfo{}) {
+			t.Errorf("wrong types %d: %+v", i, g)
+		}
 	}
 }

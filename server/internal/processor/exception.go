@@ -76,8 +76,8 @@ const MaxSessionMs = 366 * 24 * 3600 * 1000
 // It never rejects the event.
 func NormalizeOccurrenceInfo(e *models.Exception) {
 	o := &e.ExceptionOccurrenceInfo
-	o.ErrorSeq = clamp(o.ErrorSeq, MaxErrorSeq)
-	o.SessionMs = clamp(o.SessionMs, MaxSessionMs)
+	o.ErrorSeq = models.LenientInt(clamp(int64(o.ErrorSeq), MaxErrorSeq))
+	o.SessionMs = models.LenientInt(clamp(int64(o.SessionMs), MaxSessionMs))
 	switch o.Unhandled {
 	case models.UnhandledDomain, models.UnhandledDomainTerminating, models.UnhandledTask:
 	default:

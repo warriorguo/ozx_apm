@@ -239,8 +239,8 @@ func (r *Repository) InsertExceptions(ctx context.Context, exceptions []models.E
 			// APM-3; bounded by processor.NormalizeOccurrenceInfo.
 			uint32(e.ErrorSeq),
 			uint64(e.SessionMs),
-			e.Unhandled,
-			boolColumn(e.CtxMerged),
+			string(e.Unhandled),
+			boolColumn(bool(e.CtxMerged)),
 		)
 		if err != nil {
 			return fmt.Errorf("append to batch: %w", err)
