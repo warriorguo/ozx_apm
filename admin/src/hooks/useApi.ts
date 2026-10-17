@@ -1,6 +1,6 @@
 import { useQuery } from '@tanstack/react-query'
 import * as api from '../services/api'
-import type { FilterParams, PaginationParams } from '../types/api'
+import type { CustomGroup, FilterParams, PaginationParams } from '../types/api'
 
 export function useSummary(params: FilterParams) {
   return useQuery({
@@ -97,4 +97,32 @@ export function useContextDistribution(
 // Same rule as the SDK and the server: 1-64 characters from [A-Za-z0-9_.-].
 export function isValidContextKey(key: string): boolean {
   return /^[A-Za-z0-9_.-]{1,64}$/.test(key)
+}
+
+// Custom events and metrics (APM-6)
+export function useCustomEvents(params: FilterParams) {
+  return useQuery({
+    queryKey: ['custom-events', params],
+    queryFn: () => api.getCustomEvents(params),
+  })
+}
+
+export function useCustomMetrics(params: FilterParams) {
+  return useQuery({
+    queryKey: ['custom-metrics', params],
+    queryFn: () => api.getCustomMetrics(params),
+  })
+}
+
+export function useCustomDistribution(
+  kind: 'events' | 'metrics',
+  name: string,
+  group: CustomGroup,
+  params: FilterParams
+) {
+  return useQuery({
+    queryKey: ['custom-distribution', kind, name, group, params],
+    queryFn: () => api.getCustomDistribution(kind, name, group, params),
+    enabled: isValidContextKey(name) && (group.kind === 'by' || isValidContextKey(group.key)),
+  })
 }

@@ -6,6 +6,7 @@ const navItems = [
   { path: '/crashes', label: 'Crashes' },
   { path: '/exceptions', label: 'Exceptions' },
   { path: '/context', label: 'Context' },
+  { path: '/custom', label: 'Custom' },
 ]
 
 export function Layout() {

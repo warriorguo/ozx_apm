@@ -11,6 +11,10 @@ import type {
   ContextKeysResponse,
   ContextValuesResponse,
   ContextDistribution,
+  CustomEventsResponse,
+  CustomMetricsResponse,
+  CustomDistribution,
+  CustomGroup,
 } from '../types/api'
 
 export const apiConfig = {
@@ -163,6 +167,38 @@ export async function getContextDistribution(
     metric,
     unit: data?.unit || '',
     total: data?.total || 0,
+    truncated: !!data?.truncated,
+    rows: data?.rows || [],
+  }
+}
+
+// Custom events and metrics (APM-6)
+export async function getCustomEvents(params: FilterParams): Promise<CustomEventsResponse> {
+  const { data } = await api.get<CustomEventsResponse>('/custom/events', { params })
+  return { events: data?.events || [], truncated: !!data?.truncated }
+}
+
+export async function getCustomMetrics(params: FilterParams): Promise<CustomMetricsResponse> {
+  const { data } = await api.get<CustomMetricsResponse>('/custom/metrics', { params })
+  return { metrics: data?.metrics || [], truncated: !!data?.truncated }
+}
+
+// group: key=<context key>, prop=<property key> (events), by=<column>.
+export async function getCustomDistribution(
+  kind: 'events' | 'metrics',
+  name: string,
+  group: CustomGroup,
+  params: FilterParams
+): Promise<CustomDistribution> {
+  const { data } = await api.get<CustomDistribution>(`/custom/${kind}/distribution`, {
+    params: { name, [group.kind]: group.key, ...params },
+  })
+  return {
+    name,
+    group_by: data?.group_by || '',
+    unit: data?.unit || '',
+    total: data?.total || 0,
+    merged: data?.merged || 0,
     truncated: !!data?.truncated,
     rows: data?.rows || [],
   }

@@ -222,3 +222,59 @@ export interface PaginationParams {
   page?: number
   page_size?: number
 }
+
+// Custom events and metrics (APM-6)
+export interface CustomEventStat {
+  name: string
+  count: number // calls (sum of count)
+  sessions: number
+  devices: number
+  last_seen: string
+}
+
+export interface CustomEventsResponse {
+  events: CustomEventStat[]
+  truncated: boolean
+}
+
+// One metric, or one group of a distribution. Percentiles: exact rank,
+// value within 2% (the SDK's histogram buckets).
+export interface CustomMetricStat {
+  name?: string
+  value: string
+  unit?: string
+  count: number
+  sessions: number
+  avg: number
+  min: number
+  max: number
+  p50: number
+  p90: number
+  p95: number
+  p99: number
+}
+
+export interface CustomMetricsResponse {
+  metrics: CustomMetricStat[]
+  truncated: boolean
+}
+
+export type CustomColumn = 'app_version' | 'platform' | 'device_model' | 'os_version' | 'build_type'
+
+// How a distribution groups: a game context key, an event property, or a column.
+export type CustomGroup =
+  | { kind: 'key'; key: string }
+  | { kind: 'prop'; key: string }
+  | { kind: 'by'; key: CustomColumn }
+
+export interface CustomDistribution {
+  name: string
+  group_by: string
+  unit: string
+  total: number
+  // Calls/samples whose value is unknown (merged across contexts by the SDK,
+  // or aggregated events without properties); not in rows.
+  merged: number
+  truncated: boolean
+  rows: CustomMetricStat[]
+}
