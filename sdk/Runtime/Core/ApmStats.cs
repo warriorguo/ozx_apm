@@ -47,6 +47,22 @@ namespace OzxApm.Core
         public long ErrorEvents;
         /// <summary>Occurrences reported only in a summary event (more distinct errors per minute than tracked).</summary>
         public long ErrorsInSummary;
+        /// <summary>TrackEvent calls recorded since Initialize (APM-6).</summary>
+        public long CustomEvents;
+        /// <summary>Of those, sent as counts beyond MaxCustomEventsPerMinute (without properties).</summary>
+        public long CustomEventsAggregated;
+        /// <summary>Of those, not sent (more distinct event names per minute than tracked); still on the time line.</summary>
+        public long CustomEventsDropped;
+        /// <summary>RecordMetric samples and stopped timers recorded since Initialize.</summary>
+        public long MetricSamples;
+        /// <summary>Samples not sent (more distinct metric names per minute than tracked).</summary>
+        public long MetricSamplesDropped;
+        /// <summary>Invalid event/metric names, property keys or values and NaN samples refused or cut.</summary>
+        public int CustomRejected;
+        /// <summary>Timers not recorded because the app was paused while they ran.</summary>
+        public long TimersSpanningPause;
+        /// <summary>Warning/error/assert lines seen by the time line (repeats included).</summary>
+        public long LogLinesSeen;
         /// <summary>"release", "dev" or "editor"; null before Initialize.</summary>
         public string BuildType;
         /// <summary>False in the Unity Editor unless ApmConfig.UploadInEditor.</summary>

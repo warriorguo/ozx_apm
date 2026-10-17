@@ -150,6 +150,72 @@ namespace OzxApm.Utils
                     Field(w, "stack", crash.stack);
                     ArrayField(w, "breadcrumbs", crash.breadcrumbs);
                     break;
+
+                // APM-6
+                case CustomEvent ce:
+                    Field(w, "name", ce.name);
+                    w.Name("count");
+                    w.Long(ce.count);
+                    if (ce.aggregated)
+                        w.Ascii(",\"aggregated\":true");
+                    if (ce.ctx_merged)
+                        w.Ascii(",\"ctx_merged\":true");
+                    var props = ce.props;
+                    if (props != null && props.Length >= 2)
+                    {
+                        w.Name("props");
+                        w.Byte((byte)'{');
+                        for (int i = 0; i + 1 < props.Length; i += 2)
+                        {
+                            if (i > 0) w.Byte((byte)',');
+                            w.String(props[i]);
+                            w.Byte((byte)':');
+                            w.String(props[i + 1]);
+                        }
+                        w.Byte((byte)'}');
+                    }
+                    break;
+
+                case CustomMetricEvent m:
+                    Field(w, "name", m.name);
+                    OptionalField(w, "unit", m.unit);
+                    w.Name("count");
+                    w.Long(m.count);
+                    w.Name("sum");
+                    w.Double(m.sum);
+                    w.Name("min");
+                    w.Double(m.min);
+                    w.Name("max");
+                    w.Double(m.max);
+                    w.Name("window_ms");
+                    w.Long(m.window_ms);
+                    w.Name("hist_v");
+                    w.Long(m.hist_v);
+                    w.Name("hist_keys");
+                    w.Byte((byte)'[');
+                    if (m.hist_keys != null)
+                    {
+                        for (int i = 0; i < m.hist_keys.Length; i++)
+                        {
+                            if (i > 0) w.Byte((byte)',');
+                            w.Long(m.hist_keys[i]);
+                        }
+                    }
+                    w.Byte((byte)']');
+                    w.Name("hist_counts");
+                    w.Byte((byte)'[');
+                    if (m.hist_counts != null)
+                    {
+                        for (int i = 0; i < m.hist_counts.Length; i++)
+                        {
+                            if (i > 0) w.Byte((byte)',');
+                            w.Long(m.hist_counts[i]);
+                        }
+                    }
+                    w.Byte((byte)']');
+                    if (m.ctx_merged)
+                        w.Ascii(",\"ctx_merged\":true");
+                    break;
             }
 
             // The game context, last: its UTF-8 JSON was built once per context
@@ -422,6 +488,27 @@ namespace OzxApm.Utils
                 u /= 10;
             } while (u != 0);
             Array.Reverse(_buf, start, _len - start);
+        }
+
+        /// <summary>
+        /// Writes a double so that it parses back to the same value: integers
+        /// below 1e15 as such (no allocation), others in round-trip form
+        /// (allocates a short string; custom metrics only, once per series and
+        /// window). NaN and infinities are written as null.
+        /// </summary>
+        public void Double(double value)
+        {
+            if (double.IsNaN(value) || double.IsInfinity(value))
+            {
+                Ascii("null");
+                return;
+            }
+            if (Math.Abs(value) < 1e15 && value == Math.Floor(value))
+            {
+                Long((long)value);
+                return;
+            }
+            Ascii(value.ToString("R", CultureInfo.InvariantCulture));
         }
 
         [StructLayout(LayoutKind.Explicit)]

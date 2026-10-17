@@ -72,6 +72,21 @@ namespace OzxApm.Core
         public bool EnableSceneLoadTracking { get; set; } = true;
 
         /// <summary>
+        /// Custom events, metrics and timers (ApmClient.TrackEvent,
+        /// RecordMetric, StartTimer/StopTimer; APM-6). When off those calls do
+        /// nothing. Technical data: collected only with technical consent.
+        /// </summary>
+        public bool EnableCustomEvents { get; set; } = true;
+
+        /// <summary>
+        /// Custom events sent one by one (with their properties) per minute;
+        /// further calls in the same minute are sent as one count per event name
+        /// and game context, without properties. Every call is on the breadcrumb
+        /// time line either way.
+        /// </summary>
+        public int MaxCustomEventsPerMinute { get; set; } = 60;
+
+        /// <summary>
         /// Performance sampling interval in seconds
         /// </summary>
         public float SamplingIntervalSeconds { get; set; } = 1.0f;

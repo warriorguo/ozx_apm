@@ -162,6 +162,61 @@ namespace OzxApm.Models
         }
     }
 
+    /// <summary>
+    /// A custom event (ApmClient.TrackEvent, APM-6). Technical data: it only
+    /// says what the game was doing (room entered, wave started) for
+    /// diagnostics; business/operations events are APM-12.
+    /// </summary>
+    [Serializable]
+    public class CustomEvent : BaseEvent
+    {
+        public string name;
+        /// <summary>1 for one call; more for a count of calls beyond the per-window budget (aggregated).</summary>
+        public int count;
+        /// <summary>The count merges calls; their properties were not kept.</summary>
+        public bool aggregated;
+        /// <summary>The count merges calls in different game contexts; ctx holds only what they shared.</summary>
+        public bool ctx_merged;
+        /// <summary>Properties as key, value pairs (validated, immutable); null for none.</summary>
+        [NonSerialized] internal string[] props;
+
+        public CustomEvent()
+        {
+            type = "custom_event";
+            count = 1;
+        }
+    }
+
+    /// <summary>
+    /// The samples of one custom metric (ApmClient.RecordMetric, timers) in one
+    /// game context and one window (APM-6): count, sum, min, max and a
+    /// log-bucketed histogram (Utils.MetricBuckets) from which the server
+    /// computes percentiles.
+    /// </summary>
+    [Serializable]
+    public class CustomMetricEvent : BaseEvent
+    {
+        public string name;
+        /// <summary>"ms" for timers; what the game passed to RecordMetric otherwise (may be empty).</summary>
+        public string unit;
+        public long count;
+        public double sum;
+        public double min;
+        public double max;
+        /// <summary>Length of the window the samples were collected in (ms).</summary>
+        public long window_ms;
+        /// <summary>The bucket scheme (MetricBuckets.Version).</summary>
+        public int hist_v;
+        [NonSerialized] internal int[] hist_keys;
+        [NonSerialized] internal long[] hist_counts;
+        public bool ctx_merged;
+
+        public CustomMetricEvent()
+        {
+            type = "custom_metric";
+        }
+    }
+
     [Serializable]
     public class EventBatch
     {

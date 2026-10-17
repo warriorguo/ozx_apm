@@ -58,6 +58,15 @@ namespace OzxApm.Core
         private StartupTracker _startupTracker;
         private SceneLoadTracker _sceneLoadTracker;
         private ExceptionCollector _exceptionCollector;
+        private CustomCollector _customCollector;
+        // Breadcrumbs and recent warnings (APM-6), shared by the collectors.
+        private Timeline _timeline;
+
+        // Read by the static API from any thread (TrackEvent, RecordMetric,
+        // timers, RecordBreadcrumb) without touching the UnityEngine.Object.
+        private static volatile CustomCollector s_custom;
+        private static volatile Timeline s_timeline;
+        private static volatile bool s_collecting;
 
         private List<ICollector> _collectors = new List<ICollector>();
         private string _currentScene;
@@ -112,6 +121,7 @@ namespace OzxApm.Core
         public static bool IsInitialized => _isInitialized;
         public ApmConfig Config => _config;
         public SessionManager Session => _sessionManager;
+        internal Timeline Timeline => _timeline;
         public NetworkLogger NetworkLog => _networkLogger;
 
         /// <summary>
@@ -303,6 +313,7 @@ namespace OzxApm.Core
         /// <summary>Denied: nothing of the technical data stays on the device.</summary>
         private void DeleteLocalTechnicalData()
         {
+            _timeline?.Clear();
             _offlineStorage.Clear();
             _networkLogger?.ClearLogs();
             _sessionManager.OnConsentDenied();
@@ -495,14 +506,252 @@ namespace OzxApm.Core
         }
 
         /// <summary>
-        /// Records a custom breadcrumb for crash context. Ignored without technical consent.
+        /// Records a breadcrumb: a text later exceptions and janks carry on
+        /// their time line. Ignored without technical consent. No allocation;
+        /// any thread.
         /// </summary>
         public static void RecordBreadcrumb(string message)
         {
-            if (_isInitialized && Instance._collecting && Instance._exceptionCollector != null)
+            var timeline = s_timeline;
+            if (timeline != null && s_collecting)
+                timeline.RecordText(message);
+        }
+
+        // ------------------------------------------------------------------
+        // Custom events, metrics and timers (APM-6)
+        //
+        // Technical data, for diagnostics: collected only with technical
+        // consent (ApmConfig.EnableCustomEvents, on by default). Names and
+        // property keys: 1-64 characters from [A-Za-z0-9_.-]. Property values:
+        // up to 256 characters, at most 64 properties and about 4KB per event
+        // (the game context's limits). Never put personal data (names, e-mail
+        // addresses, account or payment ids, chat or other input text, precise
+        // location) in names, properties or units: they are stored as sent.
+        // Business/operations events (retention, funnels, purchases) are not
+        // these: they belong to APM-12's analytics events.
+        //
+        // Every call works from any thread, before Initialize too (then it
+        // does nothing and returns false), and never throws.
+        // ------------------------------------------------------------------
+
+        /// <summary>
+        /// Records a custom event (e.g. "room_enter"): it goes onto the
+        /// breadcrumb time line that later exceptions and janks carry, and is
+        /// uploaded with the current game context. The first
+        /// ApmConfig.MaxCustomEventsPerMinute events of a minute are sent one by
+        /// one; further ones are sent as one count per name and context.
+        /// Allocates the event (about 150 bytes). Returns false if it was not
+        /// recorded (no consent, disabled, invalid name).
+        /// </summary>
+        public static bool TrackEvent(string name)
+        {
+            return TrackEventInternal(name, null, 0);
+        }
+
+        /// <summary>A custom event with one property. Allocates the event and one 2-element array.</summary>
+        public static bool TrackEvent(string name, string key, string value)
+        {
+            var custom = s_custom;
+            if (custom == null || !custom.IsActive)
+                return false;
+            return TrackEventInternal(name, new[] { key, value }, 2);
+        }
+
+        /// <summary>A custom event with two properties. Allocates the event and one 4-element array.</summary>
+        public static bool TrackEvent(string name, string key1, string value1, string key2, string value2)
+        {
+            var custom = s_custom;
+            if (custom == null || !custom.IsActive)
+                return false;
+            return TrackEventInternal(name, new[] { key1, value1, key2, value2 }, 4);
+        }
+
+        /// <summary>
+        /// A custom event with properties (copied; invalid keys and empty values
+        /// are left out, values cut to 256 characters, at most 64 properties and
+        /// about 4KB: see the section comment). Allocates the event and one array
+        /// of 2 x count strings (plus the enumerator unless props is a Dictionary).
+        /// </summary>
+        public static bool TrackEvent(string name, IDictionary<string, string> props)
+        {
+            var custom = s_custom;
+            if (custom == null || !custom.IsActive)
+                return false;
+            try
             {
-                Instance._exceptionCollector.RecordBreadcrumb(message);
+                if (props == null || props.Count == 0)
+                    return TrackEventInternal(name, null, 0);
+                var pairs = new string[2 * props.Count];
+                int n = 0;
+                if (props is Dictionary<string, string> dict)
+                {
+                    foreach (var kv in dict)
+                    {
+                        if (n + 1 >= pairs.Length)
+                            break;
+                        pairs[n++] = kv.Key;
+                        pairs[n++] = kv.Value;
+                    }
+                }
+                else
+                {
+                    foreach (var kv in props)
+                    {
+                        if (n + 1 >= pairs.Length)
+                            break;
+                        pairs[n++] = kv.Key;
+                        pairs[n++] = kv.Value;
+                    }
+                }
+                return TrackEventInternal(name, pairs, n);
             }
+            catch (Exception ex)
+            {
+                // E.g. the game changed the dictionary on another thread.
+                ReportInternalError("TrackEvent", ex);
+                return false;
+            }
+        }
+
+        private static bool TrackEventInternal(string name, string[] pairs, int length)
+        {
+            try
+            {
+                var custom = s_custom;
+                if (custom == null || !custom.IsActive)
+                    return false;
+                return custom.TrackEvent(name, CustomCollector.ValidateProps(pairs, length));
+            }
+            catch (Exception ex)
+            {
+                ReportInternalError("TrackEvent", ex);
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Records one sample of a custom metric (a duration, a count, a size),
+        /// with the current game context. Samples are aggregated on the device
+        /// per name and context over a minute (count, sum, min, max and a
+        /// histogram), so the server shows p50/p95/p99 per name and context
+        /// value without one row per sample. No allocation once the name has
+        /// been used; any thread. NaN and infinities are refused.
+        /// </summary>
+        public static bool RecordMetric(string name, double value)
+        {
+            return RecordMetric(name, value, null);
+        }
+
+        /// <summary>
+        /// RecordMetric with a unit shown in the admin ("ms", "bytes", "count";
+        /// up to 16 printable ASCII characters). The first sample of a name in a
+        /// minute sets it.
+        /// </summary>
+        public static bool RecordMetric(string name, double value, string unit)
+        {
+            try
+            {
+                var custom = s_custom;
+                return custom != null && custom.RecordMetric(name, value, unit);
+            }
+            catch (Exception ex)
+            {
+                ReportInternalError("RecordMetric", ex);
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Starts a timer for the metric name (e.g. "room_switch_ms"). Stop it
+        /// with StopTimer(timer), or, where the handle is not at hand, with
+        /// StopTimer(name): one pending timer per name (a second StartTimer of
+        /// the same name replaces the first). The elapsed milliseconds are
+        /// recorded as a sample of the metric (unit "ms") with the game context
+        /// at the time it is stopped: set the context (e.g. the new roomId)
+        /// before stopping. A timer that spans a pause of the app is not
+        /// recorded. No allocation; any thread; works before Initialize.
+        /// </summary>
+        public static ApmTimer StartTimer(string name)
+        {
+            try
+            {
+                return TimerRegistry.Start(name);
+            }
+            catch (Exception ex)
+            {
+                ReportInternalError("StartTimer", ex);
+                return default;
+            }
+        }
+
+        /// <summary>
+        /// Stops a timer and records its elapsed time. Returns the elapsed
+        /// milliseconds (also when it is not recorded: no consent, the app was
+        /// paused meanwhile), or -1 for an invalid handle.
+        /// </summary>
+        public static double StopTimer(ApmTimer timer)
+        {
+            try
+            {
+                if (!timer.IsValid)
+                    return -1;
+                double ms = TimerRegistry.TicksToMs(System.Diagnostics.Stopwatch.GetTimestamp() - timer.StartTicks);
+                TimerRegistry.Forget(timer);
+                RecordTimer(timer, ms);
+                return ms;
+            }
+            catch (Exception ex)
+            {
+                ReportInternalError("StopTimer", ex);
+                return -1;
+            }
+        }
+
+        /// <summary>
+        /// Stops the pending timer started with StartTimer(name). Returns the
+        /// elapsed milliseconds, or -1 if no timer of that name is pending.
+        /// </summary>
+        public static double StopTimer(string name)
+        {
+            try
+            {
+                if (!TimerRegistry.TryTake(name, out var timer))
+                    return -1;
+                double ms = TimerRegistry.TicksToMs(System.Diagnostics.Stopwatch.GetTimestamp() - timer.StartTicks);
+                RecordTimer(timer, ms);
+                return ms;
+            }
+            catch (Exception ex)
+            {
+                ReportInternalError("StopTimer", ex);
+                return -1;
+            }
+        }
+
+        /// <summary>Forgets the pending timer of a name without recording it. True if there was one.</summary>
+        public static bool CancelTimer(string name)
+        {
+            try
+            {
+                return TimerRegistry.Cancel(name);
+            }
+            catch (Exception ex)
+            {
+                ReportInternalError("CancelTimer", ex);
+                return false;
+            }
+        }
+
+        private static void RecordTimer(ApmTimer timer, double ms)
+        {
+            if (timer.PauseEpoch != TimerRegistry.PauseEpoch)
+            {
+                TimerRegistry.CountSpanningPause();
+                return;
+            }
+            var custom = s_custom;
+            if (custom != null)
+                custom.RecordMetric(timer.Name, ms, "ms");
         }
 
         /// <summary>
@@ -518,6 +767,7 @@ namespace OzxApm.Core
             {
                 var client = Instance;
                 client._exceptionCollector?.FlushPending();
+                client._customCollector?.FlushPending();
                 client._offlineStorage?.Flush();
                 client._reporter?.NotifyGameReady();
                 client._reporter?.RetryNow();
@@ -625,6 +875,8 @@ namespace OzxApm.Core
             _offlineStorage.Start();
 
             // Initialize collectors
+            _timeline = new Timeline();
+            s_timeline = _timeline;
             InitializeCollectors();
 
             // Subscribe to scene changes
@@ -670,7 +922,17 @@ namespace OzxApm.Core
             {
                 _exceptionCollector = new ExceptionCollector(_config, this);
                 _exceptionCollector.PersistNow = PersistBeforeTermination;
+                // Recent warning/error lines onto the time line (APM-6), from
+                // the same log callback.
+                _exceptionCollector.LogSink = _timeline;
                 _collectors.Add(_exceptionCollector);
+            }
+
+            if (_config.EnableCustomEvents)
+            {
+                _customCollector = new CustomCollector(_config, this, _timeline);
+                _collectors.Add(_customCollector);
+                s_custom = _customCollector;
             }
 
             _collectorMarkers.Clear();
@@ -706,6 +968,7 @@ namespace OzxApm.Core
             if (_collecting == on)
                 return;
             _collecting = on;
+            s_collecting = on;
             foreach (var collector in _collectors)
             {
                 if (ReferenceEquals(collector, _startupTracker))
@@ -768,6 +1031,20 @@ namespace OzxApm.Core
                 stats.ErrorEvents = events;
                 stats.ErrorsInSummary = untracked;
             }
+            if (client._customCollector != null)
+            {
+                client._customCollector.GetStats(out long tracked, out long aggregated, out long dropped,
+                    out long samples, out long samplesDropped);
+                stats.CustomEvents = tracked;
+                stats.CustomEventsAggregated = aggregated;
+                stats.CustomEventsDropped = dropped;
+                stats.MetricSamples = samples;
+                stats.MetricSamplesDropped = samplesDropped;
+            }
+            stats.CustomRejected = CustomCollector.RejectedCount;
+            stats.TimersSpanningPause = TimerRegistry.SpanningPauseCount;
+            if (client._timeline != null)
+                stats.LogLinesSeen = client._timeline.LogLinesSeen;
             stats.LastUpdateMs = client._lastUpdateTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
             stats.BuildType = client._buildType;
             stats.UploadsEnabled = client._uploadsEnabled;
@@ -782,7 +1059,10 @@ namespace OzxApm.Core
         internal static string StoragePathForTests;
         internal OfflineStorage StorageForTests => _offlineStorage;
         internal EventReporter ReporterForTests => _reporter;
+        internal ExceptionCollector ExceptionCollectorForTests => _exceptionCollector;
+        internal CustomCollector CustomCollectorForTests => _customCollector;
         internal void UpdateForTests() => Update();
+        internal void PauseForTests(bool paused) => OnApplicationPause(paused);
 
         /// <summary>Destroys the client and forgets every static state (consent calls, shutdown flag).</summary>
         internal static void ResetForTests()
@@ -798,6 +1078,9 @@ namespace OzxApm.Core
             _isInitialized = false;
             _isShuttingDown = false;
             _logConfig = null;
+            s_custom = null;
+            s_timeline = null;
+            s_collecting = false;
             _resetDeviceIdBeforeInit = false;
             for (int i = 0; i < _explicitConsent.Length; i++)
                 _explicitConsent[i] = -1;
@@ -895,9 +1178,12 @@ namespace OzxApm.Core
 
                 if (paused)
                 {
+                    // Timers running now would include the time in background.
+                    TimerRegistry.OnPause();
                     // The OS may kill us in the background: get everything onto disk
                     // and sealed for upload. Bounded wait; the worker is normally idle.
                     _exceptionCollector?.FlushPending();
+                    _customCollector?.FlushPending();
                     _offlineStorage.Flush();
                     _offlineStorage.WaitIdle(PauseFlushTimeoutMs);
                 }
@@ -966,6 +1252,8 @@ namespace OzxApm.Core
                 }
                 _collectors.Clear();
                 _collecting = false;
+                s_collecting = false;
+                s_custom = null;
 
                 SceneManager.sceneLoaded -= OnSceneLoaded;
 

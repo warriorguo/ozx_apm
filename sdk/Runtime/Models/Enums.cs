@@ -32,7 +32,9 @@ namespace OzxApm.Models
         AssetLoad,
         Http,
         Exception,
-        Crash
+        Crash,
+        CustomEvent,
+        CustomMetric
     }
 
     /// <summary>
