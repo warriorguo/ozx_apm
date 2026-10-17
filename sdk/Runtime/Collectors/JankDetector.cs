@@ -21,9 +21,13 @@ namespace OzxApm.Collectors
         private float _lastJankReportTime;
         private const float JankReportCooldown = 1.0f; // Minimum seconds between jank reports
 
-        // Recent events for context (circular buffer)
-        private readonly Queue<string> _recentEvents = new Queue<string>();
-        private const int MaxRecentEvents = 10;
+        // What happened just before (APM-6): the time line's breadcrumbs
+        // (custom events, scene loads, exceptions) and warning/error lines of
+        // the RecentWindowMs before the jank started, at most these many.
+        internal const int MaxRecentBreadcrumbs = 10;
+        internal const int MaxRecentLogLines = 5;
+        internal const int RecentWindowMs = 10000;
+        internal const int MaxRecentLength = 200;
 
         public bool IsActive => _isActive;
 
@@ -94,15 +98,21 @@ namespace OzxApm.Collectors
         }
 
         /// <summary>
-        /// Records an event for jank context
+        /// Records a breadcrumb that later janks (and exceptions) carry. Same
+        /// as ApmClient.RecordBreadcrumb.
         /// </summary>
         public void RecordEvent(string eventDescription)
         {
-            if (_recentEvents.Count >= MaxRecentEvents)
-            {
-                _recentEvents.Dequeue();
-            }
-            _recentEvents.Enqueue($"{Time.realtimeSinceStartup:F2}:{eventDescription}");
+            _client?.Timeline?.RecordText(eventDescription);
+        }
+
+        /// <summary>The recent_events of a jank that lasted durationMs and ended at endMs.</summary>
+        internal static List<string> RecentEvents(Timeline timeline, long endMs, float durationMs)
+        {
+            if (timeline == null)
+                return new List<string>();
+            long since = endMs - (long)durationMs - RecentWindowMs;
+            return timeline.Snapshot(MaxRecentBreadcrumbs, MaxRecentLogLines, MaxRecentLength, MaxRecentLength, since);
         }
 
         private bool CanReportJank()
@@ -120,7 +130,7 @@ namespace OzxApm.Collectors
                 max_frame_ms = _maxFrameTime,
                 recent_gc_count = gcCount,
                 recent_gc_alloc_kb = gcAllocKb,
-                recent_events = new List<string>(_recentEvents)
+                recent_events = RecentEvents(_client.Timeline, Timeline.NowMs(), durationMs)
             };
 
             _client.EnqueueEvent(evt);

@@ -11,12 +11,14 @@ namespace OzxApm.Collectors
 {
     /// <summary>
     /// Receives every log line the SDK's log callback sees (APM-6: the recent
-    /// warnings/errors ring). Called on the logging thread, before the error
-    /// path, for every log type; must not throw, allocate per call or log.
+    /// warnings/errors on the Timeline). Called on the logging thread, before
+    /// the error path, for every log type; must not throw, allocate per call
+    /// or log. Returns true if it put the line on the time line (then the
+    /// error path does not add an "Exception:" breadcrumb for it).
     /// </summary>
     internal interface ILogSink
     {
-        void OnLog(string message, string stackTrace, LogType type, bool mainThread);
+        bool OnLog(string message, string stackTrace, LogType type, bool mainThread);
     }
 
     /// <summary>
@@ -147,17 +149,15 @@ namespace OzxApm.Collectors
         [ThreadStatic] private static int t_echoTick;
         private int _windowId;
 
-        // Breadcrumbs for crash context: a ring of (time, message), formatted
-        // only when they are sent, so recording one does not allocate. Guarded by _sync.
-        private const int MaxBreadcrumbs = 50;
-        private readonly long[] _breadcrumbTimes = new long[MaxBreadcrumbs];
-        private readonly string[] _breadcrumbMessages = new string[MaxBreadcrumbs];
-        private int _breadcrumbStart;
-        private int _breadcrumbCount;
-        // Sent with the first occurrence of an exception: the most recent ones,
-        // each cut to a bounded length (at most ~4.5 KB per event).
+        // Breadcrumbs and recent warning/error lines (APM-6): the Timeline,
+        // shared with the other collectors. Sent with the first occurrence of
+        // an exception: the most recent breadcrumbs and log lines merged by
+        // time, each cut to a bounded length (at most ~7.5 KB per event).
+        private readonly Timeline _timeline;
         internal const int MaxBreadcrumbsPerEvent = 20;
         internal const int MaxBreadcrumbLength = 200;
+        internal const int MaxLogLinesPerEvent = 10;
+        internal const int MaxLogLineLength = 300;
 
         // Delegates created once, so that Start/Stop add and remove the same instances.
         private readonly Application.LogCallback _onLog;
@@ -320,9 +320,15 @@ namespace OzxApm.Collectors
         internal void OnUnobservedForTests(AggregateException ex) => HandleUnhandled(Unwrap(ex), UnhandledTask, false);
 
         public ExceptionCollector(ApmConfig config, ApmClient client)
+            : this(config, client, client != null ? client.Timeline : null)
+        {
+        }
+
+        internal ExceptionCollector(ApmConfig config, ApmClient client, Timeline timeline)
         {
             _config = config;
             _client = client;
+            _timeline = timeline ?? new Timeline();
             _clock = client != null && client.Session != null ? client.Session.Clock : null;
             _onLog = OnLogMessage;
             _onUnhandled = OnUnhandledException;
@@ -422,60 +428,26 @@ namespace OzxApm.Collectors
         /// </summary>
         public void RecordBreadcrumb(string message)
         {
-            if (string.IsNullOrEmpty(message))
-                return;
-            long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-            lock (_sync)
-            {
-                RecordBreadcrumbLocked(message, now);
-            }
+            _timeline.RecordText(message);
         }
 
-        private void RecordBreadcrumbLocked(string message, long nowMs)
-        {
-            int i = (_breadcrumbStart + _breadcrumbCount) % MaxBreadcrumbs;
-            if (_breadcrumbCount == MaxBreadcrumbs)
-                _breadcrumbStart = (_breadcrumbStart + 1) % MaxBreadcrumbs;
-            else
-                _breadcrumbCount++;
-            _breadcrumbTimes[i] = nowMs;
-            _breadcrumbMessages[i] = message;
-        }
+        /// <summary>The time line this collector reads and writes.</summary>
+        internal Timeline Timeline => _timeline;
 
         /// <summary>
-        /// Gets current breadcrumbs for crash reports, oldest first, as
-        /// "[HH:mm:ss.fff] message" (UTC).
+        /// Gets the whole time line (breadcrumbs and recent warning/error
+        /// lines), oldest first, as "[HH:mm:ss.fff] text" (UTC).
         /// </summary>
         public List<string> GetBreadcrumbs()
         {
-            lock (_sync)
-            {
-                return SnapshotBreadcrumbsLocked(MaxBreadcrumbs, int.MaxValue);
-            }
+            return _timeline.Snapshot(Timeline.MaxBreadcrumbs, Timeline.MaxLogLines, int.MaxValue, int.MaxValue);
         }
 
-        /// <summary>The most recent breadcrumbs (at most max), oldest first, each cut to maxLength.</summary>
-        internal List<string> SnapshotBreadcrumbs(int max, int maxLength)
+        /// <summary>What a first occurrence carries; excludeLog: the error itself.</summary>
+        private List<string> SnapshotForEvent(string excludeLog)
         {
-            lock (_sync)
-            {
-                return SnapshotBreadcrumbsLocked(max, maxLength);
-            }
-        }
-
-        private List<string> SnapshotBreadcrumbsLocked(int max, int maxLength)
-        {
-            int n = Math.Min(max, _breadcrumbCount);
-            var list = new List<string>(n);
-            for (int k = _breadcrumbCount - n; k < _breadcrumbCount; k++)
-            {
-                int i = (_breadcrumbStart + k) % MaxBreadcrumbs;
-                string time = DateTimeOffset.FromUnixTimeMilliseconds(_breadcrumbTimes[i]).UtcDateTime
-                    .ToString("HH:mm:ss.fff", CultureInfo.InvariantCulture);
-                string text = "[" + time + "] " + _breadcrumbMessages[i];
-                list.Add(text.Length > maxLength ? Truncate(text, maxLength) : text);
-            }
-            return list;
+            return _timeline.Snapshot(MaxBreadcrumbsPerEvent, MaxLogLinesPerEvent, MaxBreadcrumbLength, MaxLogLineLength,
+                long.MinValue, excludeLog);
         }
 
         private void OnLogMessage(string message, string stackTrace, LogType type)
@@ -500,11 +472,12 @@ namespace OzxApm.Collectors
 
             bool mainThread = Environment.CurrentManagedThreadId == _mainThreadId;
             var sink = LogSink;
+            bool onTimeline = false;
             if (sink != null)
             {
                 try
                 {
-                    sink.OnLog(message, stackTrace, type, mainThread);
+                    onTimeline = sink.OnLog(message, stackTrace, type, mainThread);
                 }
                 catch
                 {
@@ -520,6 +493,7 @@ namespace OzxApm.Collectors
             if (message != null && message.StartsWith(ApmClient.LogPrefix, StringComparison.Ordinal))
                 return;
 
+            string raw = message;
             message = message ?? "";
             stackTrace = stackTrace ?? "";
             long nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
@@ -569,7 +543,7 @@ namespace OzxApm.Collectors
             // First time this text is seen in the window: parse it (allocates),
             // outside the lock.
             var info = Describe(message, stackTrace, type);
-            RecordNew(info, key, true, nowMs, ctx, null, track, track);
+            RecordNew(info, key, true, nowMs, ctx, null, track, track, raw, onTimeline);
         }
 
         /// <summary>
@@ -577,7 +551,7 @@ namespace OzxApm.Collectors
         /// (parsed into info). Any thread.
         /// </summary>
         private void RecordNew(Entry info, RawKey key, bool cacheKey, long nowMs, ContextSnapshot ctx, string unhandled,
-            bool hold, bool track)
+            bool hold, bool track, string rawMessage = null, bool onTimeline = false)
         {
             ExceptionEvent first = null;
             List<ExceptionEvent> closed = null;
@@ -620,8 +594,7 @@ namespace OzxApm.Collectors
                     // with the time it happened and the breadcrumbs that led to it.
                     _immediateSent++;
                     _eventsEnqueued++;
-                    first = BuildEvent(entry, 1, ref occ, false, _windowSessionId,
-                        SnapshotBreadcrumbsLocked(MaxBreadcrumbsPerEvent, MaxBreadcrumbLength));
+                    first = BuildEvent(entry, 1, ref occ, false, _windowSessionId, SnapshotForEvent(rawMessage));
                     if (hold)
                     {
                         _held.Add(new HeldEvent { Event = first, Tick = Environment.TickCount });
@@ -641,10 +614,12 @@ namespace OzxApm.Collectors
                         RememberLog(entry.Fingerprint, bucket, ref occ);
                 }
 
-                if (entry == info)
+                if (entry == info && !onTimeline)
                 {
-                    // Record as breadcrumb (once per group and window, not per repeat)
-                    RecordBreadcrumbLocked("Exception: " + Truncate(FirstLine(info.Message), 100), nowMs);
+                    // Record as breadcrumb (once per group and window, not per
+                    // repeat), unless the log line itself is on the time line
+                    // (errors and asserts are; exceptions are not).
+                    _timeline.RecordText("Exception: " + Truncate(FirstLine(info.Message), 100), nowMs);
                 }
             Done:;
             }
