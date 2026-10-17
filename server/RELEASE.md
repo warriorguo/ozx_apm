@@ -1147,14 +1147,16 @@ Exception events may carry, next to the APM-4 fields:
 
 ### SDK: de-duplication and limits
 
-Per window of 60 s (also closed by `Flush`, going to background, shutdown):
+Per window of 60 s (also closed by `Flush`, going to background, shutdown,
+and when a new session starts, so no count spans two sessions and every
+count carries the id of the session it happened in):
 
 | What | Limit | Beyond it |
 |---|---|---|
 | First occurrences sent at once (with breadcrumbs) | 30 fingerprints | reported at the end of the window, still with their own time, `error_seq`, context and count, without breadcrumbs |
-| Repeat counts per fingerprint | one event per (context, unhandled kind), at most 8 | one merged count (`ctx_merged`) per fingerprint |
+| Repeat counts per fingerprint | one event per (context, unhandled kind), at most 8 | one merged count (`ctx_merged`) per fingerprint, and one for its unhandled occurrences |
 | Repeat counts in all | 64 | merged counts |
-| Fingerprints tracked | 100 | counted in one summary event per window, `log_type` `error`, message `[OzxApm] N errors of M kinds not reported one by one: ...` (its own group); tracked normally in the next window |
+| Fingerprints tracked | 100 | counted in one summary event per window, `log_type` `error`, message `[OzxApm] N errors of M kinds not reported one by one: ...` (its own group; its context is what all of them shared, `ctx_merged` if they differed); tracked normally in the next window |
 | Distinct texts remembered for the cheap repeat path | 512 | parsed every time (correct, slower) |
 
 So no occurrence is lost from `sum(count)`, and the first occurrence of a
@@ -1171,6 +1173,12 @@ process is killed in the foreground (OOM, native crash, force-stop), the
 counts of that last window are lost, as before APM-3.
 
 `ApmStats` has `ErrorsSeen`, `ErrorEvents` and `ErrorsInSummary`.
+
+The repeat key counts every run of digits in the first line as one `#`. The
+server's message template treats some digit-bearing tokens differently
+(hex numbers, GUIDs), so two texts differing only there share a device-side
+count under the first text's fingerprint: a misgrouping of the count, never
+a loss.
 
 APM-6 plugs its recent-logs ring into the same callback (`ILogSink` on the
 collector: called for every log type, on the logging thread, before the
@@ -1248,8 +1256,9 @@ ALTER TABLE apm_exceptions ADD COLUMN IF NOT EXISTS ctx_merged UInt8 DEFAULT 0;
 Metadata only, idempotent, within the `apm` account's `ALTER ADD COLUMN`
 grant; fresh and migrated tables have the same columns in the same order.
 Rows of older SDKs and of the previous binary read 0 / `''`. Ingest clamps
-`error_seq` to [0, 2^32-1] and `session_ms` to [0, 366 days], and stores an
-unknown `unhandled` as `''`; it never rejects an event for these fields.
+`error_seq` to [0, 2^32-1] and `session_ms` to [0, 366 days], stores an
+unknown `unhandled` as `''`, and reads a value of the wrong JSON type as
+0 / `''` / false; it never rejects an event for these fields.
 
 ### Admin API
 
@@ -1313,14 +1322,18 @@ stay; the previous binary does not read them.
   (rollback) and the new binary again; no warning or error in any log.
 - SDK: compiles at C# 8 with and without `UNITY_2021_2_OR_NEWER`. Unity
   EditMode could not run here (the sandbox blocks the licensing client); on
-  Unity's Mono outside Unity 134 runtime tests pass (all new logic tests of
+  Unity's Mono outside Unity 139 runtime tests pass (all new logic tests of
   `ExceptionCaptureTests`, `JsonSerializerTests`, the storage and context
   tests), 2 fail for the environment (no `JSONSerializeModule`, no native
   gzip), 82 need the Unity runtime (allocation constraints, Unity's stack
   capture, MonoBehaviour); a 15 s stress run of 6 threads (repeats, 2 million
   occurrences beyond the fingerprint limit, unhandled reports, task
   exceptions, context changes) against window flushes counted all 10 million
-  occurrences exactly once with unique sequence numbers.
+  occurrences exactly once with unique sequence numbers. A code review
+  (another agent) found five defects (a session starting without a pause
+  shared a window with the previous one; the summary's context; echoes of
+  untracked exceptions counted twice; the overflow lost the unhandled kind;
+  a moved first occurrence); all fixed with tests before the numbers above.
 - Not yet run on a device (A33 IL2CPP): background-thread errors, unhandled
   thread and task exceptions, per-frame spam with and without the SDK, three
   rooms in one window, the first-error filter after an Awake failure, idle
