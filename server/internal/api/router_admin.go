@@ -54,6 +54,17 @@ func NewAdminRouter(cfg *config.Config, repo *storage.Repository, logger *zap.Lo
 		r.Get("/context/keys", contextHandler.ListKeys)
 		r.Get("/context/values", contextHandler.ListValues)
 		r.Get("/context/distribution", contextHandler.Distribution)
+
+		// Privacy deletion (APM-14). Like every admin endpoint it has no
+		// authentication of its own (internal network only, RELEASE.md);
+		// deleting needs the X-Apm-Confirm-Delete header.
+		var privacyStore admin.PrivacyStore
+		if repo != nil {
+			privacyStore = repo
+		}
+		privacyHandler := admin.NewPrivacyHandler(privacyStore, logger)
+		r.Post("/privacy/delete", privacyHandler.Delete)
+		r.Post("/privacy/verify", privacyHandler.Verify)
 	})
 
 	// Serve static files for admin UI (if exists)

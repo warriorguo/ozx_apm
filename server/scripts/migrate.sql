@@ -279,3 +279,20 @@ AS SELECT
     count() as crash_count
 FROM apm_crashes
 GROUP BY date, app_version, platform, fingerprint;
+
+-- APM-14: audit record of every privacy deletion request (subject id stored
+-- as a SHA-256 hash only). See internal/storage/privacy.go.
+
+CREATE TABLE IF NOT EXISTS apm_privacy_deletions (
+    request_id String,
+    at DateTime64(3),
+    id_type LowCardinality(String),
+    id_hash String,
+    status LowCardinality(String),
+    tables Array(String),
+    rows_before UInt64,
+    rows_after UInt64,
+    error String,
+    requested_by String
+) ENGINE = MergeTree()
+ORDER BY (id_hash, at);

@@ -12,7 +12,8 @@ import (
 // from it (go run ./cmd/schemasql > scripts/migrate.sql; a unit test fails
 // when the two differ), so a database set up either way ends up the same:
 // the six event tables with TTL, the event_id skip index and the four
-// apm_*_daily materialized views (APM-17).
+// apm_*_daily materialized views (APM-17), and the privacy deletion audit
+// table (APM-14, privacy.go).
 //
 // The event tables are ReplacingMergeTree with event_id appended to the sort
 // key (APM-19 phase B): a re-sent event has the same timestamp, app_version
@@ -367,6 +368,7 @@ func (c *ClickHouseClient) Migrate(ctx context.Context) error {
 	c.migrateEventIDIndexes(ctx, tables)
 	c.migrateMaterializedViews(ctx, tables)
 	c.checkEventTTL(tables)
+	c.migratePrivacyAudit(ctx)
 	return nil
 }
 
@@ -421,5 +423,10 @@ func SchemaSQL() string {
 	for _, v := range materializedViews {
 		sb.WriteString("\n" + v.DDL + ";\n")
 	}
+	sb.WriteString(`
+-- APM-14: audit record of every privacy deletion request (subject id stored
+-- as a SHA-256 hash only). See internal/storage/privacy.go.
+`)
+	sb.WriteString("\n" + privacyAuditTableDDL + ";\n")
 	return sb.String()
 }
