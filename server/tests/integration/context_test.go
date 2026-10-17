@@ -2,6 +2,7 @@ package integration
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -241,6 +242,45 @@ func TestContext_DefaultTimeRange(t *testing.T) {
 		dist.Buckets[3].Count+dist.Buckets[4].Count == 0 || len(keys.Keys) != 2 || cd.Total != 4 {
 		t.Errorf("summary %d, exceptions %d, crashes %d, crash detail %d, timeseries %d, distribution %+v, keys %d, ctx distribution %d",
 			s.TotalSessions, e.TotalCount, c.TotalCount, d.Count, len(ts.Data), dist.Buckets, len(keys.Keys), cd.Total)
+	}
+}
+
+// The time range is compared at millisecond precision: an event 100 ms
+// before end_time is inside it (the driver binds a time.Time argument with
+// second precision, which used to drop the last second before end_time).
+func TestAdminFilter_TimeRangeHasMillisecondPrecision(t *testing.T) {
+	admin := adminClient(t)
+	db := fmt.Sprintf("ozx_apm_apm5_ms_%d", time.Now().UnixNano()%1e9)
+	createDB(t, admin, db)
+	cfg := testutil.TestClickHouseConfig()
+	cfg.Database = db
+	client, err := testutil.SetupTestDatabase(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { client.Close() })
+	repo := storage.NewRepository(client, zap.NewNop())
+	second := time.Now().Add(-time.Hour).Truncate(time.Second)
+	at := second.Add(800 * time.Millisecond)
+	must(t, repo.InsertPerfSamples(context.Background(), []models.PerfSample{{Timestamp: at, EventID: "ms", AppVersion: "1", Platform: "Android", SessionID: "s", DeviceID: "d", FPS: 60}}))
+	router := api.NewAdminRouter(&config.Config{}, repo, zap.NewNop())
+
+	for _, c := range []struct {
+		start, end time.Time
+		want       int64
+	}{
+		{second.Add(-time.Minute), second.Add(900 * time.Millisecond), 1}, // end in the same second, after the event
+		{second.Add(-time.Minute), second.Add(700 * time.Millisecond), 0}, // end in the same second, before the event
+		{second.Add(850 * time.Millisecond), second.Add(time.Minute), 0},  // start after the event
+		{second.Add(800 * time.Millisecond), second.Add(800 * time.Millisecond), 1},
+	} {
+		var s models.DashboardSummary
+		getAdmin(t, router, "/api/summary", url.Values{
+			"start_time": {c.start.Format(time.RFC3339Nano)}, "end_time": {c.end.Format(time.RFC3339Nano)},
+		}, &s)
+		if s.TotalEvents != c.want {
+			t.Errorf("range %s .. %s: %d events, want %d", c.start.Format("15:04:05.000"), c.end.Format("15:04:05.000"), s.TotalEvents, c.want)
+		}
 	}
 }
 

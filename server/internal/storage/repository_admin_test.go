@@ -21,7 +21,7 @@ func TestAdminWhere_BuildTypes(t *testing.T) {
 	}
 	for bt, want := range cases {
 		where, args := adminWhere(models.AdminFilter{BuildType: bt})
-		if where != "WHERE timestamp >= ? AND timestamp <= ?"+want {
+		if where != "WHERE timestamp >= fromUnixTimestamp64Milli(toInt64(?)) AND timestamp <= fromUnixTimestamp64Milli(toInt64(?))"+want {
 			t.Errorf("%q: %s", bt, where)
 		}
 		if n := strings.Count(where, "?"); n != len(args) {
@@ -39,7 +39,7 @@ func TestAdminWhere_ContextFiltersAreBound(t *testing.T) {
 		Context: []models.ContextFilter{{Key: "levelId", Values: []string{"3", evil}}, {Key: "roomId", Values: []string{""}}},
 	}
 	where, args := adminWhere(f)
-	want := "WHERE timestamp >= ? AND timestamp <= ? AND app_version = ? AND platform = ? AND ctx[?] IN ? AND ctx[?] IN ?"
+	want := "WHERE timestamp >= fromUnixTimestamp64Milli(toInt64(?)) AND timestamp <= fromUnixTimestamp64Milli(toInt64(?)) AND app_version = ? AND platform = ? AND ctx[?] IN ? AND ctx[?] IN ?"
 	if where != want {
 		t.Fatalf("where\n got %s\nwant %s", where, want)
 	}

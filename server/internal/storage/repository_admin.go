@@ -14,9 +14,13 @@ import (
 // returns its arguments. Every user-supplied value (versions, context keys
 // and values) is a bound argument, quoted and escaped by the driver; nothing
 // from the request is written into the SQL text.
+//
+// The range is bound as integer milliseconds: the driver binds a time.Time
+// with second precision, which dropped the events of the last second before
+// end_time (as in buildEventIDLookup).
 func adminWhere(f models.AdminFilter) (string, []interface{}) {
-	conds := []string{"timestamp >= ?", "timestamp <= ?"}
-	args := []interface{}{f.StartTime, f.EndTime}
+	conds := []string{"timestamp >= fromUnixTimestamp64Milli(toInt64(?))", "timestamp <= fromUnixTimestamp64Milli(toInt64(?))"}
+	args := []interface{}{f.StartTime.UnixMilli(), f.EndTime.UnixMilli()}
 
 	if f.AppVersion != "" {
 		conds = append(conds, "app_version = ?")
