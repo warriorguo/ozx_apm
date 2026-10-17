@@ -54,6 +54,39 @@ func TestSchemaStatements_CreateTablesIncludeEventIDAndSeq(t *testing.T) {
 	}
 }
 
+// APM-5: build_type, device details and the ctx map on every event table,
+// in CREATE TABLE and as an additive migration, in the same order.
+func TestSchemaStatements_ContextColumnsOnEveryEventTable(t *testing.T) {
+	cols := []string{
+		"build_type LowCardinality(String) DEFAULT ''",
+		"gpu LowCardinality(String) DEFAULT ''",
+		"ram_class LowCardinality(String) DEFAULT ''",
+		"net_type LowCardinality(String) DEFAULT ''",
+		"ctx Map(LowCardinality(String), String)",
+	}
+	for _, table := range eventTables {
+		var create string
+		for _, stmt := range schemaStatements {
+			if strings.HasPrefix(stmt, "CREATE TABLE IF NOT EXISTS "+table+" ") {
+				create = stmt
+			}
+		}
+		if !strings.Contains(create, "    seq UInt64 DEFAULT 0,\n    "+strings.Join(cols, ",\n    ")+",\n    INDEX ") {
+			t.Errorf("CREATE TABLE %s: APM-5 columns missing or out of order:\n%s", table, create)
+		}
+		for _, col := range cols {
+			want := "ALTER TABLE " + table + " ADD COLUMN IF NOT EXISTS " + col
+			found := false
+			for _, stmt := range schemaStatements {
+				found = found || stmt == want
+			}
+			if !found {
+				t.Errorf("missing migration %q", want)
+			}
+		}
+	}
+}
+
 func TestSchemaStatements_NoDestructiveMigrations(t *testing.T) {
 	for _, stmt := range schemaStatements {
 		upper := strings.ToUpper(stmt)

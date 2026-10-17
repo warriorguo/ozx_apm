@@ -30,6 +30,56 @@ type RawEvent struct {
 //     deliver the same event more than once; the server drops repeats (APM-19).
 //   - Seq: per-install monotonic sequence number (persisted across launches).
 // Both are empty/zero for events from SDK versions that predate them.
+//
+// Every event type also embeds EventContext (APM-5).
+
+// EventContext holds what every event carries since APM-5: the build type,
+// device details, and the game context ("ctx": key/value pairs the game set
+// with ApmClient.SetContext, as they were when the event was recorded). All
+// fields are empty for events from older SDKs.
+//
+// RawContext is the "ctx" value as received; processor.NormalizeEventContext
+// validates it into Context (a value of the wrong shape never fails the
+// event or the batch, it is dropped and counted). Context is what is stored.
+type EventContext struct {
+	BuildType  string            `json:"build_type"`
+	GPU        string            `json:"gpu"`
+	RAMClass   string            `json:"ram_class"`
+	NetType    string            `json:"net_type"`
+	RawContext json.RawMessage   `json:"ctx"`
+	Context    map[string]string `json:"-"`
+}
+
+// Build types. BuildTypeUnknown (empty) marks events from SDKs that predate APM-5.
+const (
+	BuildTypeRelease = "release"
+	BuildTypeDev     = "dev"
+	BuildTypeEditor  = "editor"
+	BuildTypeUnknown = ""
+)
+
+// Game context limits, the same as the SDK's (GameContext.cs). The server
+// enforces them on what it stores; the admin API on what it accepts as a filter.
+const (
+	MaxContextKeys        = 64
+	MaxContextKeyLength   = 64  // bytes; keys are ASCII
+	MaxContextValueLength = 256 // characters (runes)
+)
+
+// ValidContextKey reports whether k is a valid context key: 1-64 characters
+// from [A-Za-z0-9_.-].
+func ValidContextKey(k string) bool {
+	if len(k) == 0 || len(k) > MaxContextKeyLength {
+		return false
+	}
+	for i := 0; i < len(k); i++ {
+		c := k[i]
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_' || c == '.' || c == '-') {
+			return false
+		}
+	}
+	return true
+}
 
 // PerfSample represents a performance sample event
 type PerfSample struct {
@@ -48,6 +98,7 @@ type PerfSample struct {
 	MainThreadMs float32   `json:"main_thread_ms" ch:"main_thread_ms"`
 	GCAllocKB    float32   `json:"gc_alloc_kb" ch:"gc_alloc_kb"`
 	MemMB        float32   `json:"mem_mb" ch:"mem_mb"`
+	EventContext
 }
 
 // Jank represents a jank event
@@ -67,6 +118,7 @@ type Jank struct {
 	RecentGCCount   uint32    `json:"recent_gc_count" ch:"recent_gc_count"`
 	RecentGCAllocKB float32   `json:"recent_gc_alloc_kb" ch:"recent_gc_alloc_kb"`
 	RecentEvents    []string  `json:"recent_events" ch:"recent_events"`
+	EventContext
 }
 
 // Startup represents a startup timing event
@@ -83,6 +135,7 @@ type Startup struct {
 	Phase1Ms    float32   `json:"phase1_ms" ch:"phase1_ms"` // app -> unity
 	Phase2Ms    float32   `json:"phase2_ms" ch:"phase2_ms"` // unity -> first frame
 	TTIMs       float32   `json:"tti_ms" ch:"tti_ms"`       // first frame -> interactive
+	EventContext
 }
 
 // SceneLoad represents a scene load timing event
@@ -98,6 +151,7 @@ type SceneLoad struct {
 	SceneName   string    `json:"scene_name" ch:"scene_name"`
 	LoadMs      float32   `json:"load_ms" ch:"load_ms"`
 	ActivateMs  float32   `json:"activate_ms" ch:"activate_ms"`
+	EventContext
 }
 
 // Exception represents a non-fatal exception event
@@ -116,6 +170,7 @@ type Exception struct {
 	Message     string    `json:"message" ch:"message"`
 	Stack       string    `json:"stack" ch:"stack"`
 	Count       uint32    `json:"count" ch:"count"`
+	EventContext
 }
 
 // Crash represents a fatal crash event
@@ -134,4 +189,5 @@ type Crash struct {
 	Fingerprint string    `json:"fingerprint" ch:"fingerprint"`
 	Stack       string    `json:"stack" ch:"stack"`
 	Breadcrumbs []string  `json:"breadcrumbs" ch:"breadcrumbs"`
+	EventContext
 }

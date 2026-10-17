@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -63,6 +64,26 @@ func (a *asyncInsert) Append(v ...any) error {
 	return nil
 }
 
+// appendMapLiteral writes map(?, ?, ...) for m and appends the keys and
+// values to args. An empty map is map(), which ClickHouse casts to the column type.
+func appendMapLiteral(sb *strings.Builder, args []any, m map[string]string) []any {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	sb.WriteString("map(")
+	for i, k := range keys {
+		if i > 0 {
+			sb.WriteString(", ")
+		}
+		sb.WriteString("?, ?")
+		args = append(args, k, m[k])
+	}
+	sb.WriteString(")")
+	return args
+}
+
 func (a *asyncInsert) Send() error {
 	if a.rows == 0 {
 		return nil
@@ -88,6 +109,15 @@ func (a *asyncInsert) Send() error {
 			sb.WriteString("fromUnixTimestamp64Milli(")
 			sb.WriteString(strconv.FormatInt(t.UnixMilli(), 10))
 			sb.WriteString(")")
+			continue
+		}
+		if m, ok := v.(map[string]string); ok {
+			// The driver formats a bound Go map with its keys unescaped
+			// (clickhouse-go v2.17 bind.go, reflect.Map case): a key with a
+			// quote would break out of the literal. Bind every key and value
+			// as its own string parameter instead. Keys in a fixed order so
+			// the statement text is stable.
+			args = appendMapLiteral(&sb, args, m)
 			continue
 		}
 		sb.WriteString("?")

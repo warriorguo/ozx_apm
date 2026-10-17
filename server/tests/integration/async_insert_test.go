@@ -43,6 +43,11 @@ func TestInsertPaths_RoundTripIdentically(t *testing.T) {
 				DeviceModel: trickyText, OSVersion: "14", SessionID: session, DeviceID: "d", Scene: "S",
 				DurationMs: 75.5, MaxFrameMs: 60.25, RecentGCCount: 3, RecentGCAllocKB: 1.5,
 				RecentEvents: []string{trickyText, "", "[x]"},
+				// APM-5. The quote in a key cannot come from ingest (keys are
+				// validated); it checks that neither path builds the map
+				// literal unescaped.
+				EventContext: models.EventContext{BuildType: "release", GPU: trickyText, RAMClass: "8GB", NetType: "wifi",
+					Context: map[string]string{"levelId": "3", "tricky": trickyText, "it's": "k'ey", "empty": ""}},
 			}
 			exc := models.Exception{
 				Timestamp: ts, EventID: "e2", Seq: 2, AppVersion: "1.2.3", Platform: "Android",
@@ -52,6 +57,7 @@ func TestInsertPaths_RoundTripIdentically(t *testing.T) {
 			// ReplacingMergeTree, which collapses rows with the same event_id.
 			jank2 := jank
 			jank2.EventID = "e1b"
+			jank2.EventContext = models.EventContext{} // nil map: stored as an empty map
 			if err := repo.InsertJanks(ctx, []models.Jank{jank, jank2}); err != nil {
 				t.Fatalf("insert janks: %v", err)
 			}
@@ -61,11 +67,13 @@ func TestInsertPaths_RoundTripIdentically(t *testing.T) {
 
 			var got models.Jank
 			row := client.Conn().QueryRow(ctx, `SELECT timestamp, event_id, seq, app_version, platform, device_model, os_version,
-				session_id, device_id, scene, duration_ms, max_frame_ms, recent_gc_count, recent_gc_alloc_kb, recent_events
+				session_id, device_id, scene, duration_ms, max_frame_ms, recent_gc_count, recent_gc_alloc_kb, recent_events,
+				build_type, gpu, ram_class, net_type, ctx
 				FROM apm_janks WHERE session_id = ? AND event_id = 'e1'`, session)
 			if err := row.Scan(&got.Timestamp, &got.EventID, &got.Seq, &got.AppVersion, &got.Platform, &got.DeviceModel,
 				&got.OSVersion, &got.SessionID, &got.DeviceID, &got.Scene, &got.DurationMs, &got.MaxFrameMs,
-				&got.RecentGCCount, &got.RecentGCAllocKB, &got.RecentEvents); err != nil {
+				&got.RecentGCCount, &got.RecentGCAllocKB, &got.RecentEvents,
+				&got.BuildType, &got.GPU, &got.RAMClass, &got.NetType, &got.Context); err != nil {
 				t.Fatal(err)
 			}
 			got.Timestamp = got.Timestamp.UTC()
@@ -76,6 +84,11 @@ func TestInsertPaths_RoundTripIdentically(t *testing.T) {
 			var n uint64
 			if err := client.Conn().QueryRow(ctx, "SELECT count() FROM apm_janks WHERE session_id = ?", session).Scan(&n); err != nil || n != 2 {
 				t.Errorf("expected 2 jank rows, got %d (%v)", n, err)
+			}
+			var ctx2 map[string]string
+			var bt2 string
+			if err := client.Conn().QueryRow(ctx, "SELECT ctx, build_type FROM apm_janks WHERE session_id = ? AND event_id = 'e1b'", session).Scan(&ctx2, &bt2); err != nil || len(ctx2) != 0 || bt2 != "" {
+				t.Errorf("event without context: ctx %v build_type %q (%v)", ctx2, bt2, err)
 			}
 
 			var msg, stack string

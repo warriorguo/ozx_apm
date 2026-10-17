@@ -45,6 +45,15 @@ var eventColumns = []string{
 	// APM-2: client event id and per-install sequence number.
 	"event_id String DEFAULT ''",
 	"seq UInt64 DEFAULT 0",
+	// APM-5: build type ('release', 'dev', 'editor'; '' for events from SDKs
+	// that predate it), device details, and the game context: the key/value
+	// pairs the game had set with ApmClient.SetContext when the event was
+	// recorded (models.EventContext has the limits).
+	"build_type LowCardinality(String) DEFAULT ''",
+	"gpu LowCardinality(String) DEFAULT ''",
+	"ram_class LowCardinality(String) DEFAULT ''",
+	"net_type LowCardinality(String) DEFAULT ''",
+	"ctx Map(LowCardinality(String), String)",
 }
 
 type eventTableSchema struct {
@@ -386,8 +395,8 @@ func SchemaSQL() string {
 	}
 	sb.WriteString(`
 -- Additive column migrations for tables created by earlier releases
--- (APM-2: event_id, seq). Metadata only (existing parts are not rewritten),
--- idempotent.
+-- (APM-2: event_id, seq; APM-5: build_type, gpu, ram_class, net_type, ctx).
+-- Metadata only (existing parts are not rewritten), idempotent.
 `)
 	for _, s := range eventTableSchemas {
 		for _, col := range eventColumns {

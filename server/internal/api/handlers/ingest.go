@@ -154,6 +154,7 @@ func (h *IngestHandler) IngestEvents(w http.ResponseWriter, r *http.Request) {
 		errors      []string
 		rejected    int
 		hasEventIDs bool
+		ctxStats    processor.ContextStats
 		reject      = func(i int, reason string) { rejected++; errors = append(errors, "event "+strconv.Itoa(i)+": "+reason) }
 		sdkVersion  = r.Header.Get(SDKVersionHeader)
 		clientIP    = r.RemoteAddr // In production, extract from X-Forwarded-For
@@ -185,6 +186,7 @@ func (h *IngestHandler) IngestEvents(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			event.Timestamp = timestamp
+			ctxStats.Add(processor.NormalizeEventContext(&event.EventContext, event.Platform))
 			event.Platform = h.enricher.NormalizePlatform(event.Platform)
 			event.DeviceModel = h.enricher.NormalizeDeviceModel(event.DeviceModel)
 			if err := h.validator.ValidatePerfSample(&event); err != nil {
@@ -200,6 +202,7 @@ func (h *IngestHandler) IngestEvents(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			event.Timestamp = timestamp
+			ctxStats.Add(processor.NormalizeEventContext(&event.EventContext, event.Platform))
 			event.Platform = h.enricher.NormalizePlatform(event.Platform)
 			event.DeviceModel = h.enricher.NormalizeDeviceModel(event.DeviceModel)
 			if err := h.validator.ValidateJank(&event); err != nil {
@@ -215,6 +218,7 @@ func (h *IngestHandler) IngestEvents(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			event.Timestamp = timestamp
+			ctxStats.Add(processor.NormalizeEventContext(&event.EventContext, event.Platform))
 			event.Platform = h.enricher.NormalizePlatform(event.Platform)
 			event.DeviceModel = h.enricher.NormalizeDeviceModel(event.DeviceModel)
 			if err := h.validator.ValidateStartup(&event); err != nil {
@@ -230,6 +234,7 @@ func (h *IngestHandler) IngestEvents(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			event.Timestamp = timestamp
+			ctxStats.Add(processor.NormalizeEventContext(&event.EventContext, event.Platform))
 			event.Platform = h.enricher.NormalizePlatform(event.Platform)
 			event.DeviceModel = h.enricher.NormalizeDeviceModel(event.DeviceModel)
 			if err := h.validator.ValidateSceneLoad(&event); err != nil {
@@ -245,6 +250,7 @@ func (h *IngestHandler) IngestEvents(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			event.Timestamp = timestamp
+			ctxStats.Add(processor.NormalizeEventContext(&event.EventContext, event.Platform))
 			event.Platform = h.enricher.NormalizePlatform(event.Platform)
 			event.DeviceModel = h.enricher.NormalizeDeviceModel(event.DeviceModel)
 			if err := h.validator.ValidateException(&event); err != nil {
@@ -260,6 +266,7 @@ func (h *IngestHandler) IngestEvents(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			event.Timestamp = timestamp
+			ctxStats.Add(processor.NormalizeEventContext(&event.EventContext, event.Platform))
 			event.Platform = h.enricher.NormalizePlatform(event.Platform)
 			event.DeviceModel = h.enricher.NormalizeDeviceModel(event.DeviceModel)
 			if err := h.validator.ValidateCrash(&event); err != nil {
@@ -271,6 +278,12 @@ func (h *IngestHandler) IngestEvents(w http.ResponseWriter, r *http.Request) {
 		default:
 			reject(i, "unknown type")
 		}
+	}
+
+	if ctxStats.Dropped > 0 || ctxStats.Truncated > 0 {
+		// The events are kept; only the offending context entries are not.
+		errors = append(errors, "context: "+strconv.Itoa(ctxStats.Dropped)+" entries dropped, "+
+			strconv.Itoa(ctxStats.Truncated)+" values truncated (limits: 64 keys of [A-Za-z0-9_.-]{1,64}, values up to 256 characters)")
 	}
 
 	// Drop events that are already stored or repeated in this batch (APM-19).
@@ -380,6 +393,8 @@ func (h *IngestHandler) IngestEvents(w http.ResponseWriter, r *http.Request) {
 		zap.Int("dedup_lookup_failed", dups.lookupFailed),
 		zap.Int("rejected", rejected),
 		zap.Int("failed", failed),
+		zap.Int("ctx_dropped", ctxStats.Dropped),
+		zap.Int("ctx_truncated", ctxStats.Truncated),
 		zap.String("sdk_version", sdkVersion),
 		zap.String("client_ip", clientIP),
 	)

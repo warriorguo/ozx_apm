@@ -37,7 +37,7 @@ func (r *Repository) InsertPerfSamples(ctx context.Context, samples []models.Per
 		return nil
 	}
 
-	batch, err := r.newInsert(ctx, "INSERT INTO apm_perf_samples (timestamp, app_version, platform, device_model, os_version, session_id, device_id, scene, fps, frame_time_ms, main_thread_ms, gc_alloc_kb, mem_mb, event_id, seq)")
+	batch, err := r.newInsert(ctx, "INSERT INTO apm_perf_samples (timestamp, app_version, platform, device_model, os_version, session_id, device_id, scene, fps, frame_time_ms, main_thread_ms, gc_alloc_kb, mem_mb, event_id, seq, build_type, gpu, ram_class, net_type, ctx)")
 	if err != nil {
 		return fmt.Errorf("prepare batch: %w", err)
 	}
@@ -59,6 +59,11 @@ func (r *Repository) InsertPerfSamples(ctx context.Context, samples []models.Per
 			s.MemMB,
 			s.EventID,
 			s.Seq,
+			s.BuildType,
+			s.GPU,
+			s.RAMClass,
+			s.NetType,
+			contextColumn(s.Context),
 		)
 		if err != nil {
 			return fmt.Errorf("append to batch: %w", err)
@@ -74,7 +79,7 @@ func (r *Repository) InsertJanks(ctx context.Context, janks []models.Jank) error
 		return nil
 	}
 
-	batch, err := r.newInsert(ctx, "INSERT INTO apm_janks (timestamp, app_version, platform, device_model, os_version, session_id, device_id, scene, duration_ms, max_frame_ms, recent_gc_count, recent_gc_alloc_kb, recent_events, event_id, seq)")
+	batch, err := r.newInsert(ctx, "INSERT INTO apm_janks (timestamp, app_version, platform, device_model, os_version, session_id, device_id, scene, duration_ms, max_frame_ms, recent_gc_count, recent_gc_alloc_kb, recent_events, event_id, seq, build_type, gpu, ram_class, net_type, ctx)")
 	if err != nil {
 		return fmt.Errorf("prepare batch: %w", err)
 	}
@@ -96,6 +101,11 @@ func (r *Repository) InsertJanks(ctx context.Context, janks []models.Jank) error
 			j.RecentEvents,
 			j.EventID,
 			j.Seq,
+			j.BuildType,
+			j.GPU,
+			j.RAMClass,
+			j.NetType,
+			contextColumn(j.Context),
 		)
 		if err != nil {
 			return fmt.Errorf("append to batch: %w", err)
@@ -111,7 +121,7 @@ func (r *Repository) InsertStartups(ctx context.Context, startups []models.Start
 		return nil
 	}
 
-	batch, err := r.newInsert(ctx, "INSERT INTO apm_startups (timestamp, app_version, platform, device_model, os_version, session_id, device_id, phase1_ms, phase2_ms, tti_ms, event_id, seq)")
+	batch, err := r.newInsert(ctx, "INSERT INTO apm_startups (timestamp, app_version, platform, device_model, os_version, session_id, device_id, phase1_ms, phase2_ms, tti_ms, event_id, seq, build_type, gpu, ram_class, net_type, ctx)")
 	if err != nil {
 		return fmt.Errorf("prepare batch: %w", err)
 	}
@@ -130,6 +140,11 @@ func (r *Repository) InsertStartups(ctx context.Context, startups []models.Start
 			s.TTIMs,
 			s.EventID,
 			s.Seq,
+			s.BuildType,
+			s.GPU,
+			s.RAMClass,
+			s.NetType,
+			contextColumn(s.Context),
 		)
 		if err != nil {
 			return fmt.Errorf("append to batch: %w", err)
@@ -145,7 +160,7 @@ func (r *Repository) InsertSceneLoads(ctx context.Context, loads []models.SceneL
 		return nil
 	}
 
-	batch, err := r.newInsert(ctx, "INSERT INTO apm_scene_loads (timestamp, app_version, platform, device_model, session_id, device_id, scene_name, load_ms, activate_ms, event_id, seq)")
+	batch, err := r.newInsert(ctx, "INSERT INTO apm_scene_loads (timestamp, app_version, platform, device_model, session_id, device_id, scene_name, load_ms, activate_ms, event_id, seq, build_type, gpu, ram_class, net_type, ctx)")
 	if err != nil {
 		return fmt.Errorf("prepare batch: %w", err)
 	}
@@ -163,6 +178,11 @@ func (r *Repository) InsertSceneLoads(ctx context.Context, loads []models.SceneL
 			l.ActivateMs,
 			l.EventID,
 			l.Seq,
+			l.BuildType,
+			l.GPU,
+			l.RAMClass,
+			l.NetType,
+			contextColumn(l.Context),
 		)
 		if err != nil {
 			return fmt.Errorf("append to batch: %w", err)
@@ -178,7 +198,7 @@ func (r *Repository) InsertExceptions(ctx context.Context, exceptions []models.E
 		return nil
 	}
 
-	batch, err := r.newInsert(ctx, "INSERT INTO apm_exceptions (timestamp, app_version, platform, device_model, os_version, session_id, device_id, scene, fingerprint, message, stack, count, event_id, seq)")
+	batch, err := r.newInsert(ctx, "INSERT INTO apm_exceptions (timestamp, app_version, platform, device_model, os_version, session_id, device_id, scene, fingerprint, message, stack, count, event_id, seq, build_type, gpu, ram_class, net_type, ctx)")
 	if err != nil {
 		return fmt.Errorf("prepare batch: %w", err)
 	}
@@ -199,6 +219,11 @@ func (r *Repository) InsertExceptions(ctx context.Context, exceptions []models.E
 			e.Count,
 			e.EventID,
 			e.Seq,
+			e.BuildType,
+			e.GPU,
+			e.RAMClass,
+			e.NetType,
+			contextColumn(e.Context),
 		)
 		if err != nil {
 			return fmt.Errorf("append to batch: %w", err)
@@ -214,7 +239,7 @@ func (r *Repository) InsertCrashes(ctx context.Context, crashes []models.Crash) 
 		return nil
 	}
 
-	batch, err := r.newInsert(ctx, "INSERT INTO apm_crashes (timestamp, app_version, platform, device_model, os_version, session_id, device_id, scene, crash_type, fingerprint, stack, breadcrumbs, event_id, seq)")
+	batch, err := r.newInsert(ctx, "INSERT INTO apm_crashes (timestamp, app_version, platform, device_model, os_version, session_id, device_id, scene, crash_type, fingerprint, stack, breadcrumbs, event_id, seq, build_type, gpu, ram_class, net_type, ctx)")
 	if err != nil {
 		return fmt.Errorf("prepare batch: %w", err)
 	}
@@ -235,6 +260,11 @@ func (r *Repository) InsertCrashes(ctx context.Context, crashes []models.Crash) 
 			c.Breadcrumbs,
 			c.EventID,
 			c.Seq,
+			c.BuildType,
+			c.GPU,
+			c.RAMClass,
+			c.NetType,
+			contextColumn(c.Context),
 		)
 		if err != nil {
 			return fmt.Errorf("append to batch: %w", err)
@@ -242,6 +272,14 @@ func (r *Repository) InsertCrashes(ctx context.Context, crashes []models.Crash) 
 	}
 
 	return batch.Send()
+}
+
+// contextColumn is the value inserted into the ctx Map column; never nil.
+func contextColumn(ctx map[string]string) map[string]string {
+	if ctx == nil {
+		return map[string]string{}
+	}
+	return ctx
 }
 
 // Query methods

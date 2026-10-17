@@ -25,6 +25,11 @@ CREATE TABLE IF NOT EXISTS apm_perf_samples (
     mem_mb Float32,
     event_id String DEFAULT '',
     seq UInt64 DEFAULT 0,
+    build_type LowCardinality(String) DEFAULT '',
+    gpu LowCardinality(String) DEFAULT '',
+    ram_class LowCardinality(String) DEFAULT '',
+    net_type LowCardinality(String) DEFAULT '',
+    ctx Map(LowCardinality(String), String),
     INDEX idx_event_id event_id TYPE bloom_filter(0.001) GRANULARITY 1
 ) ENGINE = ReplacingMergeTree()
 PARTITION BY toYYYYMMDD(timestamp)
@@ -47,6 +52,11 @@ CREATE TABLE IF NOT EXISTS apm_janks (
     recent_events Array(String),
     event_id String DEFAULT '',
     seq UInt64 DEFAULT 0,
+    build_type LowCardinality(String) DEFAULT '',
+    gpu LowCardinality(String) DEFAULT '',
+    ram_class LowCardinality(String) DEFAULT '',
+    net_type LowCardinality(String) DEFAULT '',
+    ctx Map(LowCardinality(String), String),
     INDEX idx_event_id event_id TYPE bloom_filter(0.001) GRANULARITY 1
 ) ENGINE = ReplacingMergeTree()
 PARTITION BY toYYYYMMDD(timestamp)
@@ -66,6 +76,11 @@ CREATE TABLE IF NOT EXISTS apm_startups (
     tti_ms Float32,
     event_id String DEFAULT '',
     seq UInt64 DEFAULT 0,
+    build_type LowCardinality(String) DEFAULT '',
+    gpu LowCardinality(String) DEFAULT '',
+    ram_class LowCardinality(String) DEFAULT '',
+    net_type LowCardinality(String) DEFAULT '',
+    ctx Map(LowCardinality(String), String),
     INDEX idx_event_id event_id TYPE bloom_filter(0.001) GRANULARITY 1
 ) ENGINE = ReplacingMergeTree()
 PARTITION BY toYYYYMMDD(timestamp)
@@ -84,6 +99,11 @@ CREATE TABLE IF NOT EXISTS apm_scene_loads (
     activate_ms Float32,
     event_id String DEFAULT '',
     seq UInt64 DEFAULT 0,
+    build_type LowCardinality(String) DEFAULT '',
+    gpu LowCardinality(String) DEFAULT '',
+    ram_class LowCardinality(String) DEFAULT '',
+    net_type LowCardinality(String) DEFAULT '',
+    ctx Map(LowCardinality(String), String),
     INDEX idx_event_id event_id TYPE bloom_filter(0.001) GRANULARITY 1
 ) ENGINE = ReplacingMergeTree()
 PARTITION BY toYYYYMMDD(timestamp)
@@ -105,6 +125,11 @@ CREATE TABLE IF NOT EXISTS apm_exceptions (
     count UInt32,
     event_id String DEFAULT '',
     seq UInt64 DEFAULT 0,
+    build_type LowCardinality(String) DEFAULT '',
+    gpu LowCardinality(String) DEFAULT '',
+    ram_class LowCardinality(String) DEFAULT '',
+    net_type LowCardinality(String) DEFAULT '',
+    ctx Map(LowCardinality(String), String),
     INDEX idx_event_id event_id TYPE bloom_filter(0.001) GRANULARITY 1
 ) ENGINE = ReplacingMergeTree()
 PARTITION BY toYYYYMMDD(timestamp)
@@ -126,6 +151,11 @@ CREATE TABLE IF NOT EXISTS apm_crashes (
     breadcrumbs Array(String),
     event_id String DEFAULT '',
     seq UInt64 DEFAULT 0,
+    build_type LowCardinality(String) DEFAULT '',
+    gpu LowCardinality(String) DEFAULT '',
+    ram_class LowCardinality(String) DEFAULT '',
+    net_type LowCardinality(String) DEFAULT '',
+    ctx Map(LowCardinality(String), String),
     INDEX idx_event_id event_id TYPE bloom_filter(0.001) GRANULARITY 1
 ) ENGINE = ReplacingMergeTree()
 PARTITION BY toYYYYMMDD(timestamp)
@@ -133,20 +163,50 @@ ORDER BY (app_version, fingerprint, timestamp, event_id)
 TTL toDateTime(timestamp) + INTERVAL 30 DAY;
 
 -- Additive column migrations for tables created by earlier releases
--- (APM-2: event_id, seq). Metadata only (existing parts are not rewritten),
--- idempotent.
+-- (APM-2: event_id, seq; APM-5: build_type, gpu, ram_class, net_type, ctx).
+-- Metadata only (existing parts are not rewritten), idempotent.
 ALTER TABLE apm_perf_samples ADD COLUMN IF NOT EXISTS event_id String DEFAULT '';
 ALTER TABLE apm_perf_samples ADD COLUMN IF NOT EXISTS seq UInt64 DEFAULT 0;
+ALTER TABLE apm_perf_samples ADD COLUMN IF NOT EXISTS build_type LowCardinality(String) DEFAULT '';
+ALTER TABLE apm_perf_samples ADD COLUMN IF NOT EXISTS gpu LowCardinality(String) DEFAULT '';
+ALTER TABLE apm_perf_samples ADD COLUMN IF NOT EXISTS ram_class LowCardinality(String) DEFAULT '';
+ALTER TABLE apm_perf_samples ADD COLUMN IF NOT EXISTS net_type LowCardinality(String) DEFAULT '';
+ALTER TABLE apm_perf_samples ADD COLUMN IF NOT EXISTS ctx Map(LowCardinality(String), String);
 ALTER TABLE apm_janks ADD COLUMN IF NOT EXISTS event_id String DEFAULT '';
 ALTER TABLE apm_janks ADD COLUMN IF NOT EXISTS seq UInt64 DEFAULT 0;
+ALTER TABLE apm_janks ADD COLUMN IF NOT EXISTS build_type LowCardinality(String) DEFAULT '';
+ALTER TABLE apm_janks ADD COLUMN IF NOT EXISTS gpu LowCardinality(String) DEFAULT '';
+ALTER TABLE apm_janks ADD COLUMN IF NOT EXISTS ram_class LowCardinality(String) DEFAULT '';
+ALTER TABLE apm_janks ADD COLUMN IF NOT EXISTS net_type LowCardinality(String) DEFAULT '';
+ALTER TABLE apm_janks ADD COLUMN IF NOT EXISTS ctx Map(LowCardinality(String), String);
 ALTER TABLE apm_startups ADD COLUMN IF NOT EXISTS event_id String DEFAULT '';
 ALTER TABLE apm_startups ADD COLUMN IF NOT EXISTS seq UInt64 DEFAULT 0;
+ALTER TABLE apm_startups ADD COLUMN IF NOT EXISTS build_type LowCardinality(String) DEFAULT '';
+ALTER TABLE apm_startups ADD COLUMN IF NOT EXISTS gpu LowCardinality(String) DEFAULT '';
+ALTER TABLE apm_startups ADD COLUMN IF NOT EXISTS ram_class LowCardinality(String) DEFAULT '';
+ALTER TABLE apm_startups ADD COLUMN IF NOT EXISTS net_type LowCardinality(String) DEFAULT '';
+ALTER TABLE apm_startups ADD COLUMN IF NOT EXISTS ctx Map(LowCardinality(String), String);
 ALTER TABLE apm_scene_loads ADD COLUMN IF NOT EXISTS event_id String DEFAULT '';
 ALTER TABLE apm_scene_loads ADD COLUMN IF NOT EXISTS seq UInt64 DEFAULT 0;
+ALTER TABLE apm_scene_loads ADD COLUMN IF NOT EXISTS build_type LowCardinality(String) DEFAULT '';
+ALTER TABLE apm_scene_loads ADD COLUMN IF NOT EXISTS gpu LowCardinality(String) DEFAULT '';
+ALTER TABLE apm_scene_loads ADD COLUMN IF NOT EXISTS ram_class LowCardinality(String) DEFAULT '';
+ALTER TABLE apm_scene_loads ADD COLUMN IF NOT EXISTS net_type LowCardinality(String) DEFAULT '';
+ALTER TABLE apm_scene_loads ADD COLUMN IF NOT EXISTS ctx Map(LowCardinality(String), String);
 ALTER TABLE apm_exceptions ADD COLUMN IF NOT EXISTS event_id String DEFAULT '';
 ALTER TABLE apm_exceptions ADD COLUMN IF NOT EXISTS seq UInt64 DEFAULT 0;
+ALTER TABLE apm_exceptions ADD COLUMN IF NOT EXISTS build_type LowCardinality(String) DEFAULT '';
+ALTER TABLE apm_exceptions ADD COLUMN IF NOT EXISTS gpu LowCardinality(String) DEFAULT '';
+ALTER TABLE apm_exceptions ADD COLUMN IF NOT EXISTS ram_class LowCardinality(String) DEFAULT '';
+ALTER TABLE apm_exceptions ADD COLUMN IF NOT EXISTS net_type LowCardinality(String) DEFAULT '';
+ALTER TABLE apm_exceptions ADD COLUMN IF NOT EXISTS ctx Map(LowCardinality(String), String);
 ALTER TABLE apm_crashes ADD COLUMN IF NOT EXISTS event_id String DEFAULT '';
 ALTER TABLE apm_crashes ADD COLUMN IF NOT EXISTS seq UInt64 DEFAULT 0;
+ALTER TABLE apm_crashes ADD COLUMN IF NOT EXISTS build_type LowCardinality(String) DEFAULT '';
+ALTER TABLE apm_crashes ADD COLUMN IF NOT EXISTS gpu LowCardinality(String) DEFAULT '';
+ALTER TABLE apm_crashes ADD COLUMN IF NOT EXISTS ram_class LowCardinality(String) DEFAULT '';
+ALTER TABLE apm_crashes ADD COLUMN IF NOT EXISTS net_type LowCardinality(String) DEFAULT '';
+ALTER TABLE apm_crashes ADD COLUMN IF NOT EXISTS ctx Map(LowCardinality(String), String);
 
 -- APM-19: bloom_filter skip index on event_id for the ingest-time duplicate
 -- lookup. Additive, idempotent, metadata only: new parts carry the index,

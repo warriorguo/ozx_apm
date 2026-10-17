@@ -249,20 +249,55 @@ func TestMigrate_FreshInstallHasTTLAndViews(t *testing.T) {
 	}
 }
 
-// seedLegacyRows inserts one row per table through the repository (the same
-// named-column inserts the previous binary used) and returns the session id.
+// legacyInserts are the inserts of the binary before APM-5 (111d9bf), with
+// one row of values each. They run before Migrate (seeding a legacy
+// database) and after it (an old binary during a rolling deploy or after a
+// rollback must keep inserting into the migrated tables).
+var legacyInserts = []struct {
+	query string
+	row   func(s string, ts time.Time) []any
+}{
+	{"INSERT INTO apm_perf_samples (timestamp, app_version, platform, device_model, os_version, session_id, device_id, scene, fps, frame_time_ms, main_thread_ms, gc_alloc_kb, mem_mb, event_id, seq)",
+		func(s string, ts time.Time) []any {
+			return []any{ts, "1", "Android", "m", "os", s, "d", "S", float32(50), float32(20), float32(20), float32(1), float32(100), s + "p", uint64(1)}
+		}},
+	{"INSERT INTO apm_janks (timestamp, app_version, platform, device_model, os_version, session_id, device_id, scene, duration_ms, max_frame_ms, recent_gc_count, recent_gc_alloc_kb, recent_events, event_id, seq)",
+		func(s string, ts time.Time) []any {
+			return []any{ts, "1", "Android", "m", "os", s, "d", "S", float32(80), float32(60), uint32(1), float32(2), []string{"x"}, s + "j", uint64(2)}
+		}},
+	{"INSERT INTO apm_startups (timestamp, app_version, platform, device_model, os_version, session_id, device_id, phase1_ms, phase2_ms, tti_ms, event_id, seq)",
+		func(s string, ts time.Time) []any {
+			return []any{ts, "1", "Android", "m", "os", s, "d", float32(1), float32(2), float32(3), s + "s", uint64(3)}
+		}},
+	{"INSERT INTO apm_scene_loads (timestamp, app_version, platform, device_model, session_id, device_id, scene_name, load_ms, activate_ms, event_id, seq)",
+		func(s string, ts time.Time) []any {
+			return []any{ts, "1", "Android", "m", s, "d", "S", float32(10), float32(1), s + "l", uint64(4)}
+		}},
+	{"INSERT INTO apm_exceptions (timestamp, app_version, platform, device_model, os_version, session_id, device_id, scene, fingerprint, message, stack, count, event_id, seq)",
+		func(s string, ts time.Time) []any {
+			return []any{ts, "1", "Android", "m", "os", s, "d", "S", "F", "msg", "stack", uint32(3), s + "e", uint64(5)}
+		}},
+	{"INSERT INTO apm_crashes (timestamp, app_version, platform, device_model, os_version, session_id, device_id, scene, crash_type, fingerprint, stack, breadcrumbs, event_id, seq)",
+		func(s string, ts time.Time) []any {
+			return []any{ts, "1", "Android", "m", "os", s, "d", "S", "native", "F", "stack", []string{"b"}, s + "c", uint64(6)}
+		}},
+}
+
+// seedLegacyRows inserts one row per table the way the 111d9bf binary does
+// and returns the session id.
 func seedLegacyRows(t *testing.T, client *storage.ClickHouseClient) string {
 	t.Helper()
 	ctx := context.Background()
-	repo := storage.NewRepository(client, zap.NewNop())
 	s := fmt.Sprintf("legacy-%d", time.Now().UnixNano())
 	ts := time.Now().Add(-2 * time.Hour)
-	must(t, repo.InsertPerfSamples(ctx, []models.PerfSample{{Timestamp: ts, EventID: s + "p", AppVersion: "1", Platform: "Android", SessionID: s, DeviceID: "d", FPS: 50}}))
-	must(t, repo.InsertJanks(ctx, []models.Jank{{Timestamp: ts, EventID: s + "j", AppVersion: "1", Platform: "Android", SessionID: s, DeviceID: "d", Scene: "S", RecentEvents: []string{"x"}}}))
-	must(t, repo.InsertStartups(ctx, []models.Startup{{Timestamp: ts, EventID: s + "s", AppVersion: "1", Platform: "Android", SessionID: s, DeviceID: "d", Phase1Ms: 1}}))
-	must(t, repo.InsertSceneLoads(ctx, []models.SceneLoad{{Timestamp: ts, EventID: s + "l", AppVersion: "1", Platform: "Android", SessionID: s, DeviceID: "d", SceneName: "S"}}))
-	must(t, repo.InsertExceptions(ctx, []models.Exception{{Timestamp: ts, EventID: s + "e", AppVersion: "1", Platform: "Android", SessionID: s, DeviceID: "d", Fingerprint: "F", Count: 3}}))
-	must(t, repo.InsertCrashes(ctx, []models.Crash{{Timestamp: ts, EventID: s + "c", AppVersion: "1", Platform: "Android", SessionID: s, DeviceID: "d", Fingerprint: "F", Breadcrumbs: []string{"b"}}}))
+	for _, ins := range legacyInserts {
+		batch, err := client.Conn().PrepareBatch(ctx, ins.query)
+		if err != nil {
+			t.Fatalf("%s: %v", ins.query, err)
+		}
+		must(t, batch.Append(ins.row(s, ts)...))
+		must(t, batch.Send())
+	}
 	return s
 }
 
@@ -352,6 +387,56 @@ func TestMigrate_UpgradesProductionDatabase(t *testing.T) {
 	assertLegacyRowsIntact(t, client, session)
 	if n := queryUint(t, client, "SELECT toUInt64(sum(total_count)) FROM apm_exception_daily"); n != viewRows {
 		t.Errorf("apm_exception_daily changed from %d to %d by Migrate", viewRows, n)
+	}
+}
+
+func columnsOf(t *testing.T, client *storage.ClickHouseClient, table string) string {
+	t.Helper()
+	rows, err := client.Conn().Query(context.Background(),
+		"SELECT name, type, default_expression FROM system.columns WHERE database = currentDatabase() AND table = ? ORDER BY position", table)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var cols []string
+	for rows.Next() {
+		var name, typ, def string
+		must(t, rows.Scan(&name, &typ, &def))
+		cols = append(cols, name+" "+typ+" "+def)
+	}
+	must(t, rows.Err())
+	return strings.Join(cols, ", ")
+}
+
+// After Migrate, an upgraded table has exactly the columns (names, types,
+// defaults, order) of a fresh one, and rows written before the upgrade read
+// the APM-5 columns as their defaults.
+func TestMigrate_UpgradedTablesMatchFreshInstall(t *testing.T) {
+	admin := adminClient(t)
+	fresh := schemaTestDB(t, "cols_fresh")
+	createDB(t, admin, fresh)
+	freshClient, _ := connect(t, fresh, "")
+	must(t, freshClient.Migrate(context.Background()))
+
+	for _, kind := range []string{"startup", "production"} {
+		t.Run(kind, func(t *testing.T) {
+			db := schemaTestDB(t, "cols_"+kind)
+			createDB(t, admin, db)
+			client, _ := connect(t, db, "")
+			execAll(t, client, legacySchema(t, kind))
+			session := seedLegacyRows(t, client)
+			must(t, client.Migrate(context.Background()))
+			for _, et := range storage.EventTables {
+				if got, want := columnsOf(t, client, et.Name), columnsOf(t, freshClient, et.Name); got != want {
+					t.Errorf("%s columns differ from a fresh install:\n got %s\nwant %s", et.Name, got, want)
+				}
+				n := queryUint(t, client, "SELECT count() FROM "+et.Name+
+					" WHERE session_id = ? AND build_type = '' AND gpu = '' AND ram_class = '' AND net_type = '' AND empty(ctx)", session)
+				if n != 1 {
+					t.Errorf("%s: legacy row does not read the APM-5 defaults", et.Name)
+				}
+			}
+		})
 	}
 }
 
