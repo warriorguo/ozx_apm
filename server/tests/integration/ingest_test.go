@@ -13,6 +13,7 @@ import (
 	"github.com/warriorguo/ozx_apm/server/internal/api"
 	"github.com/warriorguo/ozx_apm/server/internal/config"
 	"github.com/warriorguo/ozx_apm/server/internal/storage"
+	"github.com/warriorguo/ozx_apm/server/tests/integration/testutil"
 )
 
 // Note: These tests require a running ClickHouse instance
@@ -32,13 +33,7 @@ func TestIngestEvents_Success(t *testing.T) {
 			ReadTimeout:  30 * time.Second,
 			WriteTimeout: 30 * time.Second,
 		},
-		ClickHouse: config.ClickHouseConfig{
-			Host:     "localhost",
-			Port:     9000,
-			Database: "ozx_apm_test",
-			Username: "default",
-			Password: "",
-		},
+		ClickHouse: *testutil.TestClickHouseConfig(),
 		Auth: config.AuthConfig{
 			Enabled: false,
 		},
