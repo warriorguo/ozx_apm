@@ -257,6 +257,9 @@ func (h *IngestHandler) IngestEvents(w http.ResponseWriter, r *http.Request) {
 				reject(i, err.Error())
 				continue
 			}
+			// Server-side fingerprint (APM-4), before the duplicate lookup
+			// below, which matches on the stored fingerprint.
+			processor.ApplyFingerprint(&event)
 			exceptions = append(exceptions, event)
 
 		case models.EventTypeCrash:

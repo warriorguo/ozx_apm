@@ -18,6 +18,7 @@ import (
 	"github.com/warriorguo/ozx_apm/server/internal/api"
 	"github.com/warriorguo/ozx_apm/server/internal/api/handlers"
 	"github.com/warriorguo/ozx_apm/server/internal/config"
+	"github.com/warriorguo/ozx_apm/server/internal/fingerprint"
 	"github.com/warriorguo/ozx_apm/server/internal/models"
 	"github.com/warriorguo/ozx_apm/server/internal/storage"
 	"github.com/warriorguo/ozx_apm/server/tests/integration/testutil"
@@ -35,6 +36,14 @@ import (
 //	s4 editor   levelId=1                   perf 10
 //	s5 (legacy: no build_type, no ctx)      perf 40; exception E1 x1
 //	s6 (platform WindowsEditor, no build_type -> editor)  perf 5
+//
+// The server computes the exception fingerprints (APM-4); E1 and E2 are the
+// fingerprints the client sent.
+var (
+	contextFpE1 = fingerprint.Analyze(fingerprint.Input{Message: "error one"}).Fingerprint
+	contextFpE2 = fingerprint.Analyze(fingerprint.Input{Message: "error two"}).Fingerprint
+)
+
 func setupContextTest(t *testing.T) http.Handler {
 	t.Helper()
 	admin := adminClient(t)
@@ -65,18 +74,18 @@ func setupContextTest(t *testing.T) http.Handler {
 	events := []string{
 		ev("perf_sample", "s1", "Android", s1, `,"fps":60`),
 		ev("perf_sample", "s1", "Android", s1, `,"fps":50`),
-		ev("exception", "s1", "Android", s1, `,"fingerprint":"E1","message":"m","count":2`),
+		ev("exception", "s1", "Android", s1, `,"fingerprint":"E1","message":"error one","count":2`),
 		ev("jank", "s1", "Android", s1, `,"duration_ms":80,"max_frame_ms":80,"recent_events":[]`),
 		ev("startup", "s1", "Android", s1, `,"phase1_ms":100,"phase2_ms":200,"tti_ms":300`),
 		ev("scene_load", "s1", "Android", s1, `,"scene_name":"Main","load_ms":500`),
 		ev("perf_sample", "s2", "Android", s2, `,"fps":30`),
-		ev("exception", "s2", "Android", s2, `,"fingerprint":"E1","message":"m","count":1`),
+		ev("exception", "s2", "Android", s2, `,"fingerprint":"E1","message":"error one","count":1`),
 		ev("crash", "s2", "Android", s2, `,"fingerprint":"C1","crash_type":"native","stack":"st","breadcrumbs":["b"]`),
 		ev("perf_sample", "s3", "Android", s3, `,"fps":20`),
-		ev("exception", "s3", "Android", s3, `,"fingerprint":"E2","message":"m","count":5`),
+		ev("exception", "s3", "Android", s3, `,"fingerprint":"E2","message":"error two","count":5`),
 		ev("perf_sample", "s4", "Android", s4, `,"fps":10`),
 		ev("perf_sample", "s5", "Android", "", `,"fps":40`),
-		ev("exception", "s5", "Android", "", `,"fingerprint":"E1","message":"m","count":1`),
+		ev("exception", "s5", "Android", "", `,"fingerprint":"E1","message":"error one","count":1`),
 		ev("perf_sample", "s6", "WindowsEditor", "", `,"fps":5`),
 	}
 	ingest := api.NewRouter(&config.Config{ClickHouse: *cfg}, repo, zap.NewNop())
@@ -136,11 +145,11 @@ func TestContext_BuildTypeAndContextFilters(t *testing.T) {
 	// The other endpoints take the same filter.
 	var e models.ExceptionListResponse
 	getAdmin(t, router, "/api/exceptions", withParams(lastHour(), "ctx", "levelId:2"), &e)
-	if e.TotalCount != 1 || len(e.Exceptions) != 1 || e.Exceptions[0].Fingerprint != "E1" || e.Exceptions[0].Count != 1 {
+	if e.TotalCount != 1 || len(e.Exceptions) != 1 || e.Exceptions[0].Fingerprint != contextFpE1 || e.Exceptions[0].Count != 1 {
 		t.Errorf("exceptions with levelId=2: %+v", e)
 	}
 	getAdmin(t, router, "/api/exceptions", withParams(lastHour(), "build_type", "dev"), &e)
-	if e.TotalCount != 1 || e.Exceptions[0].Fingerprint != "E2" || e.Exceptions[0].Count != 5 {
+	if e.TotalCount != 1 || e.Exceptions[0].Fingerprint != contextFpE2 || e.Exceptions[0].Count != 5 {
 		t.Errorf("dev exceptions: %+v", e)
 	}
 	var c models.CrashListResponse
@@ -202,7 +211,7 @@ func TestContext_KeysValuesAndDistribution(t *testing.T) {
 	if d.Total != 4 || len(d.Rows) != 3 || d.Rows[0] != (models.ContextDistributionRow{Value: "1", Count: 2, Sessions: 1}) {
 		t.Errorf("exceptions by levelId: %+v", d)
 	}
-	d = dist("key", "levelId", "metric", "exceptions", "build_type", "all", "fingerprint", "E2")
+	d = dist("key", "levelId", "metric", "exceptions", "build_type", "all", "fingerprint", contextFpE2)
 	if d.Total != 5 || len(d.Rows) != 1 || d.Rows[0].Value != "1" || d.Rows[0].Count != 5 {
 		t.Errorf("E2 by levelId: %+v", d)
 	}

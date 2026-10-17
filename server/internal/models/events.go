@@ -171,6 +171,31 @@ type Exception struct {
 	Stack       string    `json:"stack" ch:"stack"`
 	Count       uint32    `json:"count" ch:"count"`
 	EventContext
+	ExceptionDetails
+}
+
+// ExceptionDetails is what APM-4 added to exceptions.
+//
+// From the SDK (empty from older SDKs): the log type ("exception", "error",
+// "assert"), the exception the SDK found embedded in an error log's message
+// (parsed on the device before the message was cut to 500 characters), and
+// the breadcrumbs recorded before the first occurrence.
+//
+// Computed by the server (processor.ApplyFingerprint), never read from the
+// request: Fingerprint above is replaced by the server's fingerprint, and
+// what the SDK sent is kept as ClientFingerprint.
+type ExceptionDetails struct {
+	LogType           string   `json:"log_type"`
+	EmbeddedException string   `json:"embedded_exception"`
+	Breadcrumbs       []string `json:"breadcrumbs"`
+
+	ClientFingerprint  string   `json:"-"`
+	FingerprintVersion uint8    `json:"-"`
+	ExceptionType      string   `json:"-"`
+	MessageTemplate    string   `json:"-"`
+	InnerExceptions    []string `json:"-"`
+	ThrowSite          string   `json:"-"`
+	CallSite           string   `json:"-"`
 }
 
 // Crash represents a fatal crash event

@@ -52,6 +52,12 @@ func TestInsertPaths_RoundTripIdentically(t *testing.T) {
 			exc := models.Exception{
 				Timestamp: ts, EventID: "e2", Seq: 2, AppVersion: "1.2.3", Platform: "Android",
 				SessionID: session, DeviceID: "d", Fingerprint: "fp", Message: trickyText, Stack: "at A\nat B", Count: 7,
+				// APM-4
+				ExceptionDetails: models.ExceptionDetails{
+					LogType: "error", EmbeddedException: trickyText, Breadcrumbs: []string{trickyText, "", "[10:00:00.000] Scene: Main"},
+					ClientFingerprint: "client-" + trickyText, FingerprintVersion: 255, ExceptionType: trickyText,
+					MessageTemplate: trickyText, InnerExceptions: []string{"A: " + trickyText, ""}, ThrowSite: trickyText, CallSite: trickyText,
+				},
 			}
 			// Two rows with different event_ids: since APM-19 the tables are
 			// ReplacingMergeTree, which collapses rows with the same event_id.
@@ -100,6 +106,16 @@ func TestInsertPaths_RoundTripIdentically(t *testing.T) {
 			}
 			if msg != trickyText || stack != exc.Stack || count != 7 || !excTs.Equal(ts) {
 				t.Errorf("exception round trip differs: %q %q %d %v", msg, stack, count, excTs)
+			}
+			var d models.ExceptionDetails
+			if err := client.Conn().QueryRow(ctx, `SELECT log_type, embedded_exception, breadcrumbs, client_fingerprint, fingerprint_version,
+				exception_type, message_template, inner_exceptions, throw_site, call_site FROM apm_exceptions WHERE session_id = ?`, session).
+				Scan(&d.LogType, &d.EmbeddedException, &d.Breadcrumbs, &d.ClientFingerprint, &d.FingerprintVersion,
+					&d.ExceptionType, &d.MessageTemplate, &d.InnerExceptions, &d.ThrowSite, &d.CallSite); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(d, exc.ExceptionDetails) {
+				t.Errorf("APM-4 columns differ:\n got %+v\nwant %+v", d, exc.ExceptionDetails)
 			}
 		})
 	}

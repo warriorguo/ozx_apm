@@ -14,16 +14,22 @@ import (
 )
 
 // TestClickHouseConfig returns a config for testing. OZX_TEST_CH_PORT
-// selects another native port (e.g. a second ClickHouse version).
+// selects another native port (e.g. a second ClickHouse version);
+// OZX_TEST_CH_DB another database than ozx_apm_test, so that two test runs
+// against the same ClickHouse do not truncate each other's tables.
 func TestClickHouseConfig() *config.ClickHouseConfig {
 	port := 9000
 	if p, err := strconv.Atoi(os.Getenv("OZX_TEST_CH_PORT")); err == nil && p > 0 {
 		port = p
 	}
+	db := "ozx_apm_test"
+	if d := os.Getenv("OZX_TEST_CH_DB"); d != "" {
+		db = d
+	}
 	return &config.ClickHouseConfig{
 		Host:     "localhost",
 		Port:     port,
-		Database: "ozx_apm_test",
+		Database: db,
 		Username: "default",
 		Password: "",
 	}

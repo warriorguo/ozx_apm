@@ -11,6 +11,7 @@ import (
 
 	"go.uber.org/zap"
 
+	"github.com/warriorguo/ozx_apm/server/internal/fingerprint"
 	"github.com/warriorguo/ozx_apm/server/internal/models"
 	"github.com/warriorguo/ozx_apm/server/internal/storage"
 )
@@ -225,9 +226,9 @@ func TestDedup_LookupUsesSortKeyPrefixAndTimeRange(t *testing.T) {
 	t1 := time.UnixMilli(time.Now().Add(-time.Hour).UnixMilli()/1000*1000 + 123)
 	t2 := t1.Add(90 * time.Second)
 	postBatch(t, h, batchOf(
-		eventAt("exception", "x2", 2, t2, `,"fingerprint":"fp-b","count":1`),
-		eventAt("exception", "x1", 1, t1, `,"fingerprint":"fp-a","count":1`),
-		eventAt("exception", "x3", 3, t1, `,"fingerprint":"fp-a","count":1`),
+		eventAt("exception", "x2", 2, t2, `,"fingerprint":"fp-b","message":"error b","count":1`),
+		eventAt("exception", "x1", 1, t1, `,"fingerprint":"fp-a","message":"error a","count":1`),
+		eventAt("exception", "x3", 3, t1, `,"fingerprint":"fp-a","message":"error a","count":1`),
 		eventAt("jank", "j1", 4, t1, `,"duration_ms":80,"max_frame_ms":80`),
 	), nil)
 
@@ -235,8 +236,11 @@ func TestDedup_LookupUsesSortKeyPrefixAndTimeRange(t *testing.T) {
 	for _, q := range store.lookups {
 		byTable[q.Table.Name] = q
 	}
+	// The key is the stored fingerprint, i.e. the server's (APM-4).
+	fpA := fingerprint.Analyze(fingerprint.Input{Message: "error a"}).Fingerprint
+	fpB := fingerprint.Analyze(fingerprint.Input{Message: "error b"}).Fingerprint
 	exc := byTable["apm_exceptions"]
-	if exc.Table.KeyColumn != "fingerprint" || len(exc.Keys) != 2 || exc.Keys[0] != "fp-b" || exc.Keys[1] != "fp-a" {
+	if exc.Table.KeyColumn != "fingerprint" || len(exc.Keys) != 2 || exc.Keys[0] != fpB || exc.Keys[1] != fpA {
 		t.Fatalf("exception lookup: %+v", exc)
 	}
 	if len(exc.AppVersions) != 1 || exc.AppVersions[0] != "1.0.0" {

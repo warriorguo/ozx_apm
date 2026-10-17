@@ -71,7 +71,7 @@ func TestSchemaStatements_ContextColumnsOnEveryEventTable(t *testing.T) {
 				create = stmt
 			}
 		}
-		if !strings.Contains(create, "    seq UInt64 DEFAULT 0,\n    "+strings.Join(cols, ",\n    ")+",\n    INDEX ") {
+		if !strings.Contains(create, "    seq UInt64 DEFAULT 0,\n    "+strings.Join(cols, ",\n    ")+",\n    ") {
 			t.Errorf("CREATE TABLE %s: APM-5 columns missing or out of order:\n%s", table, create)
 		}
 		for _, col := range cols {
@@ -83,6 +83,36 @@ func TestSchemaStatements_ContextColumnsOnEveryEventTable(t *testing.T) {
 			if !found {
 				t.Errorf("missing migration %q", want)
 			}
+		}
+	}
+}
+
+// APM-4: the exception columns come last in CREATE TABLE, and are added in
+// the same order after the APM-5 columns, so fresh and migrated tables match.
+func TestSchemaStatements_ExceptionColumnsAPM4(t *testing.T) {
+	var create string
+	var alters []string
+	for _, stmt := range schemaStatements {
+		if strings.HasPrefix(stmt, "CREATE TABLE IF NOT EXISTS apm_exceptions ") {
+			create = stmt
+		}
+		if strings.HasPrefix(stmt, "ALTER TABLE apm_exceptions ADD COLUMN") {
+			alters = append(alters, strings.TrimPrefix(stmt, "ALTER TABLE apm_exceptions ADD COLUMN IF NOT EXISTS "))
+		}
+	}
+	want := "    ctx Map(LowCardinality(String), String),\n    " + strings.Join(exceptionColumnsAPM4, ",\n    ") + ",\n    INDEX "
+	if !strings.Contains(create, want) {
+		t.Errorf("CREATE TABLE apm_exceptions: APM-4 columns missing or out of order:\n%s", create)
+	}
+	tail := alters[len(alters)-len(exceptionColumnsAPM4):]
+	for i, col := range exceptionColumnsAPM4 {
+		if tail[i] != col {
+			t.Errorf("migration %d: %q, want %q", i, tail[i], col)
+		}
+	}
+	for _, stmt := range schemaStatements {
+		if strings.HasPrefix(stmt, "CREATE TABLE IF NOT EXISTS apm_crashes ") && strings.Contains(stmt, "client_fingerprint") {
+			t.Error("APM-4 columns on apm_crashes")
 		}
 	}
 }

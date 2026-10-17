@@ -62,6 +62,32 @@ type eventTableSchema struct {
 	columns []string // table-specific columns, before eventColumns
 }
 
+// addedColumns are table-specific columns added after eventColumns, in the
+// order they were added; CREATE TABLE puts them last, as the ALTERs do.
+var addedColumns = map[string][]string{
+	TableExceptions.Name: exceptionColumnsAPM4,
+}
+
+// exceptionColumnsAPM4 are the exception columns of APM-4. fingerprint is
+// now computed by the server (internal/fingerprint) and fingerprint_version
+// says by which version of the algorithm; 0 marks rows stored before APM-4,
+// whose fingerprint is the SDK's. client_fingerprint is what the SDK sent.
+// The rest is parsed from message, stack and embedded_exception (the
+// exception the SDK found in an error log's message) and is empty on older
+// rows.
+var exceptionColumnsAPM4 = []string{
+	"client_fingerprint String DEFAULT ''",
+	"fingerprint_version UInt8 DEFAULT 0",
+	"log_type LowCardinality(String) DEFAULT ''",
+	"exception_type String DEFAULT ''",
+	"message_template String DEFAULT ''",
+	"embedded_exception String DEFAULT ''",
+	"inner_exceptions Array(String)",
+	"throw_site String DEFAULT ''",
+	"call_site String DEFAULT ''",
+	"breadcrumbs Array(String)",
+}
+
 var eventTableSchemas = []eventTableSchema{
 	{TablePerfSamples, []string{
 		"timestamp DateTime64(3)",
@@ -155,6 +181,9 @@ func createEventTableStatement(s eventTableSchema) string {
 	for _, col := range eventColumns {
 		sb.WriteString("    " + col + ",\n")
 	}
+	for _, col := range addedColumns[s.table.Name] {
+		sb.WriteString("    " + col + ",\n")
+	}
 	sb.WriteString("    INDEX " + EventIDIndexDDL + "\n")
 	sb.WriteString(") ENGINE = ReplacingMergeTree()\n")
 	sb.WriteString("PARTITION BY toYYYYMMDD(timestamp)\n")
@@ -180,6 +209,9 @@ var schemaStatements = func() []string {
 	}
 	for _, s := range eventTableSchemas {
 		for _, col := range eventColumns {
+			stmts = append(stmts, addColumnStatement(s.table.Name, col))
+		}
+		for _, col := range addedColumns[s.table.Name] {
 			stmts = append(stmts, addColumnStatement(s.table.Name, col))
 		}
 	}
@@ -397,11 +429,15 @@ func SchemaSQL() string {
 	}
 	sb.WriteString(`
 -- Additive column migrations for tables created by earlier releases
--- (APM-2: event_id, seq; APM-5: build_type, gpu, ram_class, net_type, ctx).
+-- (APM-2: event_id, seq; APM-5: build_type, gpu, ram_class, net_type, ctx;
+-- APM-4: the exception columns from client_fingerprint to breadcrumbs).
 -- Metadata only (existing parts are not rewritten), idempotent.
 `)
 	for _, s := range eventTableSchemas {
 		for _, col := range eventColumns {
+			sb.WriteString(addColumnStatement(s.table.Name, col) + ";\n")
+		}
+		for _, col := range addedColumns[s.table.Name] {
 			sb.WriteString(addColumnStatement(s.table.Name, col) + ";\n")
 		}
 	}

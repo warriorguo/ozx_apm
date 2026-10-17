@@ -198,7 +198,8 @@ func (r *Repository) InsertExceptions(ctx context.Context, exceptions []models.E
 		return nil
 	}
 
-	batch, err := r.newInsert(ctx, "INSERT INTO apm_exceptions (timestamp, app_version, platform, device_model, os_version, session_id, device_id, scene, fingerprint, message, stack, count, event_id, seq, build_type, gpu, ram_class, net_type, ctx)")
+	batch, err := r.newInsert(ctx, "INSERT INTO apm_exceptions (timestamp, app_version, platform, device_model, os_version, session_id, device_id, scene, fingerprint, message, stack, count, event_id, seq, build_type, gpu, ram_class, net_type, ctx, "+
+		"client_fingerprint, fingerprint_version, log_type, exception_type, message_template, embedded_exception, inner_exceptions, throw_site, call_site, breadcrumbs)")
 	if err != nil {
 		return fmt.Errorf("prepare batch: %w", err)
 	}
@@ -224,6 +225,16 @@ func (r *Repository) InsertExceptions(ctx context.Context, exceptions []models.E
 			e.RAMClass,
 			e.NetType,
 			contextColumn(e.Context),
+			e.ClientFingerprint,
+			e.FingerprintVersion,
+			e.LogType,
+			e.ExceptionType,
+			e.MessageTemplate,
+			e.EmbeddedException,
+			stringsColumn(e.InnerExceptions),
+			e.ThrowSite,
+			e.CallSite,
+			stringsColumn(e.Breadcrumbs),
 		)
 		if err != nil {
 			return fmt.Errorf("append to batch: %w", err)
@@ -231,6 +242,14 @@ func (r *Repository) InsertExceptions(ctx context.Context, exceptions []models.E
 	}
 
 	return batch.Send()
+}
+
+// stringsColumn returns a non-nil slice for an Array(String) column.
+func stringsColumn(s []string) []string {
+	if s == nil {
+		return []string{}
+	}
+	return s
 }
 
 // InsertCrashes batch inserts crash events
