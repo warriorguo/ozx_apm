@@ -272,6 +272,20 @@ namespace OzxApm.Tests
             Assert.AreNotEqual(_events[0].fingerprint, _events[1].fingerprint);
         }
 
+        [Test]
+        public void HugeMessage_IsHandledWithinBounds()
+        {
+            string huge = "[GameEventBus] Error handling event X: " + RoomLoaderText(1) + new string('x', 1 << 20);
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            _collector.HandleLogMessage(huge, "", LogType.Error);
+            _collector.HandleLogMessage(huge, "", LogType.Error);
+            sw.Stop();
+            Assert.AreEqual(1, _events.Count);
+            Assert.That(_events[0].embedded_exception.Length, Is.LessThanOrEqualTo(ExceptionCollector.MaxEmbeddedLength));
+            Assert.AreEqual(ExceptionCollector.MaxMessageLength, _events[0].message.Length);
+            Assert.That(sw.ElapsedMilliseconds, Is.LessThan(1000));
+        }
+
         private static string RoomLoaderText(int roomId) =>
             "System.InvalidOperationException: Room template not found for roomId=" + roomId + "\n" +
             "  at Ozx.Rooms.RoomLoader.LoadTemplate (System.Int32 roomId) [0x00000] in <00000000000000000000000000000000>:0 \n" +

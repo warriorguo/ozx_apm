@@ -1078,6 +1078,6 @@ the `apm_exception_daily` view.
   warnings); no warning or error in any server log.
 - SDK: compiles at C# 8 with and without `UNITY_2021_2_OR_NEWER`; the
   parser matches all 22 golden vectors on .NET 6; on Unity's Mono (outside
-  Unity) 15 of the 22 new EditMode tests run and pass, the 7 that need the
+  Unity) 16 of the 23 new EditMode tests run and pass, the 7 that need the
   Unity runtime (Unity's stack capture, the allocation constraint) were
   compiled but not run here.

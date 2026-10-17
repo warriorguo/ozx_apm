@@ -29,6 +29,8 @@ namespace OzxApm.Collectors
         internal const int MaxMessageLength = 500;
         internal const int MaxStackLength = 8000;
         internal const int MaxEmbeddedLength = 8000;
+        // At most this much of a message is parsed for an embedded exception.
+        private const int MaxEmbeddedSourceLength = 64 * 1024;
 
         // Fingerprint of each distinct log text seen in the current window, so
         // that a repeat is counted without parsing it again or allocating
@@ -108,11 +110,15 @@ namespace OzxApm.Collectors
 
         // Hash of s in which, in the first line, a run of digits counts as one
         // '#'. Two 32-bit lanes (djb2-xor, alternate characters) make a 64-bit
-        // key at the speed of string.GetHashCode. No allocation.
+        // key at the speed of string.GetHashCode. No allocation. At most the
+        // first MaxKeyChars characters are read (a pathological megabyte log
+        // stays bounded); restLength still covers the whole text.
+        private const int MaxKeyChars = 64 * 1024;
+
         private static ulong MessageKeyHash(string s, out int restLength)
         {
             uint h1 = 5381, h2 = 52711;
-            int i = 0, n = s.Length;
+            int i = 0, total = s.Length, n = Math.Min(total, MaxKeyChars);
             bool inDigits = false, odd = false;
             for (; i < n && s[i] != '\n'; i++)
             {
@@ -134,7 +140,7 @@ namespace OzxApm.Collectors
                     h1 = unchecked(((h1 << 5) + h1) ^ c);
                 odd = !odd;
             }
-            restLength = n - i;
+            restLength = total - i;
             for (; i + 1 < n; i += 2)
             {
                 h1 = unchecked(((h1 << 5) + h1) ^ s[i]);
@@ -345,7 +351,7 @@ namespace OzxApm.Collectors
             {
                 int i = ExceptionParser.FindEmbedded(message);
                 if (i >= 0)
-                    embedded = ExceptionParser.Compact(message.Substring(i), MaxEmbeddedLength);
+                    embedded = ExceptionParser.Compact(message.Substring(i, Math.Min(message.Length - i, MaxEmbeddedSourceLength)), MaxEmbeddedLength);
             }
             var info = new ExceptionInfo
             {
