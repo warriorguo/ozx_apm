@@ -27,7 +27,7 @@ BUILD_TAGS ?=
 
 .PHONY: all build run clean test test-unit test-integration coverage lint fmt vet \
         docker-build docker-run docker-up docker-down docker-logs \
-        deps tidy vendor migrate help
+        deps tidy vendor migrate schema-sql help
 
 # Default target
 all: build
@@ -215,6 +215,10 @@ migrate:
 		echo "No migration file found at scripts/migrate.sql"; \
 	fi
 
+# Regenerate scripts/migrate.sql from internal/storage/schema.go (APM-17)
+schema-sql:
+	$(GO) run ./cmd/schemasql > scripts/migrate.sql
+
 # Connect to ClickHouse CLI
 db-cli:
 	docker exec -it ozx-apm-clickhouse clickhouse-client
@@ -283,6 +287,7 @@ help:
 	@echo ""
 	@echo "Database:"
 	@echo "  make migrate        - Run database migrations"
+	@echo "  make schema-sql     - Regenerate scripts/migrate.sql from schema.go"
 	@echo "  make db-cli         - Connect to ClickHouse CLI"
 	@echo ""
 	@echo "Development:"

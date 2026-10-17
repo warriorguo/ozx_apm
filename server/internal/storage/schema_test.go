@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -95,8 +96,56 @@ func TestSchema_EventTablesAreReplacingMergeTreeOnEventID(t *testing.T) {
 		if !strings.Contains(create, ") ENGINE = ReplacingMergeTree()\n") {
 			t.Errorf("%s is not a ReplacingMergeTree", et.Name)
 		}
-		if !strings.HasSuffix(create, "ORDER BY (app_version, "+et.KeyColumn+", timestamp, event_id)") {
+		if !strings.Contains(create, "\nORDER BY (app_version, "+et.KeyColumn+", timestamp, event_id)\n") {
 			t.Errorf("%s: sort key is not (app_version, %s, timestamp, event_id)", et.Name, et.KeyColumn)
+		}
+	}
+}
+
+// APM-17: tables created by Migrate expire like the ones from migrate.sql.
+func TestSchema_EventTablesHaveTTL(t *testing.T) {
+	for _, et := range EventTables {
+		var create string
+		for _, stmt := range schemaStatements {
+			if strings.HasPrefix(stmt, "CREATE TABLE IF NOT EXISTS "+et.Name+" ") {
+				create = stmt
+			}
+		}
+		if !strings.HasSuffix(create, "\nTTL toDateTime(timestamp) + INTERVAL 30 DAY") {
+			t.Errorf("%s has no 30-day TTL:\n%s", et.Name, create)
+		}
+	}
+}
+
+// APM-17: the four daily views exist in the schema and read the event tables.
+func TestSchema_MaterializedViews(t *testing.T) {
+	want := []string{"apm_fps_daily", "apm_startup_daily", "apm_exception_daily", "apm_crash_daily"}
+	names := MaterializedViewNames()
+	if strings.Join(names, ",") != strings.Join(want, ",") {
+		t.Fatalf("views %v, want %v", names, want)
+	}
+	for _, v := range materializedViews {
+		if !strings.HasPrefix(v.DDL, "CREATE MATERIALIZED VIEW IF NOT EXISTS "+v.Name+"\n") {
+			t.Errorf("%s: %q", v.Name, v.DDL)
+		}
+		if strings.Contains(strings.ToUpper(v.DDL), "POPULATE") {
+			t.Errorf("%s: POPULATE would double rows inserted while it runs", v.Name)
+		}
+	}
+}
+
+// scripts/migrate.sql is generated from this file; one source of truth.
+func TestMigrateSQL_IsGeneratedFromSchema(t *testing.T) {
+	b, err := os.ReadFile("../../scripts/migrate.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(b) != SchemaSQL() {
+		t.Fatal("scripts/migrate.sql is out of date: run `go run ./cmd/schemasql > scripts/migrate.sql` in server/")
+	}
+	for _, stmt := range schemaStatements {
+		if !strings.Contains(string(b), stmt+";\n") {
+			t.Errorf("migrate.sql lacks %q", stmt)
 		}
 	}
 }

@@ -1,7 +1,14 @@
--- OZX APM ClickHouse Schema Migration
--- Run this script to initialize the database schema
+-- OZX APM ClickHouse schema.
+--
+-- GENERATED from server/internal/storage/schema.go, which is the only source
+-- of truth (the server runs the same statements at every start). Do not edit
+-- by hand; regenerate with:
+--   cd server && go run ./cmd/schemasql > scripts/migrate.sql
+--
+-- Idempotent: safe to re-run on an existing deployment. It never changes the
+-- TTL of an existing table (CREATE TABLE IF NOT EXISTS leaves it as it is); see
+-- RELEASE.md (APM-17) and scripts/apm17_fix_schema.sh for adding a missing TTL.
 
--- Performance samples (sampled data)
 CREATE TABLE IF NOT EXISTS apm_perf_samples (
     timestamp DateTime64(3),
     app_version String,
@@ -22,9 +29,8 @@ CREATE TABLE IF NOT EXISTS apm_perf_samples (
 ) ENGINE = ReplacingMergeTree()
 PARTITION BY toYYYYMMDD(timestamp)
 ORDER BY (app_version, platform, timestamp, event_id)
-TTL timestamp + INTERVAL 30 DAY;
+TTL toDateTime(timestamp) + INTERVAL 30 DAY;
 
--- Jank events
 CREATE TABLE IF NOT EXISTS apm_janks (
     timestamp DateTime64(3),
     app_version String,
@@ -45,9 +51,8 @@ CREATE TABLE IF NOT EXISTS apm_janks (
 ) ENGINE = ReplacingMergeTree()
 PARTITION BY toYYYYMMDD(timestamp)
 ORDER BY (app_version, scene, timestamp, event_id)
-TTL timestamp + INTERVAL 30 DAY;
+TTL toDateTime(timestamp) + INTERVAL 30 DAY;
 
--- Startup events
 CREATE TABLE IF NOT EXISTS apm_startups (
     timestamp DateTime64(3),
     app_version String,
@@ -65,9 +70,8 @@ CREATE TABLE IF NOT EXISTS apm_startups (
 ) ENGINE = ReplacingMergeTree()
 PARTITION BY toYYYYMMDD(timestamp)
 ORDER BY (app_version, platform, timestamp, event_id)
-TTL timestamp + INTERVAL 30 DAY;
+TTL toDateTime(timestamp) + INTERVAL 30 DAY;
 
--- Scene loads
 CREATE TABLE IF NOT EXISTS apm_scene_loads (
     timestamp DateTime64(3),
     app_version String,
@@ -84,9 +88,8 @@ CREATE TABLE IF NOT EXISTS apm_scene_loads (
 ) ENGINE = ReplacingMergeTree()
 PARTITION BY toYYYYMMDD(timestamp)
 ORDER BY (app_version, scene_name, timestamp, event_id)
-TTL timestamp + INTERVAL 30 DAY;
+TTL toDateTime(timestamp) + INTERVAL 30 DAY;
 
--- Exceptions (non-fatal)
 CREATE TABLE IF NOT EXISTS apm_exceptions (
     timestamp DateTime64(3),
     app_version String,
@@ -106,9 +109,8 @@ CREATE TABLE IF NOT EXISTS apm_exceptions (
 ) ENGINE = ReplacingMergeTree()
 PARTITION BY toYYYYMMDD(timestamp)
 ORDER BY (app_version, fingerprint, timestamp, event_id)
-TTL timestamp + INTERVAL 30 DAY;
+TTL toDateTime(timestamp) + INTERVAL 30 DAY;
 
--- Crashes
 CREATE TABLE IF NOT EXISTS apm_crashes (
     timestamp DateTime64(3),
     app_version String,
@@ -128,11 +130,11 @@ CREATE TABLE IF NOT EXISTS apm_crashes (
 ) ENGINE = ReplacingMergeTree()
 PARTITION BY toYYYYMMDD(timestamp)
 ORDER BY (app_version, fingerprint, timestamp, event_id)
-TTL timestamp + INTERVAL 30 DAY;
+TTL toDateTime(timestamp) + INTERVAL 30 DAY;
 
--- APM-2: client event id + per-install sequence number.
--- Additive and idempotent so it is safe to re-run on existing deployments.
--- De-duplication by event_id: APM-19 (below).
+-- Additive column migrations for tables created by earlier releases
+-- (APM-2: event_id, seq). Metadata only (existing parts are not rewritten),
+-- idempotent.
 ALTER TABLE apm_perf_samples ADD COLUMN IF NOT EXISTS event_id String DEFAULT '';
 ALTER TABLE apm_perf_samples ADD COLUMN IF NOT EXISTS seq UInt64 DEFAULT 0;
 ALTER TABLE apm_janks ADD COLUMN IF NOT EXISTS event_id String DEFAULT '';
@@ -159,9 +161,9 @@ ALTER TABLE apm_scene_loads ADD INDEX IF NOT EXISTS idx_event_id event_id TYPE b
 ALTER TABLE apm_exceptions ADD INDEX IF NOT EXISTS idx_event_id event_id TYPE bloom_filter(0.001) GRANULARITY 1;
 ALTER TABLE apm_crashes ADD INDEX IF NOT EXISTS idx_event_id event_id TYPE bloom_filter(0.001) GRANULARITY 1;
 
--- Materialized views for aggregations (optional, for better query performance)
+-- Daily aggregations. They only see rows inserted after they were created.
+-- Need the CREATE VIEW privilege (not granted to the `apm` service account).
 
--- Daily FPS aggregation
 CREATE MATERIALIZED VIEW IF NOT EXISTS apm_fps_daily
 ENGINE = SummingMergeTree()
 PARTITION BY toYYYYMM(date)
@@ -177,7 +179,6 @@ AS SELECT
 FROM apm_perf_samples
 GROUP BY date, app_version, platform, scene;
 
--- Daily startup aggregation
 CREATE MATERIALIZED VIEW IF NOT EXISTS apm_startup_daily
 ENGINE = SummingMergeTree()
 PARTITION BY toYYYYMM(date)
@@ -193,7 +194,6 @@ AS SELECT
 FROM apm_startups
 GROUP BY date, app_version, platform;
 
--- Daily exception count
 CREATE MATERIALIZED VIEW IF NOT EXISTS apm_exception_daily
 ENGINE = SummingMergeTree()
 PARTITION BY toYYYYMM(date)
@@ -207,7 +207,6 @@ AS SELECT
 FROM apm_exceptions
 GROUP BY date, app_version, platform, fingerprint;
 
--- Daily crash count
 CREATE MATERIALIZED VIEW IF NOT EXISTS apm_crash_daily
 ENGINE = SummingMergeTree()
 PARTITION BY toYYYYMM(date)

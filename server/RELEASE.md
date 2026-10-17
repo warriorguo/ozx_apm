@@ -419,4 +419,92 @@ migration keeps whatever TTL the live table has (production: 30 days, from
 `scripts/migrate.sql`). A deployment whose tables came from `Migrate` has no
 TTL; adding it there means rewriting the tables, so APM-17 could reuse this
 rebuild (create `<t>_rmt` with the TTL) instead of a separate
-`ALTER ... MODIFY TTL` pass.
+`ALTER ... MODIFY TTL` pass. (Done separately; see the APM-17 section.)
+
+## APM-17: one schema definition; TTL and materialized views from `Migrate`
+
+Before this change the server's startup migration (`Migrate`) created the
+event tables **without** `TTL` and without the four `apm_*_daily`
+materialized views that `scripts/migrate.sql` has. A deployment whose tables
+were created by the server kept its data forever.
+
+Changes:
+
+- `internal/storage/schema.go` is the only definition of the schema.
+  `scripts/migrate.sql` is generated from it (`make schema-sql`, i.e.
+  `go run ./cmd/schemasql > scripts/migrate.sql`); a unit test fails if the
+  file is out of date. The generated DDL is the same as the previous
+  hand-written file except for the TTL expression (next point).
+- New tables get `TTL toDateTime(timestamp) + INTERVAL 30 DAY`. The previous
+  `TTL timestamp + INTERVAL 30 DAY` is rejected by ClickHouse 23.8 and 24.1
+  on a `DateTime64` column ("TTL expression result column should have
+  DateTime or Date type"; only 26.1 accepts it), so the old `migrate.sql` did
+  not run there at all. Both expressions mean the same retention. `Migrate`
+  never changes the TTL of an existing table.
+- `Migrate` creates the four materialized views if they are missing (no
+  `POPULATE`: a view only aggregates rows inserted after it was created;
+  back-filling would double rows inserted while it runs). Existing views are
+  skipped without any statement. With the production `apm` account
+  (`SELECT, INSERT, CREATE TABLE, ALTER ADD COLUMN`) the views are created on
+  ClickHouse 24.1 and 26.1 (a `CREATE TABLE` grant is enough there); if a
+  version refuses, the server logs `could not create a materialized view`
+  per view and starts anyway (no code reads the views).
+- At startup, each event table without a TTL is logged as a warning
+  `event table has no TTL: its data never expires` and the server starts.
+  It does not add the TTL itself: `ALTER TABLE ... MODIFY TTL` needs the
+  `ALTER TTL` privilege, which `apm` does not have, and it deletes data, which
+  must be an admin's decision (below).
+
+Production (n192) already has the TTL and the four views (tables from the
+old `migrate.sql`), so this release changes nothing there and logs no new
+warnings (integration test `TestMigrate_UpgradesProductionDatabase`, with the
+111d9bf `migrate.sql` as fixture).
+
+### For a deployment whose tables came from `Migrate` (no TTL)
+
+Run as a ClickHouse admin (the `apm` account cannot):
+
+```sh
+scripts/apm17_fix_schema.sh check   # read-only: tables without TTL, rows it would delete, missing views
+scripts/apm17_fix_schema.sh apply   # asks for confirmation (YES=1 to skip)
+# CH="clickhouse-client --password" DB=ozx_apm scripts/apm17_fix_schema.sh ...
+```
+
+`apply` runs, for every event table **without** a TTL only,
+`ALTER TABLE <t> MODIFY TTL toDateTime(timestamp) + INTERVAL 30 DAY`, and
+creates the missing views from `scripts/migrate.sql`.
+
+**This immediately deletes every row older than 30 days** from those tables:
+with ClickHouse's default `materialize_ttl_after_modify = 1`, `MODIFY TTL`
+starts a background mutation that rewrites the table's parts and drops
+expired rows (I/O roughly the size of the table). `check` prints how many
+rows that is per table. Export them first if they are needed. To only expire
+data on future merges instead, run the `ALTER` by hand with
+`SETTINGS materialize_ttl_after_modify = 0` (old rows then go away over time,
+as parts are merged).
+
+Rehearsed on ClickHouse 26.1.12, 24.1.8 and 23.8.16 (tables as `Migrate`
+created them at 111d9bf, 5 rows of which 2 were 40 days old): `check` showed
+"deletes 2 rows", `apply` without a terminal and without `YES=1` refused,
+`apply` added the TTL to all six tables and created the four views, the two
+old rows were gone and the three recent ones kept, and a second `apply` did
+nothing.
+
+### Rollback
+
+Redeploy the previous binary; no schema action is needed. Views created by
+this release stay and keep being fed by older binaries (harmless). A TTL
+added by the admin step can be removed with `ALTER TABLE <t> REMOVE TTL`;
+rows it already deleted are gone.
+
+### Verified
+
+Integration tests on ClickHouse 26.1.12, 24.1.8 and 23.8.16
+(`tests/integration/schema_migrate_test.go`): a fresh install has the TTL on
+all six tables, the four views (one inner table each) and logs nothing, also
+on restart; a database created by the 111d9bf `Migrate` gets the views, six
+TTL warnings, keeps all rows, and is quiet after the admin step; the
+production schema is left as it is (views not doubled, view contents
+unchanged, no warnings). With a copy of the `apm` account (26.1 and 24.1;
+23.8 has no access management for `default`), `Migrate` succeeds on both
+kinds of database and only warns about the TTL.
