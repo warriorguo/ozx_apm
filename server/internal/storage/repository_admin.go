@@ -2,6 +2,8 @@ package storage
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -433,6 +435,12 @@ func (r *Repository) GetCrashDetail(ctx context.Context, fingerprint string, f m
 	}
 	row := r.client.conn.QueryRow(ctx, query, detailArgs...)
 	if err := row.Scan(&detail.Fingerprint, &detail.CrashType, &detail.Stack, &detail.Count, &detail.SessionCount, &detail.FirstSeen, &detail.LastSeen); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			// No crash with this fingerprint matches the filter: the handler
+			// answers 404 (easy to hit since the detail takes the shared
+			// build type and context filters).
+			return nil, nil
+		}
 		return nil, err
 	}
 

@@ -284,6 +284,23 @@ func TestAdminFilter_TimeRangeHasMillisecondPrecision(t *testing.T) {
 	}
 }
 
+// A crash detail whose filter matches nothing is a 404, not a 500.
+func TestContext_CrashDetailFilteredToNothingIs404(t *testing.T) {
+	router := setupContextTest(t)
+	for _, path := range []string{
+		"/api/crashes/detail?fingerprint=C1&build_type=dev",
+		"/api/crashes/detail?fingerprint=C1&ctx=levelId:1",
+		"/api/crashes/detail?fingerprint=nope",
+	} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		if w.Code != http.StatusNotFound {
+			t.Errorf("%s: %d %s", path, w.Code, w.Body.String())
+		}
+	}
+}
+
 func TestContext_BadParametersAre400(t *testing.T) {
 	router := setupContextTest(t)
 	for _, path := range []string{
