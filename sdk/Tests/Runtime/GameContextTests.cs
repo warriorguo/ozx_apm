@@ -506,5 +506,39 @@ namespace OzxApm.Tests
             Assert.AreEqual("Cellular", DeviceInfo.NetworkTypeName(NetworkReachability.ReachableViaCarrierDataNetwork));
             Assert.AreEqual("None", DeviceInfo.NetworkTypeName(NetworkReachability.NotReachable));
         }
+
+        // APM-3: repeat counts are kept apart per context (SameAs) and a merged
+        // count keeps the entries all its occurrences shared (Intersect).
+        [Test]
+        public void Snapshot_SameAsAndIntersect()
+        {
+            GameContext.Set("levelId", "3");
+            GameContext.Set("roomId", "r-1");
+            GameContext.Set("seed", "42");
+            var a = GameContext.Current;
+            GameContext.Set("roomId", "r-2");
+            var b = GameContext.Current;
+            GameContext.Set("roomId", "r-1");
+            var a2 = GameContext.Current;
+
+            Assert.AreNotSame(a, a2);
+            Assert.IsTrue(a.SameAs(a2), "same entries, another snapshot");
+            Assert.IsFalse(a.SameAs(b));
+            Assert.IsFalse(a.SameAs(null));
+            Assert.IsTrue(ContextSnapshot.Empty.SameAs(ContextSnapshot.Empty));
+
+            var common = a.Intersect(b);
+            Assert.AreEqual(2, common.Count);
+            Assert.IsTrue(common.TryGetValue("levelId", out var level) && level == "3");
+            Assert.IsFalse(common.TryGetValue("roomId", out _));
+            Assert.AreEqual("{\"levelId\":\"3\",\"seed\":\"42\"}", common.Json);
+            Assert.AreSame(common, common.Intersect(a), "nothing more to drop: no new snapshot");
+            Assert.AreSame(a, a.Intersect(a2));
+
+            GameContext.Clear();
+            GameContext.Set("other", "x");
+            Assert.AreSame(ContextSnapshot.Empty, a.Intersect(GameContext.Current));
+            Assert.AreSame(ContextSnapshot.Empty, a.Intersect(null));
+        }
     }
 }
