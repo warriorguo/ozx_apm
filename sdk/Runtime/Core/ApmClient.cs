@@ -28,6 +28,7 @@ namespace OzxApm.Core
         // How long lifecycle events may wait for the storage worker to write to disk.
         private const int PauseFlushTimeoutMs = 100;
         private const int ShutdownFlushTimeoutMs = 500;
+        private const int TerminationFlushTimeoutMs = 500;
         private const int MaxReportedInternalErrors = 10;
 
         private static ApmClient _instance;
@@ -668,6 +669,7 @@ namespace OzxApm.Core
             if (_config.EnableExceptionCapture)
             {
                 _exceptionCollector = new ExceptionCollector(_config, this);
+                _exceptionCollector.PersistNow = PersistBeforeTermination;
                 _collectors.Add(_exceptionCollector);
             }
 
@@ -758,6 +760,13 @@ namespace OzxApm.Core
                 stats.LastUploadCompleteMs = client._reporter.LastCompleteTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
                 stats.LastUploadStartMs = client._reporter.LastStartTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
                 stats.LastUploadDisposeMs = client._reporter.LastDisposeTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+            }
+            if (client._exceptionCollector != null)
+            {
+                client._exceptionCollector.GetStats(out long occurrences, out long events, out long untracked);
+                stats.ErrorsSeen = occurrences;
+                stats.ErrorEvents = events;
+                stats.ErrorsInSummary = untracked;
             }
             stats.LastUpdateMs = client._lastUpdateTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
             stats.BuildType = client._buildType;
@@ -989,8 +998,34 @@ namespace OzxApm.Core
         }
 
         /// <summary>
+        /// An unhandled exception is about to end the process (APM-3): write what
+        /// is queued to disk before returning, at most TerminationFlushTimeoutMs.
+        /// Called on the dying thread, after ExceptionCollector enqueued its counts.
+        /// </summary>
+        private void PersistBeforeTermination()
+        {
+            try
+            {
+                var storage = _offlineStorage;
+                if (storage == null)
+                    return;
+                storage.Flush();
+                // Without a worker thread WaitIdle pumps on the calling thread,
+                // which must stay the main thread's job.
+                if (storage.HasWorkerThread)
+                    storage.WaitIdle(TerminationFlushTimeoutMs);
+            }
+            catch
+            {
+                // Nothing may escape into the dying thread.
+            }
+        }
+
+        /// <summary>
         /// Enqueues an event. It is written to disk by the storage worker within
-        /// PersistIntervalMs and kept until the server confirms it. Main thread.
+        /// PersistIntervalMs (exceptions at once) and kept until the server
+        /// confirms it. Any thread (exceptions are reported on the thread that
+        /// logged them).
         /// </summary>
         internal void EnqueueEvent(BaseEvent evt)
         {

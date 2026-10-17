@@ -119,6 +119,27 @@ namespace OzxApm.Models
         public string embedded_exception;
         /// <summary>Breadcrumbs recorded before the first occurrence; null for repeat counts (APM-4).</summary>
         public List<string> breadcrumbs;
+        /// <summary>
+        /// Which error of its session the (first) occurrence this event reports
+        /// was, counting every occurrence of every error: 1 is the session's first
+        /// error (APM-3). 0: not set.
+        /// </summary>
+        public int error_seq;
+        /// <summary>Milliseconds from the start of the session to that occurrence (APM-3).</summary>
+        public long session_ms;
+        /// <summary>
+        /// Empty for a logged error; "domain" or "domain_terminating" for an
+        /// exception no code caught (AppDomain.UnhandledException; terminating:
+        /// the process is about to end), "task" for a faulted task nobody
+        /// observed (TaskScheduler.UnobservedTaskException) (APM-3).
+        /// </summary>
+        public string unhandled;
+        /// <summary>
+        /// The count merges occurrences in different game contexts (more than the
+        /// SDK keeps apart in one window); ctx then holds only the entries they
+        /// all had (APM-3).
+        /// </summary>
+        public bool ctx_merged;
 
         public ExceptionEvent()
         {

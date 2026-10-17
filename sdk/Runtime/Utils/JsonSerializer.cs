@@ -131,6 +131,17 @@ namespace OzxApm.Utils
                     OptionalField(w, "embedded_exception", exc.embedded_exception);
                     if (exc.breadcrumbs != null && exc.breadcrumbs.Count > 0)
                         ArrayField(w, "breadcrumbs", exc.breadcrumbs);
+                    // APM-3; absent from older SDKs.
+                    if (exc.error_seq > 0)
+                    {
+                        w.Name("error_seq");
+                        w.Long(exc.error_seq);
+                        w.Name("session_ms");
+                        w.Long(exc.session_ms);
+                    }
+                    OptionalField(w, "unhandled", exc.unhandled);
+                    if (exc.ctx_merged)
+                        w.Ascii(",\"ctx_merged\":true");
                     break;
 
                 case CrashEvent crash:

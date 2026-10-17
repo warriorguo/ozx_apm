@@ -51,6 +51,74 @@ namespace OzxApm.Core
             return i >= 0;
         }
 
+        /// <summary>True if other holds the same keys and values. No allocation.</summary>
+        internal bool SameAs(ContextSnapshot other)
+        {
+            if (ReferenceEquals(this, other))
+                return true;
+            if (other == null || other._keys.Length != _keys.Length)
+                return false;
+            // Json lists the keys in ordinal order: equal text, equal context.
+            return string.Equals(Json, other.Json, StringComparison.Ordinal);
+        }
+
+        /// <summary>
+        /// The entries this and other have in common (same key, same value). Returns
+        /// this, without allocating, if other has all of them (APM-3: the context
+        /// of a repeat count that merges occurrences with different contexts).
+        /// </summary>
+        internal ContextSnapshot Intersect(ContextSnapshot other)
+        {
+            if (other == null)
+                return Empty;
+            if (ReferenceEquals(this, other))
+                return this;
+            int common = 0;
+            for (int i = 0, j = 0; i < _keys.Length && j < other._keys.Length;)
+            {
+                int c = string.CompareOrdinal(_keys[i], other._keys[j]);
+                if (c == 0)
+                {
+                    if (string.Equals(_values[i], other._values[j], StringComparison.Ordinal))
+                        common++;
+                    i++;
+                    j++;
+                }
+                else if (c < 0)
+                    i++;
+                else
+                    j++;
+            }
+            if (common == _keys.Length)
+                return this;
+            if (common == 0)
+                return Empty;
+            var keys = new string[common];
+            var values = new string[common];
+            int n = 0;
+            for (int i = 0, j = 0; i < _keys.Length && j < other._keys.Length;)
+            {
+                int c = string.CompareOrdinal(_keys[i], other._keys[j]);
+                if (c == 0)
+                {
+                    if (string.Equals(_values[i], other._values[j], StringComparison.Ordinal))
+                    {
+                        keys[n] = _keys[i];
+                        values[n] = _values[i];
+                        n++;
+                    }
+                    i++;
+                    j++;
+                }
+                else if (c < 0)
+                    i++;
+                else
+                    j++;
+            }
+            // Not GameContext's current snapshot: a version it never has.
+            return new ContextSnapshot(-1, keys, values);
+        }
+
         private static string BuildJson(string[] keys, string[] values)
         {
             var sb = new StringBuilder(16 + keys.Length * 32);

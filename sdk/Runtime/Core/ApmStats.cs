@@ -41,6 +41,12 @@ namespace OzxApm.Core
         public int ContextRejected;
         /// <summary>Context values cut to GameContext.MaxValueLength.</summary>
         public int ContextTruncated;
+        /// <summary>Error/exception/assert occurrences captured since Initialize (every repeat counted, APM-3).</summary>
+        public long ErrorsSeen;
+        /// <summary>Exception events enqueued for them (first occurrences and per-context repeat counts).</summary>
+        public long ErrorEvents;
+        /// <summary>Occurrences reported only in a summary event (more distinct errors per minute than tracked).</summary>
+        public long ErrorsInSummary;
         /// <summary>"release", "dev" or "editor"; null before Initialize.</summary>
         public string BuildType;
         /// <summary>False in the Unity Editor unless ApmConfig.UploadInEditor.</summary>

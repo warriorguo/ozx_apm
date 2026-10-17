@@ -1,5 +1,6 @@
 using System;
 using System.Globalization;
+using System.Threading;
 using UnityEngine;
 using OzxApm.Utils;
 
@@ -29,6 +30,9 @@ namespace OzxApm.Core
         public string SessionId => _sessionId;
         public string UserId => _userId;
         public DateTime SessionStart => _sessionStart;
+
+        /// <summary>The current session's start and generation, readable from any thread (APM-3).</summary>
+        internal SessionClock Clock { get; } = new SessionClock();
 
         // Returns whether PlayerPrefs may be written (consent). Null: always.
         private readonly Func<bool> _canPersist;
@@ -160,6 +164,7 @@ namespace OzxApm.Core
             _sessionStart = DateTime.UtcNow;
             _lastActivity = _sessionStart;
             _sessionPersisted = false;
+            Clock.Begin(new DateTimeOffset(_sessionStart).ToUnixTimeMilliseconds());
 
             // Persist session info for crash recovery (only with consent)
             if (CanPersist)
@@ -218,6 +223,30 @@ namespace OzxApm.Core
 
             sessionStart = DateTime.MinValue;
             return false;
+        }
+    }
+
+    /// <summary>
+    /// The current session as error reports see it (APM-3): when it started and
+    /// a generation that changes with every new session, so that the per-session
+    /// error count restarts. Written on the main thread, read from any thread
+    /// (errors are logged from any thread); no lock, no allocation.
+    /// </summary>
+    internal sealed class SessionClock
+    {
+        private long _startUnixMs;
+        private int _generation;
+
+        /// <summary>Changes with every new session.</summary>
+        public int Generation => Volatile.Read(ref _generation);
+
+        /// <summary>Start of the current session, Unix milliseconds (UTC).</summary>
+        public long StartUnixMs => Interlocked.Read(ref _startUnixMs);
+
+        internal void Begin(long startUnixMs)
+        {
+            Interlocked.Exchange(ref _startUnixMs, startUnixMs);
+            Interlocked.Increment(ref _generation);
         }
     }
 }
