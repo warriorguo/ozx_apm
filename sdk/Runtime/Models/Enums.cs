@@ -35,6 +35,19 @@ namespace OzxApm.Models
         Crash
     }
 
+    /// <summary>
+    /// Build type sent with every event (APM-5). Auto: Editor when running in the
+    /// Unity Editor, Dev in a development build (Debug.isDebugBuild), else Release.
+    /// The admin shows Release by default.
+    /// </summary>
+    public enum ApmBuildType
+    {
+        Auto = 0,
+        Release = 1,
+        Dev = 2,
+        Editor = 3
+    }
+
     public enum LogLevel
     {
         None = 0,

@@ -116,11 +116,14 @@ namespace OzxApm.Network
         private static readonly byte[] BatchPrefix = Encoding.UTF8.GetBytes("{\"events\":[");
         private static readonly byte[] BatchSuffix = Encoding.UTF8.GetBytes("]}");
         private static readonly byte[] LegacyEventMarker = Encoding.UTF8.GetBytes("{\"type\":\"");
-        private static readonly byte[][] HighValueMarkers =
+        // Matched only at the start of a line (see StartsAnyLine): every event line
+        // starts with its type, while the game context ("ctx", APM-5) can hold a
+        // "type":"exception" pair anywhere else in a line.
+        internal static readonly byte[][] HighValueMarkers =
         {
-            Encoding.UTF8.GetBytes("\"type\":\"exception\""),
-            Encoding.UTF8.GetBytes("\"type\":\"crash\""),
-            Encoding.UTF8.GetBytes("\"type\":\"startup\"")
+            Encoding.UTF8.GetBytes("{\"type\":\"exception\""),
+            Encoding.UTF8.GetBytes("{\"type\":\"crash\""),
+            Encoding.UTF8.GetBytes("{\"type\":\"startup\"")
         };
         private static readonly byte[] SeqMarker = Encoding.UTF8.GetBytes("\"seq\":");
 
@@ -1408,7 +1411,7 @@ namespace OzxApm.Network
                 {
                     for (int m = 0; m < HighValueMarkers.Length; m++)
                     {
-                        if (IndexOf(_readBuffer, 0, length, HighValueMarkers[m]) >= 0)
+                        if (StartsAnyLine(_readBuffer, length, HighValueMarkers[m]))
                         {
                             s.HighValue = 1;
                             break;
@@ -1417,6 +1420,17 @@ namespace OzxApm.Network
                 }
             }
             return s.HighValue == 1;
+        }
+
+        /// <summary>True if some line of buffer[0..length) starts with marker.</summary>
+        internal static bool StartsAnyLine(byte[] buffer, int length, byte[] marker)
+        {
+            for (int i = IndexOf(buffer, 0, length, marker); i >= 0; i = IndexOf(buffer, i + 1, length, marker))
+            {
+                if (i == 0 || buffer[i - 1] == (byte)'\n')
+                    return true;
+            }
+            return false;
         }
 
         private int CountEvents(Segment s)

@@ -1,0 +1,313 @@
+using System;
+using System.Collections.Generic;
+using System.Text;
+using OzxApm.Models;
+using OzxApm.Utils;
+
+namespace OzxApm.Core
+{
+    /// <summary>
+    /// Immutable copy of the game context at one point in time. Every event
+    /// keeps a reference to the snapshot that was current when it was enqueued
+    /// and is serialized (and so persisted) with it. Its JSON is built once and
+    /// shared by all events until the context changes.
+    /// </summary>
+    public sealed class ContextSnapshot
+    {
+        /// <summary>The empty context.</summary>
+        public static readonly ContextSnapshot Empty = new ContextSnapshot(0, new string[0], new string[0]);
+
+        internal readonly int Version;
+        private readonly string[] _keys;   // ordinal order
+        private readonly string[] _values;
+
+        /// <summary>The context as a JSON object ({"key":"value",...}); null when empty.</summary>
+        internal readonly string Json;
+
+        internal ContextSnapshot(int version, string[] keys, string[] values)
+        {
+            Version = version;
+            _keys = keys;
+            _values = values;
+            Json = keys.Length == 0 ? null : BuildJson(keys, values);
+        }
+
+        public int Count => _keys.Length;
+
+        /// <summary>Key at index (ordinal order), 0 &lt;= index &lt; Count.</summary>
+        public string GetKey(int index) => _keys[index];
+
+        /// <summary>Value at index, 0 &lt;= index &lt; Count.</summary>
+        public string GetValue(int index) => _values[index];
+
+        public bool TryGetValue(string key, out string value)
+        {
+            int i = key == null ? -1 : Array.BinarySearch(_keys, key, StringComparer.Ordinal);
+            value = i >= 0 ? _values[i] : null;
+            return i >= 0;
+        }
+
+        private static string BuildJson(string[] keys, string[] values)
+        {
+            var sb = new StringBuilder(16 + keys.Length * 32);
+            sb.Append('{');
+            for (int i = 0; i < keys.Length; i++)
+            {
+                if (i > 0)
+                    sb.Append(',');
+                sb.Append('"');
+                JsonSerializer.AppendEscapedString(sb, keys[i]);
+                sb.Append("\":\"");
+                JsonSerializer.AppendEscapedString(sb, values[i]);
+                sb.Append('"');
+            }
+            sb.Append('}');
+            return sb.ToString();
+        }
+    }
+
+    /// <summary>
+    /// The game context (APM-5): key/value pairs the game sets with
+    /// ApmClient.SetContext (level, room, seed, loadout, data version, ...).
+    /// Every event enqueued afterwards carries a snapshot of it, taken at enqueue
+    /// time, which is persisted with the event.
+    ///
+    /// Cost: changing the context marks it dirty (no allocation if the value is
+    /// unchanged); the snapshot and its JSON are rebuilt once, by the next event
+    /// that is enqueued, and then shared. Reading an unchanged snapshot is two
+    /// volatile reads: no lock, no allocation.
+    ///
+    /// Limits (the server enforces the same): at most MaxKeys keys; keys are 1-64
+    /// characters from [A-Za-z0-9_.-]; values are cut to MaxValueLength
+    /// characters; the whole context to MaxTotalLength characters. Violations
+    /// are counted (ApmStats) and logged as warnings (the first few only); they
+    /// never throw.
+    ///
+    /// Thread-safe: may be changed and read from any thread.
+    /// </summary>
+    public static class GameContext
+    {
+        public const int MaxKeys = 64;
+        public const int MaxKeyLength = 64;
+        public const int MaxValueLength = 256;
+        /// <summary>
+        /// Upper bound of the context's size: the sum of key and value lengths plus
+        /// 6 characters per entry (roughly its JSON size). Every event, including the
+        /// once-per-second perf sample, carries the context, so it is bounded more
+        /// tightly than MaxKeys x MaxValueLength.
+        /// </summary>
+        public const int MaxTotalLength = 4096;
+
+        private const int MaxLoggedViolations = 10;
+
+        private static readonly object s_lock = new object();
+        private static readonly Dictionary<string, string> s_values = new Dictionary<string, string>(StringComparer.Ordinal);
+        private static int s_totalLength;
+        private static volatile int s_version;
+        private static volatile ContextSnapshot s_snapshot = ContextSnapshot.Empty;
+        private static int s_rejected;
+        private static int s_truncated;
+        private static int s_loggedViolations;
+
+        /// <summary>Keys currently set.</summary>
+        public static int Count
+        {
+            get
+            {
+                lock (s_lock)
+                {
+                    return s_values.Count;
+                }
+            }
+        }
+
+        /// <summary>SetContext calls refused so far (invalid key, too many keys, context too large).</summary>
+        public static int RejectedCount => s_rejected;
+
+        /// <summary>Values cut to MaxValueLength so far.</summary>
+        public static int TruncatedCount => s_truncated;
+
+        /// <summary>
+        /// The current snapshot (rebuilt here if the context changed since the last
+        /// call). Allocation-free while the context is unchanged.
+        /// </summary>
+        public static ContextSnapshot Current
+        {
+            get
+            {
+                var snapshot = s_snapshot;
+                if (snapshot.Version == s_version)
+                    return snapshot;
+                lock (s_lock)
+                {
+                    if (s_snapshot.Version != s_version)
+                        s_snapshot = Build();
+                    return s_snapshot;
+                }
+            }
+        }
+
+        /// <summary>True if key is 1-64 characters from [A-Za-z0-9_.-].</summary>
+        public static bool IsValidKey(string key)
+        {
+            if (string.IsNullOrEmpty(key) || key.Length > MaxKeyLength)
+                return false;
+            for (int i = 0; i < key.Length; i++)
+            {
+                char c = key[i];
+                bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+                          c == '_' || c == '.' || c == '-';
+                if (!ok)
+                    return false;
+            }
+            return true;
+        }
+
+        /// <summary>
+        /// Sets key to value. A null or empty value removes the key. A value longer
+        /// than MaxValueLength is cut (and counted). Returns false, without
+        /// throwing, if the key is invalid or the context would exceed MaxKeys or
+        /// MaxTotalLength; in that case a previous value of the key is removed, so
+        /// events never carry a stale value.
+        /// </summary>
+        internal static bool Set(string key, string value)
+        {
+            if (!IsValidKey(key))
+            {
+                Violation("invalid key", key, true);
+                return false;
+            }
+            if (string.IsNullOrEmpty(value))
+            {
+                Remove(key);
+                return true;
+            }
+            bool truncated = false;
+            if (value.Length > MaxValueLength)
+            {
+                int cut = MaxValueLength;
+                // Never split a surrogate pair.
+                if (char.IsHighSurrogate(value[cut - 1]))
+                    cut--;
+                value = value.Substring(0, cut);
+                truncated = true;
+            }
+
+            string reason = null;
+            lock (s_lock)
+            {
+                bool exists = s_values.TryGetValue(key, out string old);
+                if (exists && string.Equals(old, value, StringComparison.Ordinal))
+                {
+                    // Unchanged: no new snapshot, no allocation.
+                }
+                else
+                {
+                    int oldLength = exists ? EntryLength(key, old) : 0;
+                    int newTotal = s_totalLength - oldLength + EntryLength(key, value);
+                    if (!exists && s_values.Count >= MaxKeys)
+                        reason = "too many keys (max " + MaxKeys + ")";
+                    else if (newTotal > MaxTotalLength)
+                        reason = "context too large (max " + MaxTotalLength + " characters)";
+
+                    if (reason == null)
+                    {
+                        s_values[key] = value;
+                        s_totalLength = newTotal;
+                        s_version++;
+                    }
+                    else if (exists)
+                    {
+                        s_values.Remove(key);
+                        s_totalLength -= oldLength;
+                        s_version++;
+                    }
+                }
+            }
+
+            if (reason != null)
+            {
+                Violation(reason, key, true);
+                return false;
+            }
+            if (truncated)
+                Violation("value cut to " + MaxValueLength + " characters", key, false);
+            return true;
+        }
+
+        /// <summary>Removes key. Returns true if it was set.</summary>
+        internal static bool Remove(string key)
+        {
+            if (key == null)
+                return false;
+            lock (s_lock)
+            {
+                if (!s_values.TryGetValue(key, out string old))
+                    return false;
+                s_values.Remove(key);
+                s_totalLength -= EntryLength(key, old);
+                s_version++;
+                return true;
+            }
+        }
+
+        /// <summary>Removes every key.</summary>
+        internal static void Clear()
+        {
+            lock (s_lock)
+            {
+                if (s_values.Count == 0)
+                    return;
+                s_values.Clear();
+                s_totalLength = 0;
+                s_version++;
+            }
+        }
+
+        internal static void ResetForTests()
+        {
+            lock (s_lock)
+            {
+                s_values.Clear();
+                s_totalLength = 0;
+                s_version = 0;
+                s_snapshot = ContextSnapshot.Empty;
+                s_rejected = 0;
+                s_truncated = 0;
+                s_loggedViolations = 0;
+            }
+        }
+
+        private static int EntryLength(string key, string value)
+        {
+            return key.Length + value.Length + 6; // "k":"v",
+        }
+
+        // Caller holds s_lock.
+        private static ContextSnapshot Build()
+        {
+            int n = s_values.Count;
+            var keys = new string[n];
+            s_values.Keys.CopyTo(keys, 0);
+            Array.Sort(keys, StringComparer.Ordinal);
+            var values = new string[n];
+            for (int i = 0; i < n; i++)
+                values[i] = s_values[keys[i]];
+            return new ContextSnapshot(s_version, keys, values);
+        }
+
+        private static void Violation(string what, string key, bool rejected)
+        {
+            if (rejected)
+                System.Threading.Interlocked.Increment(ref s_rejected);
+            else
+                System.Threading.Interlocked.Increment(ref s_truncated);
+            // A warning, never an error: the SDK must not trigger its own (or the
+            // game's) error reporting. Only the first few, in case of a call per frame.
+            if (System.Threading.Interlocked.Increment(ref s_loggedViolations) > MaxLoggedViolations)
+                return;
+            string shown = key == null ? "null" : key.Length > MaxKeyLength ? key.Substring(0, MaxKeyLength) + "..." : key;
+            ApmClient.Log(LogLevel.Warning, "SetContext(\"" + shown + "\"): " + what + (rejected ? "; not set" : ""));
+        }
+    }
+}

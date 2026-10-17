@@ -138,6 +138,30 @@ var config = new ApmConfig
 ApmClient.Initialize(config);
 ```
 
+### Game context
+
+Key/value pairs that every event carries from the moment they are set (perf
+samples, janks, exceptions, crashes, ...), so the admin can filter and group by
+them. The snapshot at enqueue time is stored with the event on disk.
+
+```csharp
+ApmClient.SetContext("gitCommit", "a1b2c3d");   // works before Initialize
+ApmClient.SetContext("levelId", levelId);
+ApmClient.SetContext("roomId", roomId);         // a null or empty value removes the key
+ApmClient.RemoveContext("roomId");
+ApmClient.ClearContext();
+```
+
+- Keys: 1-64 characters from `[A-Za-z0-9_.-]`; values are cut to 256 characters;
+  at most 64 keys and about 4KB in total. Refused values return `false`, log a
+  warning (never an error) and are counted in `ApmClient.GetStats()`.
+- Any thread. Setting the value a key already has costs nothing; a change is
+  copied once, by the next event. Not meant for values that change every frame.
+- Build type: every event also carries `build_type` (`release`, `dev` or
+  `editor`; detected, or `ApmConfig.BuildType`), the GPU, a RAM class and the
+  network type. The admin shows release builds by default. In the Unity Editor
+  events are stored but not uploaded unless `ApmConfig.UploadInEditor = true`.
+
 ## API Endpoints
 
 ### Ingestion

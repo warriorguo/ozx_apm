@@ -63,6 +63,15 @@ namespace OzxApm.Core
         private string _platform;
         private string _deviceModel;
         private string _osVersion;
+        private string _buildType;
+        private string _gpu;
+        private string _ramClass;
+        // Refreshed on the main thread every NetTypePollSeconds (and on resume);
+        // read by EnqueueEvent, which may run on another thread. Constant strings.
+        private volatile string _netType;
+        private float _nextNetTypeCheck;
+        private const float NetTypePollSeconds = 5f;
+        private bool _uploadsEnabled;
 
         public static ApmClient Instance
         {
@@ -201,6 +210,68 @@ namespace OzxApm.Core
         }
 
         /// <summary>
+        /// Sets a game context value (APM-5): every event enqueued afterwards, of
+        /// any type, carries the context as it is at that moment, and it is stored
+        /// with the event on disk. Use it for what you want to filter and group by
+        /// on the server: level, room, seed, loadout, data version, git commit...
+        ///
+        /// A null or empty value removes the key. Keys: 1-64 characters from
+        /// [A-Za-z0-9_.-]; values are cut to 256 characters; at most 64 keys and
+        /// about 4KB in total (GameContext has the limits). Returns false if the
+        /// value was refused (a warning is logged, the counter in GetStats goes up,
+        /// and a previous value of the key is removed); never throws.
+        ///
+        /// Works before Initialize and from any thread. Setting a key to the value
+        /// it already has costs nothing; otherwise the context is copied once, at
+        /// the next event. Do not use it for values that change every frame.
+        /// </summary>
+        public static bool SetContext(string key, string value)
+        {
+            try
+            {
+                return GameContext.Set(key, value);
+            }
+            catch (Exception ex)
+            {
+                ReportInternalError("SetContext", ex);
+                return false;
+            }
+        }
+
+        /// <summary>Removes a game context key. Returns true if it was set.</summary>
+        public static bool RemoveContext(string key)
+        {
+            try
+            {
+                return GameContext.Remove(key);
+            }
+            catch (Exception ex)
+            {
+                ReportInternalError("RemoveContext", ex);
+                return false;
+            }
+        }
+
+        /// <summary>Removes every game context key (e.g. at the end of a run).</summary>
+        public static void ClearContext()
+        {
+            try
+            {
+                GameContext.Clear();
+            }
+            catch (Exception ex)
+            {
+                ReportInternalError("ClearContext", ex);
+            }
+        }
+
+        /// <summary>The current value of a game context key, or null.</summary>
+        public static string GetContext(string key)
+        {
+            return GameContext.Current.TryGetValue(key, out string value) ? value : null;
+        }
+
+        /// <summary>
         /// Marks Time To Interactive. Also tells the SDK the game has finished
         /// loading, so uploads may start before InitialUploadDelaySeconds.
         /// </summary>
@@ -322,6 +393,12 @@ namespace OzxApm.Core
             _platform = DeviceInfo.GetPlatformString();
             _deviceModel = DeviceInfo.GetDeviceModel();
             _osVersion = DeviceInfo.GetOSVersion();
+            _buildType = DeviceInfo.BuildTypeName(config.BuildType, Application.isEditor, Debug.isDebugBuild);
+            _gpu = DeviceInfo.GetGPU();
+            _ramClass = DeviceInfo.GetRAMClass();
+            _netType = DeviceInfo.GetNetworkType();
+            _nextNetTypeCheck = Time.realtimeSinceStartup + NetTypePollSeconds;
+            _uploadsEnabled = !Application.isEditor || config.UploadInEditor;
             _offlineStorage = new OfflineStorage(config);
             _networkLogger = new NetworkLogger(config);
             _reporter = new EventReporter(config, _offlineStorage, _networkLogger);
@@ -335,7 +412,9 @@ namespace OzxApm.Core
             _currentScene = SceneManager.GetActiveScene().name;
 
             _isInitialized = true;
-            Log(LogLevel.Info, "APM SDK initialized successfully");
+            Log(LogLevel.Info, $"APM SDK initialized successfully (build type {_buildType})");
+            if (!_uploadsEnabled)
+                Log(LogLevel.Info, "Running in the Editor: events are stored but not uploaded (ApmConfig.UploadInEditor)");
         }
 
         private void InitializeCollectors()
@@ -395,7 +474,14 @@ namespace OzxApm.Core
         /// </summary>
         public static ApmStats GetStats()
         {
-            var stats = new ApmStats { Initialized = _isInitialized, Consent = Consent };
+            var stats = new ApmStats
+            {
+                Initialized = _isInitialized,
+                Consent = Consent,
+                ContextKeys = GameContext.Count,
+                ContextRejected = GameContext.RejectedCount,
+                ContextTruncated = GameContext.TruncatedCount
+            };
             if (!_isInitialized || ReferenceEquals(_instance, null))
                 return stats;
 
@@ -418,6 +504,8 @@ namespace OzxApm.Core
                 stats.LastUploadDisposeMs = client._reporter.LastDisposeTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
             }
             stats.LastUpdateMs = client._lastUpdateTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+            stats.BuildType = client._buildType;
+            stats.UploadsEnabled = client._uploadsEnabled;
             return stats;
         }
 
@@ -458,12 +546,20 @@ namespace OzxApm.Core
                 }
             }
 
+            float now = Time.realtimeSinceStartup;
+            if (now >= _nextNetTypeCheck)
+            {
+                _nextNetTypeCheck = now + NetTypePollSeconds;
+                _netType = DeviceInfo.GetNetworkType();
+            }
+
             using (s_uploadMarker.Auto())
             {
                 try
                 {
                     _offlineStorage.Tick();
-                    _reporter.Update();
+                    if (_uploadsEnabled)
+                        _reporter.Update();
                 }
                 catch (Exception ex)
                 {
@@ -492,6 +588,7 @@ namespace OzxApm.Core
                 else
                 {
                     // The network may have changed while we were away.
+                    _netType = DeviceInfo.GetNetworkType();
                     _reporter.RetryNow();
                 }
             }
@@ -613,6 +710,7 @@ namespace OzxApm.Core
                 evt.session_id = _sessionManager.SessionId;
                 evt.device_id = _sessionManager.DeviceId;
                 evt.scene = _currentScene;
+                StampContext(evt, _buildType, _gpu, _ramClass, _netType);
 
                 using (s_enqueueMarker.Auto())
                     _offlineStorage.Enqueue(evt);
@@ -621,6 +719,21 @@ namespace OzxApm.Core
             {
                 ReportInternalError("EnqueueEvent", ex);
             }
+        }
+
+        /// <summary>
+        /// Sets the APM-5 fields of an event: build type, device details and the game
+        /// context as it is now (unless the collector captured an earlier one).
+        /// Allocation-free while the context is unchanged; any thread.
+        /// </summary>
+        internal static void StampContext(BaseEvent evt, string buildType, string gpu, string ramClass, string netType)
+        {
+            evt.build_type = buildType;
+            evt.gpu = gpu;
+            evt.ram_class = ramClass;
+            evt.net_type = netType;
+            if (evt.ctx == null)
+                evt.ctx = GameContext.Current;
         }
 
         /// <summary>

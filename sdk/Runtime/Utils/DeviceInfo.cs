@@ -154,30 +154,72 @@ namespace OzxApm.Utils
         }
 
         /// <summary>
-        /// Gets RAM class (Low/Medium/High based on system memory)
+        /// Gets the RAM class: the nominal memory size of the device ("2GB", "3GB",
+        /// "4GB", "6GB", "8GB", "12GB", "16GB", "24GB+"; "1GB" and below), sent with
+        /// every event (APM-5). Devices report less than their nominal size (an 8GB
+        /// phone reports ~7.5GB), so the reported size is rounded up to the class.
         /// </summary>
         public static string GetRAMClass()
         {
-            int memoryMB = SystemInfo.systemMemorySize;
-            if (memoryMB < 2048)
-                return "Low";
-            if (memoryMB < 4096)
-                return "Medium";
-            return "High";
+            return RamClassFromMB(SystemInfo.systemMemorySize);
+        }
+
+        internal static string RamClassFromMB(int memoryMB)
+        {
+            if (memoryMB <= 0)
+                return "unknown";
+            if (memoryMB <= 1536)
+                return "1GB";
+            if (memoryMB <= 2560)
+                return "2GB";
+            if (memoryMB <= 3584)
+                return "3GB";
+            if (memoryMB <= 5120)
+                return "4GB";
+            if (memoryMB <= 7168)
+                return "6GB";
+            if (memoryMB <= 10240)
+                return "8GB";
+            if (memoryMB <= 14336)
+                return "12GB";
+            if (memoryMB <= 20480)
+                return "16GB";
+            return "24GB+";
         }
 
         /// <summary>
-        /// Gets current network type
+        /// Gets current network type ("WiFi", "Cellular", "None"). Main thread.
         /// </summary>
         public static string GetNetworkType()
         {
-            return Application.internetReachability switch
+            return NetworkTypeName(Application.internetReachability);
+        }
+
+        /// <summary>Network type name for a reachability value; constant strings, no allocation.</summary>
+        internal static string NetworkTypeName(NetworkReachability reachability)
+        {
+            switch (reachability)
             {
-                NetworkReachability.ReachableViaLocalAreaNetwork => "WiFi",
-                NetworkReachability.ReachableViaCarrierDataNetwork => "Cellular",
-                NetworkReachability.NotReachable => "None",
-                _ => "Unknown"
-            };
+                case NetworkReachability.ReachableViaLocalAreaNetwork: return "WiFi";
+                case NetworkReachability.ReachableViaCarrierDataNetwork: return "Cellular";
+                case NetworkReachability.NotReachable: return "None";
+                default: return "Unknown";
+            }
+        }
+
+        /// <summary>"release", "dev" or "editor" for the configured build type (Auto: detected).</summary>
+        internal static string BuildTypeName(ApmBuildType configured, bool isEditor, bool isDebugBuild)
+        {
+            switch (configured)
+            {
+                case ApmBuildType.Release: return "release";
+                case ApmBuildType.Dev: return "dev";
+                case ApmBuildType.Editor: return "editor";
+            }
+            // Debug.isDebugBuild is always true in the Editor: check the Editor first.
+            if (isEditor)
+                return "editor";
+            return isDebugBuild ? "dev" : "release";
         }
 
         /// <summary>

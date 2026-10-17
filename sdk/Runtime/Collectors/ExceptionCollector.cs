@@ -41,6 +41,7 @@ namespace OzxApm.Collectors
             public string Stack;
             public int RepeatCount;
             public long RepeatFirstSeenMs;
+            public ContextSnapshot RepeatContext; // game context at the first repeat
         }
 
         public bool IsActive => _isActive;
@@ -152,7 +153,10 @@ namespace OzxApm.Collectors
             {
                 // Deduplicate - count it, report at the end of the window
                 if (existing.RepeatCount == 0)
+                {
                     existing.RepeatFirstSeenMs = nowMs;
+                    existing.RepeatContext = GameContext.Current;
+                }
                 existing.RepeatCount++;
             }
             else
@@ -172,7 +176,7 @@ namespace OzxApm.Collectors
                 _recentExceptions[fingerprint] = info;
 
                 // First occurrence goes to disk right away, with the time it happened.
-                Enqueue(info, 1, nowMs);
+                Enqueue(info, 1, nowMs, null);
             }
 
             // Record as breadcrumb
@@ -185,13 +189,13 @@ namespace OzxApm.Collectors
             {
                 var info = kvp.Value;
                 if (info.RepeatCount > 0)
-                    Enqueue(info, info.RepeatCount, info.RepeatFirstSeenMs);
+                    Enqueue(info, info.RepeatCount, info.RepeatFirstSeenMs, info.RepeatContext);
             }
 
             _recentExceptions.Clear();
         }
 
-        private void Enqueue(ExceptionInfo info, int count, long timestampMs)
+        private void Enqueue(ExceptionInfo info, int count, long timestampMs, ContextSnapshot context)
         {
             var evt = new ExceptionEvent
             {
@@ -199,7 +203,9 @@ namespace OzxApm.Collectors
                 fingerprint = info.Fingerprint,
                 message = info.Message,
                 stack = info.Stack,
-                count = count
+                count = count,
+                // null: the context at enqueue time (set by EnqueueEvent)
+                ctx = context
             };
 
             _client.EnqueueEvent(evt);

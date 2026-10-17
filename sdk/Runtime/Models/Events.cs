@@ -20,6 +20,18 @@ namespace OzxApm.Models
         public string session_id;
         public string device_id;
         public string scene;
+        /// <summary>"release", "dev" or "editor" (APM-5).</summary>
+        public string build_type;
+        public string gpu;
+        public string ram_class;
+        public string net_type;
+
+        /// <summary>
+        /// The game context when the event was enqueued (APM-5). Set by
+        /// ApmClient.EnqueueEvent unless the collector already captured an earlier
+        /// one (e.g. the first repeat of an exception). Immutable and shared.
+        /// </summary>
+        [NonSerialized] internal OzxApm.Core.ContextSnapshot ctx;
 
         /// <summary>Came from an event pool; returned to it after serialization.</summary>
         [NonSerialized] internal bool pooled;

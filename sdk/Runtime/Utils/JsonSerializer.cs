@@ -67,6 +67,14 @@ namespace OzxApm.Utils
             AppendField(sb, "device_id", evt.device_id);
             if (!string.IsNullOrEmpty(evt.scene))
                 AppendField(sb, "scene", evt.scene);
+            if (!string.IsNullOrEmpty(evt.build_type))
+                AppendField(sb, "build_type", evt.build_type);
+            if (!string.IsNullOrEmpty(evt.gpu))
+                AppendField(sb, "gpu", evt.gpu);
+            if (!string.IsNullOrEmpty(evt.ram_class))
+                AppendField(sb, "ram_class", evt.ram_class);
+            if (!string.IsNullOrEmpty(evt.net_type))
+                AppendField(sb, "net_type", evt.net_type);
 
             // Type-specific fields
             switch (evt)
@@ -113,6 +121,12 @@ namespace OzxApm.Utils
                     AppendFieldArray(sb, "breadcrumbs", crash.breadcrumbs);
                     break;
             }
+
+            // The game context, last: its JSON was built once per context change
+            // and is shared by every event until the next one (APM-5).
+            var ctx = evt.ctx;
+            if (ctx != null && ctx.Json != null)
+                sb.Append(",\"ctx\":").Append(ctx.Json);
 
             sb.Append('}');
         }
@@ -169,7 +183,7 @@ namespace OzxApm.Utils
             sb.Append(']');
         }
 
-        private static void AppendEscapedString(StringBuilder sb, string value)
+        internal static void AppendEscapedString(StringBuilder sb, string value)
         {
             foreach (char c in value)
             {

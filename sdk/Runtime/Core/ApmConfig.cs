@@ -28,6 +28,20 @@ namespace OzxApm.Core
         public string Build { get; set; } = "";
 
         /// <summary>
+        /// Build type sent with every event: Auto (default) detects Editor / Dev
+        /// (development build) / Release. Set it to override, e.g. Dev for an
+        /// internal test build made without the Development Build flag.
+        /// </summary>
+        public ApmBuildType BuildType { get; set; } = ApmBuildType.Auto;
+
+        /// <summary>
+        /// Upload from the Unity Editor. Off by default: Editor play sessions are
+        /// collected and stored locally (and visible in ApmClient.GetStats) but not
+        /// sent. Events from the Editor carry build_type "editor" either way.
+        /// </summary>
+        public bool UploadInEditor { get; set; } = false;
+
+        /// <summary>
         /// Enable/disable the SDK
         /// </summary>
         public bool Enabled { get; set; } = true;

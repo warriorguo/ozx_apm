@@ -30,5 +30,15 @@ namespace OzxApm.Core
         /// <summary>Main-thread cost of the last SendWebRequest call / request dispose, in milliseconds.</summary>
         public double LastUploadStartMs;
         public double LastUploadDisposeMs;
+        /// <summary>Game context keys currently set (ApmClient.SetContext).</summary>
+        public int ContextKeys;
+        /// <summary>SetContext calls refused (invalid key, too many keys, context too large).</summary>
+        public int ContextRejected;
+        /// <summary>Context values cut to GameContext.MaxValueLength.</summary>
+        public int ContextTruncated;
+        /// <summary>"release", "dev" or "editor"; null before Initialize.</summary>
+        public string BuildType;
+        /// <summary>False in the Unity Editor unless ApmConfig.UploadInEditor.</summary>
+        public bool UploadsEnabled;
     }
 }
