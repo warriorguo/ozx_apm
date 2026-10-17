@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
+
 	"github.com/warriorguo/ozx_apm/server/internal/models"
 )
 
@@ -30,37 +32,33 @@ func (r *Repository) GetDashboardSummary(ctx context.Context, startTime, endTime
 
 	// Get session count from perf_samples (unique sessions)
 	sessionQuery := fmt.Sprintf(`
-		SELECT uniqExact(session_id) as sessions, count() as events, avg(fps) as avg_fps
+		SELECT toInt64(uniqExact(session_id)) as sessions, toInt64(count()) as events, %s as avg_fps
 		FROM apm_perf_samples %s
-	`, whereClause)
+	`, finiteFloat("avg(fps)"), whereClause)
 
-	row := r.client.conn.QueryRow(ctx, sessionQuery, args...)
-	var events int64
-	var avgFPS float64
-	if err := row.Scan(&summary.TotalSessions, &events, &avgFPS); err == nil {
-		summary.TotalEvents = events
-		summary.AvgFPS = avgFPS
+	if err := r.client.conn.QueryRow(ctx, sessionQuery, args...).Scan(&summary.TotalSessions, &summary.TotalEvents, &summary.AvgFPS); err != nil {
+		return nil, fmt.Errorf("sessions: %w", err)
 	}
 
-	// Get crash count
-	crashQuery := fmt.Sprintf(`SELECT count() FROM apm_crashes %s`, whereClause)
-	row = r.client.conn.QueryRow(ctx, crashQuery, args...)
-	row.Scan(&summary.CrashCount)
+	crashQuery := fmt.Sprintf(`SELECT toInt64(count()) FROM apm_crashes %s`, whereClause)
+	if err := r.client.conn.QueryRow(ctx, crashQuery, args...).Scan(&summary.CrashCount); err != nil {
+		return nil, fmt.Errorf("crash count: %w", err)
+	}
 
-	// Get exception count
-	excQuery := fmt.Sprintf(`SELECT sum(count) FROM apm_exceptions %s`, whereClause)
-	row = r.client.conn.QueryRow(ctx, excQuery, args...)
-	row.Scan(&summary.ExceptionCount)
+	excQuery := fmt.Sprintf(`SELECT toInt64(sum(count)) FROM apm_exceptions %s`, whereClause)
+	if err := r.client.conn.QueryRow(ctx, excQuery, args...).Scan(&summary.ExceptionCount); err != nil {
+		return nil, fmt.Errorf("exception count: %w", err)
+	}
 
-	// Get jank count
-	jankQuery := fmt.Sprintf(`SELECT count() FROM apm_janks %s`, whereClause)
-	row = r.client.conn.QueryRow(ctx, jankQuery, args...)
-	row.Scan(&summary.JankCount)
+	jankQuery := fmt.Sprintf(`SELECT toInt64(count()) FROM apm_janks %s`, whereClause)
+	if err := r.client.conn.QueryRow(ctx, jankQuery, args...).Scan(&summary.JankCount); err != nil {
+		return nil, fmt.Errorf("jank count: %w", err)
+	}
 
-	// Get avg startup time
-	startupQuery := fmt.Sprintf(`SELECT avg(phase1_ms + phase2_ms + tti_ms) FROM apm_startups %s`, whereClause)
-	row = r.client.conn.QueryRow(ctx, startupQuery, args...)
-	row.Scan(&summary.AvgStartupMs)
+	startupQuery := fmt.Sprintf(`SELECT %s FROM apm_startups %s`, finiteFloat("avg(phase1_ms + phase2_ms + tti_ms)"), whereClause)
+	if err := r.client.conn.QueryRow(ctx, startupQuery, args...).Scan(&summary.AvgStartupMs); err != nil {
+		return nil, fmt.Errorf("avg startup: %w", err)
+	}
 
 	// Calculate crash rate
 	if summary.TotalSessions > 0 {
@@ -71,43 +69,47 @@ func (r *Repository) GetDashboardSummary(ctx context.Context, startTime, endTime
 	versionQuery := fmt.Sprintf(`
 		SELECT
 			app_version,
-			uniqExact(session_id) as session_count
+			toInt64(uniqExact(session_id)) as session_count
 		FROM apm_perf_samples %s
 		GROUP BY app_version
-		ORDER BY session_count DESC
+		ORDER BY session_count DESC, app_version
 		LIMIT 5
 	`, whereClause)
 
-	rows, err := r.client.conn.Query(ctx, versionQuery, args...)
-	if err == nil {
-		defer rows.Close()
-		for rows.Next() {
-			var vs models.VersionStats
-			rows.Scan(&vs.Version, &vs.SessionCount)
-			summary.TopVersions = append(summary.TopVersions, vs)
+	err := r.queryRows(ctx, versionQuery, args, func(rows driver.Rows) error {
+		var vs models.VersionStats
+		if err := rows.Scan(&vs.Version, &vs.SessionCount); err != nil {
+			return err
 		}
+		summary.TopVersions = append(summary.TopVersions, vs)
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("top versions: %w", err)
 	}
 
 	// Get top platforms
 	platformQuery := fmt.Sprintf(`
 		SELECT
 			platform,
-			uniqExact(session_id) as session_count,
-			avg(fps) as avg_fps
+			toInt64(uniqExact(session_id)) as session_count,
+			%s as avg_fps
 		FROM apm_perf_samples %s
 		GROUP BY platform
-		ORDER BY session_count DESC
+		ORDER BY session_count DESC, platform
 		LIMIT 5
-	`, whereClause)
+	`, finiteFloat("avg(fps)"), whereClause)
 
-	rows, err = r.client.conn.Query(ctx, platformQuery, args...)
-	if err == nil {
-		defer rows.Close()
-		for rows.Next() {
-			var ps models.PlatformStats
-			rows.Scan(&ps.Platform, &ps.SessionCount, &ps.AvgFPS)
-			summary.TopPlatforms = append(summary.TopPlatforms, ps)
+	err = r.queryRows(ctx, platformQuery, args, func(rows driver.Rows) error {
+		var ps models.PlatformStats
+		if err := rows.Scan(&ps.Platform, &ps.SessionCount, &ps.AvgFPS); err != nil {
+			return err
 		}
+		summary.TopPlatforms = append(summary.TopPlatforms, ps)
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("top platforms: %w", err)
 	}
 
 	return summary, nil
@@ -128,68 +130,45 @@ func (r *Repository) GetTimeSeries(ctx context.Context, metric string, startTime
 		args = append(args, platform)
 	}
 
+	// The value is always scanned into a float64, so every expression is
+	// converted to Float64 (count() is UInt64, avg(Float32) can be NaN).
+	var table, value string
 	switch metric {
 	case "fps":
-		query = fmt.Sprintf(`
-			SELECT toStartOfInterval(timestamp, INTERVAL %s) as t, avg(fps)
-			FROM apm_perf_samples %s
-			GROUP BY t ORDER BY t
-		`, interval, whereClause)
+		table, value = "apm_perf_samples", "avg(fps)"
 	case "frame_time":
-		query = fmt.Sprintf(`
-			SELECT toStartOfInterval(timestamp, INTERVAL %s) as t, avg(frame_time_ms)
-			FROM apm_perf_samples %s
-			GROUP BY t ORDER BY t
-		`, interval, whereClause)
+		table, value = "apm_perf_samples", "avg(frame_time_ms)"
 	case "crashes", "crash_count":
-		query = fmt.Sprintf(`
-			SELECT toStartOfInterval(timestamp, INTERVAL %s) as t, count()
-			FROM apm_crashes %s
-			GROUP BY t ORDER BY t
-		`, interval, whereClause)
+		table, value = "apm_crashes", "count()"
 	case "exceptions":
-		query = fmt.Sprintf(`
-			SELECT toStartOfInterval(timestamp, INTERVAL %s) as t, sum(count)
-			FROM apm_exceptions %s
-			GROUP BY t ORDER BY t
-		`, interval, whereClause)
+		table, value = "apm_exceptions", "sum(count)"
 	case "janks", "jank_count":
-		query = fmt.Sprintf(`
-			SELECT toStartOfInterval(timestamp, INTERVAL %s) as t, count()
-			FROM apm_janks %s
-			GROUP BY t ORDER BY t
-		`, interval, whereClause)
+		table, value = "apm_janks", "count()"
 	case "sessions":
-		query = fmt.Sprintf(`
-			SELECT toStartOfInterval(timestamp, INTERVAL %s) as t, uniqExact(session_id)
-			FROM apm_perf_samples %s
-			GROUP BY t ORDER BY t
-		`, interval, whereClause)
+		table, value = "apm_perf_samples", "uniqExact(session_id)"
 	case "startup", "startup_time":
-		query = fmt.Sprintf(`
-			SELECT toStartOfInterval(timestamp, INTERVAL %s) as t, avg(phase1_ms + phase2_ms + tti_ms)
-			FROM apm_startups %s
-			GROUP BY t ORDER BY t
-		`, interval, whereClause)
+		table, value = "apm_startups", "avg(phase1_ms + phase2_ms + tti_ms)"
 	default:
 		return nil, fmt.Errorf("unknown metric: %s", metric)
 	}
+	query = fmt.Sprintf(`
+		SELECT toStartOfInterval(timestamp, INTERVAL %s) as t, %s
+		FROM %s %s
+		GROUP BY t ORDER BY t
+	`, interval, finiteFloat(value), table, whereClause)
 
-	rows, err := r.client.conn.Query(ctx, query, args...)
+	points := []models.TimeSeriesPoint{}
+	err := r.queryRows(ctx, query, args, func(rows driver.Rows) error {
+		var p models.TimeSeriesPoint
+		if err := rows.Scan(&p.Timestamp, &p.Value); err != nil {
+			return err
+		}
+		points = append(points, p)
+		return nil
+	})
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-
-	points := []models.TimeSeriesPoint{}
-	for rows.Next() {
-		var p models.TimeSeriesPoint
-		if err := rows.Scan(&p.Timestamp, &p.Value); err != nil {
-			continue
-		}
-		points = append(points, p)
-	}
-
 	return points, nil
 }
 
@@ -205,10 +184,6 @@ func (r *Repository) GetDistribution(ctx context.Context, metric string, startTi
 	if platform != "" {
 		whereClause += " AND platform = ?"
 		args = append(args, platform)
-	}
-	if scene != "" {
-		whereClause += " AND scene = ?"
-		args = append(args, scene)
 	}
 
 	var valueColumn, table string
@@ -230,20 +205,23 @@ func (r *Repository) GetDistribution(ctx context.Context, metric string, startTi
 	default:
 		return nil, fmt.Errorf("unknown metric: %s", metric)
 	}
+	// apm_startups has no scene column; the scene filter applies to perf samples only.
+	if scene != "" && table == "apm_perf_samples" {
+		whereClause += " AND scene = ?"
+		args = append(args, scene)
+	}
 
 	// Get percentiles
 	pctQuery := fmt.Sprintf(`
-		SELECT
-			quantile(0.5)(%s) as p50,
-			quantile(0.9)(%s) as p90,
-			quantile(0.95)(%s) as p95,
-			quantile(0.99)(%s) as p99
+		SELECT %s as p50, %s as p90, %s as p95, %s as p99
 		FROM %s %s
-	`, valueColumn, valueColumn, valueColumn, valueColumn, table, whereClause)
+	`, finiteFloat("quantile(0.5)("+valueColumn+")"), finiteFloat("quantile(0.9)("+valueColumn+")"),
+		finiteFloat("quantile(0.95)("+valueColumn+")"), finiteFloat("quantile(0.99)("+valueColumn+")"), table, whereClause)
 
 	resp := &models.DistributionResponse{Metric: metric, Buckets: []models.DistributionBucket{}}
-	row := r.client.conn.QueryRow(ctx, pctQuery, args...)
-	row.Scan(&resp.P50, &resp.P90, &resp.P95, &resp.P99)
+	if err := r.client.conn.QueryRow(ctx, pctQuery, args...).Scan(&resp.P50, &resp.P90, &resp.P95, &resp.P99); err != nil {
+		return nil, fmt.Errorf("percentiles: %w", err)
+	}
 
 	// Build bucket query based on metric
 	var bucketQuery string
@@ -252,7 +230,7 @@ func (r *Repository) GetDistribution(ctx context.Context, metric string, startTi
 		bucketQuery = fmt.Sprintf(`
 			SELECT
 				multiIf(fps < 15, '0-15', fps < 30, '15-30', fps < 45, '30-45', fps < 60, '45-60', '60+') as bucket,
-				count() as cnt
+				toInt64(count()) as cnt
 			FROM %s %s
 			GROUP BY bucket
 		`, table, whereClause)
@@ -260,7 +238,7 @@ func (r *Repository) GetDistribution(ctx context.Context, metric string, startTi
 		bucketQuery = fmt.Sprintf(`
 			SELECT
 				multiIf(frame_time_ms < 16, '0-16', frame_time_ms < 33, '16-33', frame_time_ms < 50, '33-50', frame_time_ms < 100, '50-100', '100+') as bucket,
-				count() as cnt
+				toInt64(count()) as cnt
 			FROM %s %s
 			GROUP BY bucket
 		`, table, whereClause)
@@ -268,26 +246,26 @@ func (r *Repository) GetDistribution(ctx context.Context, metric string, startTi
 		bucketQuery = fmt.Sprintf(`
 			SELECT
 				multiIf(%s < 1000, '0-1000', %s < 2000, '1000-2000', %s < 3000, '2000-3000', %s < 5000, '3000-5000', '5000+') as bucket,
-				count() as cnt
+				toInt64(count()) as cnt
 			FROM %s %s
 			GROUP BY bucket
 		`, valueColumn, valueColumn, valueColumn, valueColumn, table, whereClause)
 	}
 
-	rows, err := r.client.conn.Query(ctx, bucketQuery, args...)
-	if err != nil {
-		return resp, nil
-	}
-	defer rows.Close()
-
 	bucketCounts := make(map[string]int64)
 	var total int64
-	for rows.Next() {
+	err := r.queryRows(ctx, bucketQuery, args, func(rows driver.Rows) error {
 		var bucket string
 		var count int64
-		rows.Scan(&bucket, &count)
+		if err := rows.Scan(&bucket, &count); err != nil {
+			return err
+		}
 		bucketCounts[bucket] = count
 		total += count
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("buckets: %w", err)
 	}
 
 	// Build response in order
@@ -317,17 +295,17 @@ func (r *Repository) GetAppVersions(ctx context.Context) ([]string, error) {
 		LIMIT 50
 	`
 
-	rows, err := r.client.conn.Query(ctx, query)
+	versions := []string{}
+	err := r.queryRows(ctx, query, nil, func(rows driver.Rows) error {
+		var v string
+		if err := rows.Scan(&v); err != nil {
+			return err
+		}
+		versions = append(versions, v)
+		return nil
+	})
 	if err != nil {
 		return nil, err
-	}
-	defer rows.Close()
-
-	versions := []string{}
-	for rows.Next() {
-		var v string
-		rows.Scan(&v)
-		versions = append(versions, v)
 	}
 
 	return versions, nil
@@ -351,17 +329,17 @@ func (r *Repository) GetScenes(ctx context.Context, appVersion string) ([]string
 		LIMIT 100
 	`, whereClause)
 
-	rows, err := r.client.conn.Query(ctx, query, args...)
+	scenes := []string{}
+	err := r.queryRows(ctx, query, args, func(rows driver.Rows) error {
+		var s string
+		if err := rows.Scan(&s); err != nil {
+			return err
+		}
+		scenes = append(scenes, s)
+		return nil
+	})
 	if err != nil {
 		return nil, err
-	}
-	defer rows.Close()
-
-	scenes := []string{}
-	for rows.Next() {
-		var s string
-		rows.Scan(&s)
-		scenes = append(scenes, s)
 	}
 
 	return scenes, nil
@@ -382,9 +360,11 @@ func (r *Repository) GetCrashGroups(ctx context.Context, startTime, endTime time
 	}
 
 	// Get total count
-	countQuery := fmt.Sprintf(`SELECT count(DISTINCT fingerprint) FROM apm_crashes %s`, whereClause)
+	countQuery := fmt.Sprintf(`SELECT toInt64(uniqExact(fingerprint)) FROM apm_crashes %s`, whereClause)
 	var totalCount int64
-	r.client.conn.QueryRow(ctx, countQuery, args...).Scan(&totalCount)
+	if err := r.client.conn.QueryRow(ctx, countQuery, args...).Scan(&totalCount); err != nil {
+		return nil, 0, fmt.Errorf("crash group count: %w", err)
+	}
 
 	// Get crash groups
 	offset := (page - 1) * pageSize
@@ -392,31 +372,25 @@ func (r *Repository) GetCrashGroups(ctx context.Context, startTime, endTime time
 		SELECT
 			fingerprint,
 			any(crash_type) as crash_type,
-			count() as cnt,
-			uniqExact(session_id) as session_count,
+			toInt64(count()) as cnt,
+			toInt64(uniqExact(session_id)) as session_count,
 			min(timestamp) as first_seen,
 			max(timestamp) as last_seen,
-			groupArray(DISTINCT app_version) as versions,
+			groupUniqArray(app_version) as versions,
 			topK(5)(device_model) as devices
 		FROM apm_crashes
 		%s
 		GROUP BY fingerprint
-		ORDER BY cnt DESC
+		ORDER BY cnt DESC, fingerprint
 		LIMIT %d OFFSET %d
 	`, whereClause, pageSize, offset)
 
-	rows, err := r.client.conn.Query(ctx, query, args...)
-	if err != nil {
-		return nil, 0, err
-	}
-	defer rows.Close()
-
 	crashes := []models.CrashGroup{}
-	for rows.Next() {
+	err := r.queryRows(ctx, query, args, func(rows driver.Rows) error {
 		var c models.CrashGroup
 		var versions, devices []string
 		if err := rows.Scan(&c.Fingerprint, &c.CrashType, &c.Count, &c.SessionCount, &c.FirstSeen, &c.LastSeen, &versions, &devices); err != nil {
-			continue
+			return err
 		}
 		if versions == nil {
 			versions = []string{}
@@ -427,8 +401,11 @@ func (r *Repository) GetCrashGroups(ctx context.Context, startTime, endTime time
 		c.AffectedVersions = versions
 		c.TopDevices = devices
 		crashes = append(crashes, c)
+		return nil
+	})
+	if err != nil {
+		return nil, 0, err
 	}
-
 	return crashes, totalCount, nil
 }
 
@@ -440,8 +417,8 @@ func (r *Repository) GetCrashDetail(ctx context.Context, fingerprint string, sta
 			fingerprint,
 			any(crash_type),
 			any(stack),
-			count(),
-			uniqExact(session_id),
+			toInt64(count()),
+			toInt64(uniqExact(session_id)),
 			min(timestamp),
 			max(timestamp)
 		FROM apm_crashes
@@ -450,9 +427,9 @@ func (r *Repository) GetCrashDetail(ctx context.Context, fingerprint string, sta
 	`
 
 	detail := &models.CrashDetail{
-		Occurrences:  []models.CrashOccurrence{},
-		VersionDist:  []models.VersionDist{},
-		DeviceDist:   []models.DeviceDist{},
+		Occurrences: []models.CrashOccurrence{},
+		VersionDist: []models.VersionDist{},
+		DeviceDist:  []models.DeviceDist{},
 	}
 	row := r.client.conn.QueryRow(ctx, query, fingerprint, startTime, endTime)
 	if err := row.Scan(&detail.Fingerprint, &detail.CrashType, &detail.Stack, &detail.Count, &detail.SessionCount, &detail.FirstSeen, &detail.LastSeen); err != nil {
@@ -468,51 +445,58 @@ func (r *Repository) GetCrashDetail(ctx context.Context, fingerprint string, sta
 		LIMIT 10
 	`
 
-	rows, err := r.client.conn.Query(ctx, occQuery, fingerprint, startTime, endTime)
-	if err == nil {
-		defer rows.Close()
-		for rows.Next() {
-			var occ models.CrashOccurrence
-			rows.Scan(&occ.Timestamp, &occ.AppVersion, &occ.Platform, &occ.DeviceModel, &occ.OSVersion, &occ.Scene, &occ.Breadcrumbs)
-			detail.Occurrences = append(detail.Occurrences, occ)
+	detailArgs := []interface{}{fingerprint, startTime, endTime}
+	err := r.queryRows(ctx, occQuery, detailArgs, func(rows driver.Rows) error {
+		var occ models.CrashOccurrence
+		if err := rows.Scan(&occ.Timestamp, &occ.AppVersion, &occ.Platform, &occ.DeviceModel, &occ.OSVersion, &occ.Scene, &occ.Breadcrumbs); err != nil {
+			return err
 		}
+		detail.Occurrences = append(detail.Occurrences, occ)
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("occurrences: %w", err)
 	}
 
 	// Get version distribution
 	versionQuery := `
-		SELECT app_version, count() as cnt
+		SELECT app_version, toInt64(count()) as cnt
 		FROM apm_crashes
 		WHERE fingerprint = ? AND timestamp >= ? AND timestamp <= ?
 		GROUP BY app_version
-		ORDER BY cnt DESC
+		ORDER BY cnt DESC, app_version
 	`
-	rows, err = r.client.conn.Query(ctx, versionQuery, fingerprint, startTime, endTime)
-	if err == nil {
-		defer rows.Close()
-		for rows.Next() {
-			var vd models.VersionDist
-			rows.Scan(&vd.Version, &vd.Count)
-			detail.VersionDist = append(detail.VersionDist, vd)
+	err = r.queryRows(ctx, versionQuery, detailArgs, func(rows driver.Rows) error {
+		var vd models.VersionDist
+		if err := rows.Scan(&vd.Version, &vd.Count); err != nil {
+			return err
 		}
+		detail.VersionDist = append(detail.VersionDist, vd)
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("version distribution: %w", err)
 	}
 
 	// Get device distribution
 	deviceQuery := `
-		SELECT device_model, count() as cnt
+		SELECT device_model, toInt64(count()) as cnt
 		FROM apm_crashes
 		WHERE fingerprint = ? AND timestamp >= ? AND timestamp <= ?
 		GROUP BY device_model
-		ORDER BY cnt DESC
+		ORDER BY cnt DESC, device_model
 		LIMIT 10
 	`
-	rows, err = r.client.conn.Query(ctx, deviceQuery, fingerprint, startTime, endTime)
-	if err == nil {
-		defer rows.Close()
-		for rows.Next() {
-			var dd models.DeviceDist
-			rows.Scan(&dd.Device, &dd.Count)
-			detail.DeviceDist = append(detail.DeviceDist, dd)
+	err = r.queryRows(ctx, deviceQuery, detailArgs, func(rows driver.Rows) error {
+		var dd models.DeviceDist
+		if err := rows.Scan(&dd.Device, &dd.Count); err != nil {
+			return err
 		}
+		detail.DeviceDist = append(detail.DeviceDist, dd)
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("device distribution: %w", err)
 	}
 
 	return detail, nil
@@ -533,9 +517,11 @@ func (r *Repository) GetExceptionGroups(ctx context.Context, startTime, endTime 
 	}
 
 	// Get total count
-	countQuery := fmt.Sprintf(`SELECT count(DISTINCT fingerprint) FROM apm_exceptions %s`, whereClause)
+	countQuery := fmt.Sprintf(`SELECT toInt64(uniqExact(fingerprint)) FROM apm_exceptions %s`, whereClause)
 	var totalCount int64
-	r.client.conn.QueryRow(ctx, countQuery, args...).Scan(&totalCount)
+	if err := r.client.conn.QueryRow(ctx, countQuery, args...).Scan(&totalCount); err != nil {
+		return nil, 0, fmt.Errorf("exception group count: %w", err)
+	}
 
 	// Get exception groups
 	offset := (page - 1) * pageSize
@@ -543,31 +529,50 @@ func (r *Repository) GetExceptionGroups(ctx context.Context, startTime, endTime 
 		SELECT
 			fingerprint,
 			any(message) as message,
-			sum(count) as cnt,
-			uniqExact(session_id) as session_count,
+			toInt64(sum(count)) as cnt,
+			toInt64(uniqExact(session_id)) as session_count,
 			min(timestamp) as first_seen,
 			max(timestamp) as last_seen
 		FROM apm_exceptions
 		%s
 		GROUP BY fingerprint
-		ORDER BY cnt DESC
+		ORDER BY cnt DESC, fingerprint
 		LIMIT %d OFFSET %d
 	`, whereClause, pageSize, offset)
 
-	rows, err := r.client.conn.Query(ctx, query, args...)
+	exceptions := []models.ExceptionGroup{}
+	err := r.queryRows(ctx, query, args, func(rows driver.Rows) error {
+		var e models.ExceptionGroup
+		if err := rows.Scan(&e.Fingerprint, &e.Message, &e.Count, &e.SessionCount, &e.FirstSeen, &e.LastSeen); err != nil {
+			return err
+		}
+		exceptions = append(exceptions, e)
+		return nil
+	})
 	if err != nil {
 		return nil, 0, err
 	}
-	defer rows.Close()
-
-	exceptions := []models.ExceptionGroup{}
-	for rows.Next() {
-		var e models.ExceptionGroup
-		if err := rows.Scan(&e.Fingerprint, &e.Message, &e.Count, &e.SessionCount, &e.FirstSeen, &e.LastSeen); err != nil {
-			continue
-		}
-		exceptions = append(exceptions, e)
-	}
-
 	return exceptions, totalCount, nil
+}
+
+// finiteFloat converts an aggregate to Float64 and replaces NaN/Inf with 0:
+// avg() and quantile() of no rows are NaN, which encoding/json cannot encode.
+func finiteFloat(expr string) string {
+	return "ifNotFinite(toFloat64(" + expr + "), 0)"
+}
+
+// queryRows runs query and calls scan for every row, returning the first
+// error from the query, a scan, or the row iteration.
+func (r *Repository) queryRows(ctx context.Context, query string, args []interface{}, scan func(driver.Rows) error) error {
+	rows, err := r.client.conn.Query(ctx, query, args...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		if err := scan(rows); err != nil {
+			return err
+		}
+	}
+	return rows.Err()
 }
