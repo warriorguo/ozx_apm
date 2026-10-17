@@ -137,6 +137,243 @@ export interface ExceptionGroup {
   // code caught. Absent from older servers, 0 for rows of older SDKs.
   first_error_sessions?: number
   unhandled_count?: number
+  // APM-11: sessions whose rows carry an error sequence (SDK with APM-3);
+  // first_error_sessions / sessions_with_seq = share of sessions in which
+  // this group was the first error.
+  sessions_with_seq?: number
+}
+
+export type ExceptionSort = 'count' | 'sessions' | 'first_seen' | 'last_seen'
+
+// The exception detail (APM-4 server, APM-11 page). Everything that older
+// servers or older SDK rows may lack is optional.
+export interface ParsedFrame {
+  method: string
+  file?: string
+  line?: number
+  in_app: boolean
+  raw: string
+}
+
+export interface ParsedException {
+  type: string
+  message: string
+  frames: ParsedFrame[]
+}
+
+export interface ParsedStack {
+  kind: string // exception, error, assert
+  wrapped: boolean // the exception was embedded in an error/assert log
+  chain: ParsedException[] // outermost first
+  log_frames: ParsedFrame[] // Unity's stack of the log call
+  message_template: string
+  throw_site: string
+  call_site: string
+  fingerprint: string
+  fingerprint_version: number
+}
+
+export interface ExceptionSample {
+  timestamp: string
+  event_id: string
+  log_type: string
+  message: string
+  stack: string
+  embedded_exception: string
+  client_fingerprint: string
+  fingerprint_version: number
+  inner_exceptions: string[]
+  parsed: ParsedStack
+}
+
+export interface ExceptionOccurrence {
+  timestamp: string
+  event_id: string
+  count: number
+  app_version: string
+  build_type: string
+  platform: string
+  device_model: string
+  os_version: string
+  scene: string
+  session_id: string
+  device_id: string
+  context: Record<string, string>
+  breadcrumbs: string[]
+  error_seq: number // 0: unknown (SDK before APM-3)
+  session_ms: number
+  unhandled: string // '', domain, domain_terminating, task
+  ctx_merged: boolean
+}
+
+export interface ExceptionTrendPoint {
+  timestamp: string
+  count: number
+  sessions: number
+}
+
+export interface ExceptionDetail extends ExceptionGroup {
+  first_version: string
+  last_version: string
+  sample: ExceptionSample
+  occurrences: ExceptionOccurrence[]
+  version_distribution: VersionDist[]
+  device_distribution: DeviceDist[]
+  trend: { interval_seconds: number; points: ExceptionTrendPoint[] }
+}
+
+export interface ExceptionOccurrencesResponse {
+  fingerprint: string
+  occurrences: ExceptionOccurrence[]
+  total_count: number
+  page: number
+  page_size: number
+}
+
+export type ExceptionColumn = 'app_version' | 'build_type' | 'device_model' | 'platform' | 'os_version'
+
+// by a column, or by a game context key
+export type ExceptionGroupBy = { kind: 'by'; key: ExceptionColumn } | { kind: 'key'; key: string }
+
+export interface ExceptionDistributionRow {
+  value: string
+  count: number
+  sessions: number
+}
+
+export interface ExceptionDistribution {
+  fingerprint: string
+  group_by: string
+  total: number
+  merged: number // occurrences whose value of the key is unknown (merged across contexts)
+  truncated: boolean
+  rows: ExceptionDistributionRow[]
+}
+
+// Session time line (APM-15)
+export type TimelineType =
+  | 'custom_event'
+  | 'custom_metric'
+  | 'exception'
+  | 'crash'
+  | 'jank'
+  | 'scene_load'
+  | 'startup'
+  | 'context'
+  | 'breadcrumb'
+
+export type BreadcrumbKind = 'event' | 'scene' | 'warning' | 'error' | 'assert' | 'exception' | 'text'
+
+export interface ContextChange {
+  key: string
+  from: string
+  to: string
+}
+
+// One item; only the fields of its type are present.
+export interface TimelineItem {
+  time: string
+  type: TimelineType
+  event_id?: string
+  seq?: number
+  scene?: string
+  name?: string
+  aggregated?: boolean
+  props?: Record<string, string>
+  unit?: string
+  sum?: number
+  min?: number
+  max?: number
+  window_ms?: number
+  count?: number
+  ctx_merged?: boolean
+  context?: Record<string, string>
+  fingerprint?: string
+  message?: string
+  exception_type?: string
+  log_type?: string
+  throw_site?: string
+  call_site?: string
+  error_seq?: number
+  session_ms?: number
+  unhandled?: string
+  crash_type?: string
+  duration_ms?: number
+  max_frame_ms?: number
+  recent_gc_count?: number
+  recent_gc_alloc_kb?: number
+  recent_events?: string[]
+  scene_name?: string
+  load_ms?: number
+  activate_ms?: number
+  phase1_ms?: number
+  phase2_ms?: number
+  tti_ms?: number
+  changes?: ContextChange[]
+  source?: string
+  kind?: BreadcrumbKind
+  text?: string
+  repeats?: number
+  repeat_until?: string
+  time_unknown?: boolean
+}
+
+export interface SessionInfo {
+  session_id: string
+  first_seen: string
+  last_seen: string
+  started_at?: string
+  device_id: string
+  app_version: string
+  platform: string
+  device_model: string
+  os_version: string
+  build_type: string
+  rows: number
+}
+
+export interface PerfPoint {
+  time: string
+  samples: number
+  fps_avg: number
+  fps_min: number
+  frame_ms_max: number
+  mem_mb_max: number
+}
+
+export interface SessionTimeline {
+  session_id: string
+  start_time: string
+  end_time: string
+  found: boolean
+  session: SessionInfo
+  items: TimelineItem[]
+  counts: Record<string, number>
+  truncated: string[]
+  duplicate_breadcrumbs: number
+  perf: PerfPoint[]
+  perf_interval_seconds: number
+}
+
+export interface SessionSummary {
+  session_id: string
+  first_seen: string
+  last_seen: string
+  rows: number
+  exceptions: number
+  crashes: number
+  app_version: string
+  platform: string
+  device_model: string
+  build_type: string
+}
+
+export interface DeviceSessionsResponse {
+  device_id: string
+  start_time: string
+  end_time: string
+  sessions: SessionSummary[]
+  truncated: boolean
 }
 
 export interface ExceptionListResponse {

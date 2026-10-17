@@ -28,6 +28,11 @@ import {
   getContextKeys,
   getContextValues,
   getContextDistribution,
+  getExceptionDetail,
+  getExceptionOccurrences,
+  getExceptionDistribution,
+  getSessionTimeline,
+  getDeviceSessions,
 } from './api'
 
 describe('API Service', () => {
@@ -205,6 +210,66 @@ describe('API Service', () => {
         params: { key: 'levelId', metric: 'fps' },
       })
       expect(result).toEqual({ key: 'levelId', metric: 'fps', unit: '', total: 0, truncated: false, rows: [] })
+    })
+  })
+
+  describe('exception detail APIs (APM-11)', () => {
+    it('getExceptionDetail fills what an old server or an old row lacks', async () => {
+      mockGet.mockResolvedValue({ data: { fingerprint: 'f', count: 3, occurrences: [{ timestamp: 't' }], sample: null } })
+      const d = await getExceptionDetail('f', { build_type: 'all' })
+      expect(mockGet).toHaveBeenCalledWith('/exceptions/detail', { params: { fingerprint: 'f', build_type: 'all' } })
+      expect(d.sample.parsed.chain).toEqual([])
+      expect(d.sample.parsed.log_frames).toEqual([])
+      expect(d.sample.inner_exceptions).toEqual([])
+      expect(d.trend).toEqual({ interval_seconds: 0, points: [] })
+      expect(d.occurrences[0]).toMatchObject({ context: {}, breadcrumbs: [], error_seq: 0, ctx_merged: false, device_id: '' })
+      expect(d.version_distribution).toEqual([])
+    })
+
+    it('getExceptionDetail rejects an empty body', async () => {
+      mockGet.mockResolvedValue({ data: null })
+      await expect(getExceptionDetail('f', {})).rejects.toThrow()
+    })
+
+    it('getExceptionOccurrences pages and normalizes', async () => {
+      mockGet.mockResolvedValue({ data: { occurrences: [{ count: 2, context: null }], total_count: 7, page: 2, page_size: 5 } })
+      const r = await getExceptionOccurrences('f', { page: 2, page_size: 5 })
+      expect(mockGet).toHaveBeenCalledWith('/exceptions/occurrences', { params: { fingerprint: 'f', page: 2, page_size: 5 } })
+      expect(r.total_count).toBe(7)
+      expect(r.occurrences[0].context).toEqual({})
+    })
+
+    it('getExceptionDistribution sends by or key', async () => {
+      mockGet.mockResolvedValue({ data: null })
+      const r = await getExceptionDistribution('f', { kind: 'key', key: 'roomId' }, {})
+      expect(mockGet).toHaveBeenCalledWith('/exceptions/distribution', { params: { fingerprint: 'f', key: 'roomId' } })
+      expect(r).toEqual({ fingerprint: 'f', group_by: '', total: 0, merged: 0, truncated: false, rows: [] })
+      await getExceptionDistribution('f', { kind: 'by', key: 'build_type' }, { build_type: 'all' })
+      expect(mockGet).toHaveBeenLastCalledWith('/exceptions/distribution', { params: { fingerprint: 'f', by: 'build_type', build_type: 'all' } })
+    })
+
+    it('getExceptions passes the sort and first_error', async () => {
+      mockGet.mockResolvedValue({ data: { exceptions: null, total_count: 0, page: 1, page_size: 20 } })
+      const r = await getExceptions({ sort: 'first_seen', first_error: '1' })
+      expect(mockGet).toHaveBeenCalledWith('/exceptions', { params: { sort: 'first_seen', first_error: '1' } })
+      expect(r.exceptions).toEqual([])
+    })
+  })
+
+  describe('session APIs (APM-15)', () => {
+    it('getSessionTimeline survives an empty body', async () => {
+      mockGet.mockResolvedValue({ data: null })
+      const t = await getSessionTimeline({ session_id: 's', at: '2026-10-18T10:00:00Z' })
+      expect(mockGet).toHaveBeenCalledWith('/sessions/timeline', { params: { session_id: 's', at: '2026-10-18T10:00:00Z' } })
+      expect(t).toMatchObject({ session_id: 's', found: false, items: [], truncated: [], perf: [], counts: {} })
+      expect(t.session.session_id).toBe('s')
+    })
+
+    it('getDeviceSessions sends the device and the range', async () => {
+      mockGet.mockResolvedValue({ data: { sessions: null } })
+      const r = await getDeviceSessions('d', { start_time: 'a' })
+      expect(mockGet).toHaveBeenCalledWith('/sessions', { params: { device_id: 'd', start_time: 'a' } })
+      expect(r.sessions).toEqual([])
     })
   })
 })

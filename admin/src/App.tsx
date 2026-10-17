@@ -6,6 +6,7 @@ import { Crashes } from './pages/Crashes'
 import { Exceptions } from './pages/Exceptions'
 import { Context } from './pages/Context'
 import { Custom } from './pages/Custom'
+import { ExceptionDetail } from './pages/ExceptionDetail'
 import { FiltersProvider } from './hooks/useFilters'
 
 function App() {
@@ -18,6 +19,7 @@ function App() {
             <Route path="performance" element={<Performance />} />
             <Route path="crashes" element={<Crashes />} />
             <Route path="exceptions" element={<Exceptions />} />
+            <Route path="exceptions/detail" element={<ExceptionDetail />} />
             <Route path="context" element={<Context />} />
             <Route path="custom" element={<Custom />} />
           </Route>

@@ -15,6 +15,17 @@ import type {
   CustomMetricsResponse,
   CustomDistribution,
   CustomGroup,
+  ExceptionSort,
+  ExceptionDetail,
+  ExceptionSample,
+  ExceptionOccurrence,
+  ExceptionOccurrencesResponse,
+  ExceptionDistribution,
+  ExceptionGroupBy,
+  ParsedStack,
+  SessionTimeline,
+  SessionInfo,
+  DeviceSessionsResponse,
 } from '../types/api'
 
 export const apiConfig = {
@@ -125,14 +136,177 @@ export async function getCrashDetail(
 }
 
 // Exception APIs
+// sort (APM-11): count (server default), sessions, first_seen, last_seen.
+// first_error (APM-3): only occurrences that were their session's first error.
 export async function getExceptions(
-  params: FilterParams & PaginationParams
+  params: FilterParams & PaginationParams & { sort?: ExceptionSort; first_error?: string }
 ): Promise<ExceptionListResponse> {
   const { data } = await api.get<ExceptionListResponse>('/exceptions', { params })
   if (!data) {
     return { exceptions: [], total_count: 0, page: 1, page_size: 20 }
   }
   return { ...data, exceptions: data.exceptions || [] }
+}
+
+// Fields an old server or an old SDK's row may lack become empty values, so
+// the pages never have to check for undefined.
+export function normalizeOccurrence(o: Partial<ExceptionOccurrence>): ExceptionOccurrence {
+  return {
+    timestamp: o.timestamp || '',
+    event_id: o.event_id || '',
+    count: o.count || 0,
+    app_version: o.app_version || '',
+    build_type: o.build_type || '',
+    platform: o.platform || '',
+    device_model: o.device_model || '',
+    os_version: o.os_version || '',
+    scene: o.scene || '',
+    session_id: o.session_id || '',
+    device_id: o.device_id || '',
+    context: o.context || {},
+    breadcrumbs: o.breadcrumbs || [],
+    error_seq: o.error_seq || 0,
+    session_ms: o.session_ms || 0,
+    unhandled: o.unhandled || '',
+    ctx_merged: !!o.ctx_merged,
+  }
+}
+
+function normalizeParsed(p: Partial<ParsedStack> | undefined): ParsedStack {
+  return {
+    kind: p?.kind || '',
+    wrapped: !!p?.wrapped,
+    chain: (p?.chain || []).map((e) => ({ type: e.type || '', message: e.message || '', frames: e.frames || [] })),
+    log_frames: p?.log_frames || [],
+    message_template: p?.message_template || '',
+    throw_site: p?.throw_site || '',
+    call_site: p?.call_site || '',
+    fingerprint: p?.fingerprint || '',
+    fingerprint_version: p?.fingerprint_version || 0,
+  }
+}
+
+// APM-4/APM-11: one exception group. Rejects with the axios error (404 when
+// nothing of the group matches the filter).
+export async function getExceptionDetail(fingerprint: string, params: FilterParams): Promise<ExceptionDetail> {
+  const { data } = await api.get<ExceptionDetail>('/exceptions/detail', {
+    params: { fingerprint, ...params },
+  })
+  if (!data) {
+    throw new Error('Exception detail not found')
+  }
+  const s: Partial<ExceptionSample> = data.sample || {}
+  return {
+    ...data,
+    message: data.message || '',
+    first_version: data.first_version || '',
+    last_version: data.last_version || '',
+    sample: {
+      timestamp: s.timestamp || '',
+      event_id: s.event_id || '',
+      log_type: s.log_type || '',
+      message: s.message || '',
+      stack: s.stack || '',
+      embedded_exception: s.embedded_exception || '',
+      client_fingerprint: s.client_fingerprint || '',
+      fingerprint_version: s.fingerprint_version || 0,
+      inner_exceptions: s.inner_exceptions || [],
+      parsed: normalizeParsed(s.parsed),
+    },
+    occurrences: (data.occurrences || []).map(normalizeOccurrence),
+    version_distribution: data.version_distribution || [],
+    device_distribution: data.device_distribution || [],
+    trend: { interval_seconds: data.trend?.interval_seconds || 0, points: data.trend?.points || [] },
+  }
+}
+
+export async function getExceptionOccurrences(
+  fingerprint: string,
+  params: FilterParams & PaginationParams
+): Promise<ExceptionOccurrencesResponse> {
+  const { data } = await api.get<ExceptionOccurrencesResponse>('/exceptions/occurrences', {
+    params: { fingerprint, ...params },
+  })
+  return {
+    fingerprint,
+    occurrences: (data?.occurrences || []).map(normalizeOccurrence),
+    total_count: data?.total_count || 0,
+    page: data?.page || 1,
+    page_size: data?.page_size || params.page_size || 10,
+  }
+}
+
+export async function getExceptionDistribution(
+  fingerprint: string,
+  group: ExceptionGroupBy,
+  params: FilterParams
+): Promise<ExceptionDistribution> {
+  const { data } = await api.get<ExceptionDistribution>('/exceptions/distribution', {
+    params: { fingerprint, [group.kind]: group.key, ...params },
+  })
+  return {
+    fingerprint,
+    group_by: data?.group_by || '',
+    total: data?.total || 0,
+    merged: data?.merged || 0,
+    truncated: !!data?.truncated,
+    rows: data?.rows || [],
+  }
+}
+
+// Session time line (APM-15). at: the moment to anchor on (an occurrence).
+export interface SessionTimelineParams {
+  session_id: string
+  at?: string
+  start_time?: string
+  end_time?: string
+  perf?: string
+}
+
+export async function getSessionTimeline(params: SessionTimelineParams): Promise<SessionTimeline> {
+  const { data } = await api.get<SessionTimeline>('/sessions/timeline', { params })
+  const s: Partial<SessionInfo> = data?.session || {}
+  return {
+    session_id: data?.session_id || params.session_id,
+    start_time: data?.start_time || '',
+    end_time: data?.end_time || '',
+    found: !!data?.found,
+    session: {
+      session_id: s.session_id || params.session_id,
+      first_seen: s.first_seen || '',
+      last_seen: s.last_seen || '',
+      started_at: s.started_at,
+      device_id: s.device_id || '',
+      app_version: s.app_version || '',
+      platform: s.platform || '',
+      device_model: s.device_model || '',
+      os_version: s.os_version || '',
+      build_type: s.build_type || '',
+      rows: s.rows || 0,
+    },
+    items: data?.items || [],
+    counts: data?.counts || {},
+    truncated: data?.truncated || [],
+    duplicate_breadcrumbs: data?.duplicate_breadcrumbs || 0,
+    perf: data?.perf || [],
+    perf_interval_seconds: data?.perf_interval_seconds || 0,
+  }
+}
+
+export async function getDeviceSessions(
+  deviceId: string,
+  params: { start_time?: string; end_time?: string }
+): Promise<DeviceSessionsResponse> {
+  const { data } = await api.get<DeviceSessionsResponse>('/sessions', {
+    params: { device_id: deviceId, ...params },
+  })
+  return {
+    device_id: deviceId,
+    start_time: data?.start_time || '',
+    end_time: data?.end_time || '',
+    sessions: data?.sessions || [],
+    truncated: !!data?.truncated,
+  }
 }
 
 // Game context APIs (APM-5). source: perf, janks, startups, scene_loads,

@@ -1,6 +1,6 @@
 import { useQuery } from '@tanstack/react-query'
 import * as api from '../services/api'
-import type { CustomGroup, FilterParams, PaginationParams } from '../types/api'
+import type { CustomGroup, ExceptionGroupBy, ExceptionSort, FilterParams, PaginationParams, SessionTimeline } from '../types/api'
 
 export function useSummary(params: FilterParams) {
   return useQuery({
@@ -56,10 +56,59 @@ export function useCrashDetail(fingerprint: string, params: FilterParams) {
   })
 }
 
-export function useExceptions(params: FilterParams & PaginationParams) {
+export function useExceptions(
+  params: FilterParams & PaginationParams & { sort?: ExceptionSort; first_error?: string }
+) {
   return useQuery({
     queryKey: ['exceptions', params],
     queryFn: () => api.getExceptions(params),
+  })
+}
+
+// APM-11: the exception detail page
+export function useExceptionDetail(fingerprint: string, params: FilterParams) {
+  return useQuery({
+    queryKey: ['exception-detail', fingerprint, params],
+    queryFn: () => api.getExceptionDetail(fingerprint, params),
+    enabled: !!fingerprint,
+    retry: false,
+  })
+}
+
+export function useExceptionOccurrences(fingerprint: string, params: FilterParams & PaginationParams) {
+  return useQuery({
+    queryKey: ['exception-occurrences', fingerprint, params],
+    queryFn: () => api.getExceptionOccurrences(fingerprint, params),
+    enabled: !!fingerprint,
+  })
+}
+
+export function useExceptionDistribution(fingerprint: string, group: ExceptionGroupBy, params: FilterParams) {
+  return useQuery({
+    queryKey: ['exception-distribution', fingerprint, group, params],
+    queryFn: () => api.getExceptionDistribution(fingerprint, group, params),
+    enabled: !!fingerprint && (group.kind === 'by' || isValidContextKey(group.key)),
+  })
+}
+
+// APM-15: the session time line
+export function useSessionTimeline(params: api.SessionTimelineParams) {
+  return useQuery({
+    queryKey: ['session-timeline', params],
+    queryFn: () => api.getSessionTimeline(params),
+    enabled: !!params.session_id,
+    // Keep showing the session while a filter (e.g. the perf track) reloads it.
+    placeholderData: (prev: SessionTimeline | undefined) => (prev?.session_id === params.session_id ? prev : undefined),
+    retry: false,
+  })
+}
+
+export function useDeviceSessions(deviceId: string, params: { start_time?: string; end_time?: string }) {
+  return useQuery({
+    queryKey: ['device-sessions', deviceId, params],
+    queryFn: () => api.getDeviceSessions(deviceId, params),
+    enabled: !!deviceId,
+    retry: false,
   })
 }
 
