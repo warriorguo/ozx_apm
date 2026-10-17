@@ -62,10 +62,11 @@ const privacyAuditTableDDL = `CREATE TABLE IF NOT EXISTS ` + PrivacyAuditTable +
 ORDER BY (id_hash, at)`
 
 // ErrPrivacyDeleteNotPermitted: the ClickHouse account lacks ALTER DELETE.
-var ErrPrivacyDeleteNotPermitted = errors.New("the ClickHouse account may not delete rows: an admin must run " + PrivacyDeleteGrant)
+var ErrPrivacyDeleteNotPermitted = errors.New("the ClickHouse account may not delete rows: an admin must add " + PrivacyDeleteGrant +
+	" to its grants (users.d/apm.xml on n192, RELEASE.md APM-14)")
 
 // PrivacyDeleteGrant is the privilege the service account needs (RELEASE.md, APM-14).
-const PrivacyDeleteGrant = "GRANT ALTER DELETE ON ozx_apm.* TO apm"
+const PrivacyDeleteGrant = "GRANT ALTER DELETE ON ozx_apm.*"
 
 // chAccessDenied is ClickHouse's ACCESS_DENIED error code.
 const chAccessDenied = 497

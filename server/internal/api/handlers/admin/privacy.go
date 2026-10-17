@@ -277,8 +277,8 @@ func (h *PrivacyHandler) runDeletion(ctx context.Context, job *models.PrivacyDel
 		zap.Uint64("rows_remaining", result.RowsRemaining), zap.Int("tables", len(result.Tables))}
 	switch {
 	case denied != nil:
-		log.Error("privacy deletion refused by ClickHouse: the service account lacks ALTER DELETE; an admin must run "+
-			storage.PrivacyDeleteGrant+" (RELEASE.md, APM-14)", append(fields, zap.Error(denied))...)
+		log.Error("privacy deletion refused by ClickHouse: the service account lacks ALTER DELETE; an admin must add "+
+			storage.PrivacyDeleteGrant+" to its grants (RELEASE.md, APM-14)", append(fields, zap.Error(denied))...)
 	case result.Status == models.PrivacyStatusFailed:
 		log.Error("privacy deletion failed", append(fields, zap.String("error", result.Error))...)
 	default:
