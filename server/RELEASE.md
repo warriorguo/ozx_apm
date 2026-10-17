@@ -508,3 +508,125 @@ production schema is left as it is (views not doubled, view contents
 unchanged, no warnings). With a copy of the `apm` account (26.1 and 24.1;
 23.8 has no access management for `default`), `Migrate` succeeds on both
 kinds of database and only warns about the TTL.
+
+## APM-5: game context, build type, device details (additive schema change)
+
+Deploy order: **server, then admin UI, then SDK builds.** An older server
+accepts events from the new SDK but drops the new fields, so ship game builds
+with the new SDK only after this server runs everywhere.
+
+### Wire format (SDK -> server)
+
+Every event may carry, next to the existing fields:
+
+```json
+{"type":"perf_sample", ..., "build_type":"release", "gpu":"Adreno (TM) 642L",
+ "ram_class":"8GB", "net_type":"WiFi",
+ "ctx":{"levelId":"3","roomId":"r-12","masterSeed":"184467440737"}}
+```
+
+- `build_type`: `release`, `dev` or `editor`. Anything else, or absent, is
+  stored as `''` (unknown). An event without `build_type` whose platform names
+  an editor (`WindowsEditor`, `OSXEditor`, ...) is stored as `editor`, because
+  the platform itself is folded into `Windows`/`macOS`.
+- `ctx`: the game context (`ApmClient.SetContext`), a JSON object. Limits, the
+  same in SDK and server: at most 64 keys; keys 1-64 characters from
+  `[A-Za-z0-9_.-]`; values up to 256 characters. Server policy: an invalid key,
+  an object/array value or a key beyond the 64th (in key order) is dropped;
+  a longer value is truncated (on a character boundary); numbers/booleans are
+  stored as their JSON text; `null`/`""` are not stored; a `ctx` that is not
+  an object is dropped as a whole. **The event is never rejected** for its
+  context. Counts are logged on the `ingested events` line (`ctx_dropped`,
+  `ctx_truncated`) and reported as one entry in the response's `errors`.
+- `gpu` (cut to 128 characters), `ram_class`, `net_type` (cut to 32).
+
+### Schema
+
+`Migrate` adds five columns to the six event tables (also in
+`scripts/migrate.sql`):
+
+```sql
+ALTER TABLE <t> ADD COLUMN IF NOT EXISTS build_type LowCardinality(String) DEFAULT '';
+ALTER TABLE <t> ADD COLUMN IF NOT EXISTS gpu LowCardinality(String) DEFAULT '';
+ALTER TABLE <t> ADD COLUMN IF NOT EXISTS ram_class LowCardinality(String) DEFAULT '';
+ALTER TABLE <t> ADD COLUMN IF NOT EXISTS net_type LowCardinality(String) DEFAULT '';
+ALTER TABLE <t> ADD COLUMN IF NOT EXISTS ctx Map(LowCardinality(String), String);
+```
+
+Metadata only, idempotent, within the `apm` account's `ALTER ADD COLUMN`
+grant. Existing rows read `''` and an empty map. The sort keys, TTL and the
+daily views are unchanged (the views do not split by build type; nothing reads
+them). Fresh and migrated tables have identical columns in the same order
+(integration test `TestMigrate_UpgradedTablesMatchFreshInstall`).
+
+The async-insert path (`clickhouse.async_insert: true`) renders the map as
+`map(?, ?, ...)` with every key and value bound: clickhouse-go 2.17 formats a
+bound Go map with unescaped keys.
+
+### Admin API
+
+Every endpoint takes:
+
+- `build_type`: `release` (**default**), `dev`, `editor`, `unknown`, `all`.
+  `release` also shows events with an empty build type, i.e. everything sent
+  by SDKs before APM-5: they cannot be told apart, and hiding them would make
+  all existing data vanish from the default view. `unknown` shows only those.
+  Editor events from old SDKs that sent an editor platform are `editor`; old
+  SDKs that folded the editor into Windows/macOS themselves (this SDK before
+  APM-5) are `unknown`. Pre-APM-5 data expires within 30 days (TTL).
+- `ctx=key:value`, repeatable (at most 10): the same key repeated is an OR,
+  different keys an AND; `key:` (empty value) matches events without the key.
+  Keys and values are bound query arguments only. A bad `build_type` or `ctx`
+  is a 400.
+
+New endpoints (same filters; default range 7 days):
+
+- `GET /api/context/keys[?source=perf|janks|startups|scene_loads|exceptions|crashes|all]`
+  -> `{"keys":[{"key":"levelId","count":123}]}` (events carrying the key, top 200)
+- `GET /api/context/values?key=K[&source=..][&limit=N]`
+  -> `{"key":"K","values":[{"value":"3","count":40}]}` (top 50, at most 500)
+- `GET /api/context/distribution?key=K&metric=M[&fingerprint=F]`, M one of
+  `fps`, `frame_time`, `janks`, `startup`, `scene_load`, `exceptions`,
+  `crashes` -> `{"key","metric","unit","total","truncated","rows":[{"value",
+  "count","sessions","p50","p95"}]}`; `value` `""` = key not set; p50/p95 of
+  fps / ms (0 for exceptions and crashes); exceptions count occurrences
+  (`sum(count)`); top 50 values.
+
+`/api/crashes/detail` occurrences now include `build_type` and `context`.
+
+The time range is now compared at millisecond precision (it was bound with
+second precision, which dropped the events of the last second before
+`end_time`).
+
+Cost: `ctx[...]` filters and groupings read the `ctx` column (keys and
+values) of the rows in the time range; there is no index on it. Fine at the
+current volume; revisit with a materialized column for a hot key if needed.
+
+### Rolling deploy and rollback
+
+Old and new binaries can serve side by side: the old one names its insert
+columns, so its rows get the defaults; its admin API ignores the new filters
+(shows all build types). **Rollback:** redeploy the previous binary; no
+schema action. The columns stay and keep their data; the next deploy of this
+release uses it again. Dropping the columns is not needed and would lose the
+context (`ALTER TABLE <t> DROP COLUMN ...`, admin privilege).
+
+### Verified
+
+- Unit tests (`go test ./...`), integration tests on ClickHouse 26.1.12,
+  24.1.8 and 23.8.16: context normalization and limits, every event type
+  carrying the fields, legacy events, the editor platform, both insert paths
+  round-tripping keys/values with quotes and backslashes, the admin filters
+  and endpoints end to end (ingest router -> ClickHouse -> admin router),
+  defaults without time range, 400s, empty ranges, millisecond range.
+- Migration rehearsal (a script outside the repo) on each version: production schema of 111d9bf (its `migrate.sql`
+  with TTL and the four views; 23.8/24.1 with the `toDateTime()` TTL),
+  servers as a copy of the `apm` account where possible (26.1, 24.1); the
+  111d9bf binary ingesting while the new binary starts and migrates
+  (20 batches/s old format + 30 batches/s new format, six event types each):
+  every acknowledged event stored exactly once, old rows unchanged and
+  reading the defaults, new rows with build type/device/context, views not
+  doubled (`apm_fps_daily` = perf rows), TTL kept, no warnings or errors,
+  admin numbers for default/dev/unknown/all and a context filter as expected;
+  then the 111d9bf binary restarted on the migrated tables (ingest and admin
+  work) and the new binary again (no warnings).
