@@ -32,6 +32,9 @@ type fakeEventStore struct {
 	janks               []models.Jank
 	exceptions          []models.Exception
 	crashes             []models.Crash
+	customs             []models.CustomEvent
+	metricRows          []models.CustomMetric
+	failCustom          bool
 	ids                 map[string]map[string]bool
 	lookups             []storage.EventIDLookup
 	lookupErr           error
@@ -82,6 +85,26 @@ func (f *fakeEventStore) InsertCrashes(_ context.Context, c []models.Crash) erro
 	f.crashes = append(f.crashes, c...)
 	for _, e := range c {
 		f.remember(storage.TableCrashes.Name, e.EventID)
+	}
+	return nil
+}
+func (f *fakeEventStore) InsertCustomEvents(_ context.Context, e []models.CustomEvent) error {
+	if f.failCustom {
+		return errors.New("clickhouse unavailable")
+	}
+	f.customs = append(f.customs, e...)
+	for _, x := range e {
+		f.remember(storage.TableCustomEvents.Name, x.EventID)
+	}
+	return nil
+}
+func (f *fakeEventStore) InsertCustomMetrics(_ context.Context, m []models.CustomMetric) error {
+	if f.failCustom {
+		return errors.New("clickhouse unavailable")
+	}
+	f.metricRows = append(f.metricRows, m...)
+	for _, x := range m {
+		f.remember(storage.TableCustomMetrics.Name, x.EventID)
 	}
 	return nil
 }

@@ -176,10 +176,72 @@ PARTITION BY toYYYYMMDD(timestamp)
 ORDER BY (app_version, fingerprint, timestamp, event_id)
 TTL toDateTime(timestamp) + INTERVAL 30 DAY;
 
+CREATE TABLE IF NOT EXISTS apm_custom_events (
+    timestamp DateTime64(3),
+    app_version String,
+    platform String,
+    device_model String,
+    os_version String,
+    session_id String,
+    device_id String,
+    scene String,
+    name String,
+    count UInt32,
+    aggregated UInt8,
+    ctx_merged UInt8,
+    props Map(LowCardinality(String), String),
+    event_id String DEFAULT '',
+    seq UInt64 DEFAULT 0,
+    build_type LowCardinality(String) DEFAULT '',
+    gpu LowCardinality(String) DEFAULT '',
+    ram_class LowCardinality(String) DEFAULT '',
+    net_type LowCardinality(String) DEFAULT '',
+    ctx Map(LowCardinality(String), String),
+    INDEX idx_event_id event_id TYPE bloom_filter(0.001) GRANULARITY 1
+) ENGINE = ReplacingMergeTree()
+PARTITION BY toYYYYMMDD(timestamp)
+ORDER BY (app_version, name, timestamp, event_id)
+TTL toDateTime(timestamp) + INTERVAL 30 DAY;
+
+CREATE TABLE IF NOT EXISTS apm_custom_metrics (
+    timestamp DateTime64(3),
+    app_version String,
+    platform String,
+    device_model String,
+    os_version String,
+    session_id String,
+    device_id String,
+    scene String,
+    name String,
+    unit LowCardinality(String),
+    count UInt64,
+    value_sum Float64,
+    value_min Float64,
+    value_max Float64,
+    window_ms UInt32,
+    hist_version UInt8,
+    hist_keys Array(Int16),
+    hist_counts Array(UInt64),
+    ctx_merged UInt8,
+    event_id String DEFAULT '',
+    seq UInt64 DEFAULT 0,
+    build_type LowCardinality(String) DEFAULT '',
+    gpu LowCardinality(String) DEFAULT '',
+    ram_class LowCardinality(String) DEFAULT '',
+    net_type LowCardinality(String) DEFAULT '',
+    ctx Map(LowCardinality(String), String),
+    INDEX idx_event_id event_id TYPE bloom_filter(0.001) GRANULARITY 1
+) ENGINE = ReplacingMergeTree()
+PARTITION BY toYYYYMMDD(timestamp)
+ORDER BY (app_version, name, timestamp, event_id)
+TTL toDateTime(timestamp) + INTERVAL 30 DAY;
+
 -- Additive column migrations for tables created by earlier releases
 -- (APM-2: event_id, seq; APM-5: build_type, gpu, ram_class, net_type, ctx;
 -- APM-4: the exception columns from client_fingerprint to breadcrumbs;
--- APM-3: error_seq, session_ms, unhandled, ctx_merged).
+-- APM-3: error_seq, session_ms, unhandled, ctx_merged). The APM-6 tables
+-- (apm_custom_events, apm_custom_metrics) have had all their columns from
+-- the start.
 -- Metadata only (existing parts are not rewritten), idempotent.
 ALTER TABLE apm_perf_samples ADD COLUMN IF NOT EXISTS event_id String DEFAULT '';
 ALTER TABLE apm_perf_samples ADD COLUMN IF NOT EXISTS seq UInt64 DEFAULT 0;
@@ -237,6 +299,20 @@ ALTER TABLE apm_crashes ADD COLUMN IF NOT EXISTS gpu LowCardinality(String) DEFA
 ALTER TABLE apm_crashes ADD COLUMN IF NOT EXISTS ram_class LowCardinality(String) DEFAULT '';
 ALTER TABLE apm_crashes ADD COLUMN IF NOT EXISTS net_type LowCardinality(String) DEFAULT '';
 ALTER TABLE apm_crashes ADD COLUMN IF NOT EXISTS ctx Map(LowCardinality(String), String);
+ALTER TABLE apm_custom_events ADD COLUMN IF NOT EXISTS event_id String DEFAULT '';
+ALTER TABLE apm_custom_events ADD COLUMN IF NOT EXISTS seq UInt64 DEFAULT 0;
+ALTER TABLE apm_custom_events ADD COLUMN IF NOT EXISTS build_type LowCardinality(String) DEFAULT '';
+ALTER TABLE apm_custom_events ADD COLUMN IF NOT EXISTS gpu LowCardinality(String) DEFAULT '';
+ALTER TABLE apm_custom_events ADD COLUMN IF NOT EXISTS ram_class LowCardinality(String) DEFAULT '';
+ALTER TABLE apm_custom_events ADD COLUMN IF NOT EXISTS net_type LowCardinality(String) DEFAULT '';
+ALTER TABLE apm_custom_events ADD COLUMN IF NOT EXISTS ctx Map(LowCardinality(String), String);
+ALTER TABLE apm_custom_metrics ADD COLUMN IF NOT EXISTS event_id String DEFAULT '';
+ALTER TABLE apm_custom_metrics ADD COLUMN IF NOT EXISTS seq UInt64 DEFAULT 0;
+ALTER TABLE apm_custom_metrics ADD COLUMN IF NOT EXISTS build_type LowCardinality(String) DEFAULT '';
+ALTER TABLE apm_custom_metrics ADD COLUMN IF NOT EXISTS gpu LowCardinality(String) DEFAULT '';
+ALTER TABLE apm_custom_metrics ADD COLUMN IF NOT EXISTS ram_class LowCardinality(String) DEFAULT '';
+ALTER TABLE apm_custom_metrics ADD COLUMN IF NOT EXISTS net_type LowCardinality(String) DEFAULT '';
+ALTER TABLE apm_custom_metrics ADD COLUMN IF NOT EXISTS ctx Map(LowCardinality(String), String);
 
 -- APM-19: bloom_filter skip index on event_id for the ingest-time duplicate
 -- lookup. Additive, idempotent, metadata only: new parts carry the index,
@@ -250,6 +326,8 @@ ALTER TABLE apm_startups ADD INDEX IF NOT EXISTS idx_event_id event_id TYPE bloo
 ALTER TABLE apm_scene_loads ADD INDEX IF NOT EXISTS idx_event_id event_id TYPE bloom_filter(0.001) GRANULARITY 1;
 ALTER TABLE apm_exceptions ADD INDEX IF NOT EXISTS idx_event_id event_id TYPE bloom_filter(0.001) GRANULARITY 1;
 ALTER TABLE apm_crashes ADD INDEX IF NOT EXISTS idx_event_id event_id TYPE bloom_filter(0.001) GRANULARITY 1;
+ALTER TABLE apm_custom_events ADD INDEX IF NOT EXISTS idx_event_id event_id TYPE bloom_filter(0.001) GRANULARITY 1;
+ALTER TABLE apm_custom_metrics ADD INDEX IF NOT EXISTS idx_event_id event_id TYPE bloom_filter(0.001) GRANULARITY 1;
 
 -- Daily aggregations. They only see rows inserted after they were created.
 -- Need the CREATE VIEW privilege (not granted to the `apm` service account).
@@ -309,6 +387,41 @@ AS SELECT
     count() as crash_count
 FROM apm_crashes
 GROUP BY date, app_version, platform, fingerprint;
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS apm_custom_event_daily
+ENGINE = SummingMergeTree()
+PARTITION BY toYYYYMM(date)
+ORDER BY (date, app_version, platform, build_type, name)
+TTL date + INTERVAL 365 DAY
+AS SELECT
+    toDate(timestamp) as date,
+    app_version,
+    platform,
+    build_type,
+    name,
+    sum(count) as total_count
+FROM apm_custom_events
+GROUP BY date, app_version, platform, build_type, name;
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS apm_custom_metric_daily
+ENGINE = AggregatingMergeTree()
+PARTITION BY toYYYYMM(date)
+ORDER BY (date, app_version, platform, build_type, name)
+TTL date + INTERVAL 365 DAY
+AS SELECT
+    toDate(timestamp) as date,
+    app_version,
+    platform,
+    build_type,
+    name,
+    sumState(count) as samples,
+    sumState(value_sum) as total,
+    minState(value_min) as min_value,
+    maxState(value_max) as max_value,
+    sumMapState(hist_keys, hist_counts) as hist
+FROM apm_custom_metrics
+WHERE hist_version = 1
+GROUP BY date, app_version, platform, build_type, name;
 
 -- APM-14: audit record of every privacy deletion request (subject id stored
 -- as a SHA-256 hash only). See internal/storage/privacy.go.

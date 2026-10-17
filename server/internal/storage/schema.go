@@ -11,9 +11,11 @@ import (
 // Migrate runs it on every server start, and scripts/migrate.sql is generated
 // from it (go run ./cmd/schemasql > scripts/migrate.sql; a unit test fails
 // when the two differ), so a database set up either way ends up the same:
-// the six event tables with TTL, the event_id skip index and the four
-// apm_*_daily materialized views (APM-17), and the privacy deletion audit
-// table (APM-14, privacy.go).
+// the event tables with TTL, the event_id skip index and the apm_*_daily
+// materialized views (APM-17), and the privacy deletion audit table (APM-14,
+// privacy.go). APM-6 added two event tables (apm_custom_events,
+// apm_custom_metrics) and their daily views; new tables are created by
+// CREATE TABLE IF NOT EXISTS, which the service account may run.
 //
 // The event tables are ReplacingMergeTree with event_id appended to the sort
 // key (APM-19 phase B): a re-sent event has the same timestamp, app_version
@@ -184,6 +186,49 @@ var eventTableSchemas = []eventTableSchema{
 		"stack String",
 		"breadcrumbs Array(String)",
 	}},
+	// APM-6: ApmClient.TrackEvent. count: calls (1, or a count of calls beyond
+	// the SDK's per-minute budget, then aggregated = 1 and props empty);
+	// ctx_merged: the count merges calls in different game contexts.
+	{TableCustomEvents, []string{
+		"timestamp DateTime64(3)",
+		"app_version String",
+		"platform String",
+		"device_model String",
+		"os_version String",
+		"session_id String",
+		"device_id String",
+		"scene String",
+		"name String",
+		"count UInt32",
+		"aggregated UInt8",
+		"ctx_merged UInt8",
+		"props Map(LowCardinality(String), String)",
+	}},
+	// APM-6: ApmClient.RecordMetric and the timers, aggregated by the SDK per
+	// name, game context and minute: count, sum, min and max of the samples,
+	// and their histogram (internal/metrics, version hist_version: bucket keys
+	// and counts) from which the admin API computes percentiles.
+	{TableCustomMetrics, []string{
+		"timestamp DateTime64(3)",
+		"app_version String",
+		"platform String",
+		"device_model String",
+		"os_version String",
+		"session_id String",
+		"device_id String",
+		"scene String",
+		"name String",
+		"unit LowCardinality(String)",
+		"count UInt64",
+		"value_sum Float64",
+		"value_min Float64",
+		"value_max Float64",
+		"window_ms UInt32",
+		"hist_version UInt8",
+		"hist_keys Array(Int16)",
+		"hist_counts Array(UInt64)",
+		"ctx_merged UInt8",
+	}},
 }
 
 func createEventTableStatement(s eventTableSchema) string {
@@ -311,6 +356,44 @@ AS SELECT
     count() as crash_count
 FROM apm_crashes
 GROUP BY date, app_version, platform, fingerprint`},
+	// APM-6: the one-year aggregates of custom events and metrics (CLAUDE.md:
+	// technical data is kept 30 days in detail, a year aggregated). By build
+	// type, so dev and editor data can be left out. The metric view keeps
+	// the merged histogram (sumMap state), so percentiles per day can be
+	// computed from it like from the table.
+	{"apm_custom_event_daily", `CREATE MATERIALIZED VIEW IF NOT EXISTS apm_custom_event_daily
+ENGINE = SummingMergeTree()
+PARTITION BY toYYYYMM(date)
+ORDER BY (date, app_version, platform, build_type, name)
+TTL date + INTERVAL 365 DAY
+AS SELECT
+    toDate(timestamp) as date,
+    app_version,
+    platform,
+    build_type,
+    name,
+    sum(count) as total_count
+FROM apm_custom_events
+GROUP BY date, app_version, platform, build_type, name`},
+	{"apm_custom_metric_daily", `CREATE MATERIALIZED VIEW IF NOT EXISTS apm_custom_metric_daily
+ENGINE = AggregatingMergeTree()
+PARTITION BY toYYYYMM(date)
+ORDER BY (date, app_version, platform, build_type, name)
+TTL date + INTERVAL 365 DAY
+AS SELECT
+    toDate(timestamp) as date,
+    app_version,
+    platform,
+    build_type,
+    name,
+    sumState(count) as samples,
+    sumState(value_sum) as total,
+    minState(value_min) as min_value,
+    maxState(value_max) as max_value,
+    sumMapState(hist_keys, hist_counts) as hist
+FROM apm_custom_metrics
+WHERE hist_version = 1
+GROUP BY date, app_version, platform, build_type, name`},
 }
 
 // MaterializedViewNames lists the apm_*_daily views Migrate creates.
@@ -445,7 +528,9 @@ func SchemaSQL() string {
 -- Additive column migrations for tables created by earlier releases
 -- (APM-2: event_id, seq; APM-5: build_type, gpu, ram_class, net_type, ctx;
 -- APM-4: the exception columns from client_fingerprint to breadcrumbs;
--- APM-3: error_seq, session_ms, unhandled, ctx_merged).
+-- APM-3: error_seq, session_ms, unhandled, ctx_merged). The APM-6 tables
+-- (apm_custom_events, apm_custom_metrics) have had all their columns from
+-- the start.
 -- Metadata only (existing parts are not rewritten), idempotent.
 `)
 	for _, s := range eventTableSchemas {

@@ -19,7 +19,7 @@ type EventTable struct {
 	KeyColumn string
 }
 
-// The six event tables and their sort-key prefix (app_version, KeyColumn, timestamp).
+// The event tables and their sort-key prefix (app_version, KeyColumn, timestamp).
 var (
 	TablePerfSamples = EventTable{Name: "apm_perf_samples", KeyColumn: "platform"}
 	TableJanks       = EventTable{Name: "apm_janks", KeyColumn: "scene"}
@@ -27,10 +27,14 @@ var (
 	TableSceneLoads  = EventTable{Name: "apm_scene_loads", KeyColumn: "scene_name"}
 	TableExceptions  = EventTable{Name: "apm_exceptions", KeyColumn: "fingerprint"}
 	TableCrashes     = EventTable{Name: "apm_crashes", KeyColumn: "fingerprint"}
+	// APM-6
+	TableCustomEvents  = EventTable{Name: "apm_custom_events", KeyColumn: "name"}
+	TableCustomMetrics = EventTable{Name: "apm_custom_metrics", KeyColumn: "name"}
 )
 
 // EventTables lists every event table.
-var EventTables = []EventTable{TablePerfSamples, TableJanks, TableStartups, TableSceneLoads, TableExceptions, TableCrashes}
+var EventTables = []EventTable{TablePerfSamples, TableJanks, TableStartups, TableSceneLoads, TableExceptions, TableCrashes,
+	TableCustomEvents, TableCustomMetrics}
 
 // EventIDLookup asks which of EventIDs are already stored in Table.
 //

@@ -16,6 +16,8 @@ var eventTables = []string{
 	"apm_scene_loads",
 	"apm_exceptions",
 	"apm_crashes",
+	"apm_custom_events",
+	"apm_custom_metrics",
 }
 
 // Existing deployments only get new columns through additive, idempotent
@@ -185,7 +187,8 @@ func TestSchema_EventTablesHaveTTL(t *testing.T) {
 
 // APM-17: the four daily views exist in the schema and read the event tables.
 func TestSchema_MaterializedViews(t *testing.T) {
-	want := []string{"apm_fps_daily", "apm_startup_daily", "apm_exception_daily", "apm_crash_daily"}
+	want := []string{"apm_fps_daily", "apm_startup_daily", "apm_exception_daily", "apm_crash_daily",
+		"apm_custom_event_daily", "apm_custom_metric_daily"}
 	names := MaterializedViewNames()
 	if strings.Join(names, ",") != strings.Join(want, ",") {
 		t.Fatalf("views %v, want %v", names, want)

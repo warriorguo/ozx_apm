@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"go.uber.org/zap"
@@ -28,6 +29,10 @@ const (
 	maxIngestBodyBytes = 8 << 20
 	// Seconds a client should wait before retrying after a storage failure.
 	storageRetryAfterSeconds = 30
+	// maxResponseErrors bounds IngestResponse.Errors; the counts stay exact.
+	maxResponseErrors = 50
+	// maxShownTypeLength bounds an unknown type as quoted in an error.
+	maxShownTypeLength = 64
 )
 
 // insertRetryDelays is the pause before each extra attempt of a failed table
@@ -44,6 +49,8 @@ type EventStore interface {
 	InsertSceneLoads(ctx context.Context, loads []models.SceneLoad) error
 	InsertExceptions(ctx context.Context, exceptions []models.Exception) error
 	InsertCrashes(ctx context.Context, crashes []models.Crash) error
+	InsertCustomEvents(ctx context.Context, events []models.CustomEvent) error
+	InsertCustomMetrics(ctx context.Context, rows []models.CustomMetric) error
 	// ExistingEventIDs returns which of the looked-up event_ids are already stored.
 	ExistingEventIDs(ctx context.Context, q storage.EventIDLookup) (map[string]struct{}, error)
 }
@@ -90,20 +97,27 @@ type EventWrapper struct {
 //     never on a bare 4xx from a proxy or middleware.
 //
 // Events rejected by validation are counted in Rejected and are not worth
-// retrying, so they do not make Stored false.
+// retrying, so they do not make Stored false. Every rejected event has its
+// reason in Errors ("event <index>: <reason>"), among them event types this
+// server does not store ("unknown type \"x\"", "type \"http\" is not
+// supported yet"); Errors lists at most maxResponseErrors entries and then
+// how many more there were. RejectedTypes counts the rejected events of each
+// type the server does not know or store (APM-6).
 //
 // Duplicates counts events that were not inserted because their event_id was
 // already stored or appeared earlier in the batch (APM-19). They are included
 // in Accepted: the server has them, so the client must delete them.
 type IngestResponse struct {
-	Accepted   int      `json:"accepted"`
-	Duplicates int      `json:"duplicates"`
-	Rejected   int      `json:"rejected"`
-	Failed     int      `json:"failed"`
-	Stored     bool     `json:"stored"`
-	Retry      bool     `json:"retry"`
-	RejectCode string   `json:"reject_code,omitempty"`
-	Errors     []string `json:"errors,omitempty"`
+	Accepted   int `json:"accepted"`
+	Duplicates int `json:"duplicates"`
+	Rejected   int `json:"rejected"`
+	Failed     int `json:"failed"`
+	// RejectedTypes: rejected events per unsupported type (APM-6); omitted when none.
+	RejectedTypes map[string]int `json:"rejected_types,omitempty"`
+	Stored        bool           `json:"stored"`
+	Retry         bool           `json:"retry"`
+	RejectCode    string         `json:"reject_code,omitempty"`
+	Errors        []string       `json:"errors,omitempty"`
 }
 
 func writeIngestResponse(w http.ResponseWriter, status int, resp IngestResponse) {
@@ -151,16 +165,37 @@ func (h *IngestHandler) IngestEvents(w http.ResponseWriter, r *http.Request) {
 		sceneLoads  []models.SceneLoad
 		exceptions  []models.Exception
 		crashes     []models.Crash
+		customs     []models.CustomEvent
+		metricRows  []models.CustomMetric
 		errors      []string
 		rejected    int
 		hasEventIDs bool
 		ctxStats    processor.ContextStats
-		reject      = func(i int, reason string) { rejected++; errors = append(errors, "event "+strconv.Itoa(i)+": "+reason) }
-		sdkVersion  = r.Header.Get(SDKVersionHeader)
-		clientIP    = r.RemoteAddr // In production, extract from X-Forwarded-For
+		propStats   processor.ContextStats
+		rejTypes    map[string]int
+		moreErrors  int
+		addError    = func(msg string) {
+			if len(errors) < maxResponseErrors {
+				errors = append(errors, msg)
+			} else {
+				moreErrors++
+			}
+		}
+		reject     = func(i int, reason string) { rejected++; addError("event " + strconv.Itoa(i) + ": " + reason) }
+		rejectType = func(i int, typ, reason string) {
+			if rejTypes == nil {
+				rejTypes = map[string]int{}
+			}
+			if len(rejTypes) < maxResponseErrors {
+				rejTypes[typ]++
+			}
+			reject(i, reason)
+		}
+		sdkVersion = r.Header.Get(SDKVersionHeader)
+		clientIP   = r.RemoteAddr // In production, extract from X-Forwarded-For
 	)
 	if salvaged {
-		errors = append(errors, "batch was not valid JSON; salvaged the well-formed events")
+		addError("batch was not valid JSON; salvaged the well-formed events")
 	}
 
 	for i, rawEvent := range rawEvents {
@@ -279,15 +314,62 @@ func (h *IngestHandler) IngestEvents(w http.ResponseWriter, r *http.Request) {
 			}
 			crashes = append(crashes, event)
 
+		case models.EventTypeCustomEvent:
+			var event models.CustomEvent
+			if err := json.Unmarshal(rawEvent, &event); err != nil {
+				reject(i, "invalid fields")
+				continue
+			}
+			event.Timestamp = timestamp
+			ctxStats.Add(processor.NormalizeEventContext(&event.EventContext, event.Platform))
+			propStats.Add(processor.NormalizeCustomEvent(&event))
+			event.Platform = h.enricher.NormalizePlatform(event.Platform)
+			event.DeviceModel = h.enricher.NormalizeDeviceModel(event.DeviceModel)
+			if err := h.validator.ValidateCustomEvent(&event); err != nil {
+				reject(i, err.Error())
+				continue
+			}
+			customs = append(customs, event)
+
+		case models.EventTypeCustomMetric:
+			var event models.CustomMetric
+			if err := json.Unmarshal(rawEvent, &event); err != nil {
+				reject(i, "invalid fields")
+				continue
+			}
+			event.Timestamp = timestamp
+			ctxStats.Add(processor.NormalizeEventContext(&event.EventContext, event.Platform))
+			event.Platform = h.enricher.NormalizePlatform(event.Platform)
+			event.DeviceModel = h.enricher.NormalizeDeviceModel(event.DeviceModel)
+			if err := h.validator.ValidateCustomMetric(&event); err != nil {
+				reject(i, err.Error())
+				continue
+			}
+			metricRows = append(metricRows, event)
+
+		case models.EventTypeAssetLoad, models.EventTypeHTTP:
+			// Planned (asset loads: APM-7, HTTP timings: APM-8), not stored yet:
+			// rejected with a reason, never silently dropped.
+			rejectType(i, wrapper.Type, "type "+strconv.Quote(wrapper.Type)+" is not supported yet")
+
 		default:
-			reject(i, "unknown type")
+			shown := wrapper.Type
+			if len(shown) > maxShownTypeLength {
+				shown = shown[:maxShownTypeLength] + "..."
+			}
+			shown = strings.ToValidUTF8(shown, "?")
+			rejectType(i, shown, "unknown type "+strconv.Quote(shown))
 		}
 	}
 
 	if ctxStats.Dropped > 0 || ctxStats.Truncated > 0 {
 		// The events are kept; only the offending context entries are not.
-		errors = append(errors, "context: "+strconv.Itoa(ctxStats.Dropped)+" entries dropped, "+
-			strconv.Itoa(ctxStats.Truncated)+" values truncated (limits: 64 keys of [A-Za-z0-9_.-]{1,64}, values up to 256 characters)")
+		addError("context: " + strconv.Itoa(ctxStats.Dropped) + " entries dropped, " +
+			strconv.Itoa(ctxStats.Truncated) + " values truncated (limits: 64 keys of [A-Za-z0-9_.-]{1,64}, values up to 256 characters)")
+	}
+	if propStats.Dropped > 0 || propStats.Truncated > 0 {
+		addError("props: " + strconv.Itoa(propStats.Dropped) + " entries dropped, " +
+			strconv.Itoa(propStats.Truncated) + " values truncated (the context's limits)")
 	}
 
 	// Drop events that are already stored or repeated in this batch (APM-19).
@@ -319,6 +401,12 @@ func (h *IngestHandler) IngestEvents(w http.ResponseWriter, r *http.Request) {
 	crashes, d = dedupe(ctx, h.repo, h.logger, storage.TableCrashes, crashes,
 		func(e *models.Crash) eventKey { return eventKey{e.EventID, e.AppVersion, e.Fingerprint, e.Timestamp} })
 	add(d)
+	customs, d = dedupe(ctx, h.repo, h.logger, storage.TableCustomEvents, customs,
+		func(e *models.CustomEvent) eventKey { return eventKey{e.EventID, e.AppVersion, e.Name, e.Timestamp} })
+	add(d)
+	metricRows, d = dedupe(ctx, h.repo, h.logger, storage.TableCustomMetrics, metricRows,
+		func(e *models.CustomMetric) eventKey { return eventKey{e.EventID, e.AppVersion, e.Name, e.Timestamp} })
+	add(d)
 	if dups.total() > 0 {
 		h.logger.Info("dropped duplicate events",
 			zap.Int("duplicates", dups.total()),
@@ -338,6 +426,8 @@ func (h *IngestHandler) IngestEvents(w http.ResponseWriter, r *http.Request) {
 	assignServerEventIDs(sceneLoads, func(e *models.SceneLoad) *string { return &e.EventID })
 	assignServerEventIDs(exceptions, func(e *models.Exception) *string { return &e.EventID })
 	assignServerEventIDs(crashes, func(e *models.Crash) *string { return &e.EventID })
+	assignServerEventIDs(customs, func(e *models.CustomEvent) *string { return &e.EventID })
+	assignServerEventIDs(metricRows, func(e *models.CustomMetric) *string { return &e.EventID })
 
 	// Insert events into ClickHouse. Each table insert is retried here
 	// before answering. Only events whose insert succeeded count as accepted,
@@ -351,7 +441,7 @@ func (h *IngestHandler) IngestEvents(w http.ResponseWriter, r *http.Request) {
 		if err := h.insertWithRetry(ctx, fn); err != nil {
 			h.logger.Error("failed to insert "+kind, zap.Error(err), zap.Int("count", n), zap.String("sdk_version", sdkVersion))
 			failed += n
-			errors = append(errors, "storage error: "+kind)
+			addError("storage error: " + kind)
 			return
 		}
 		accepted += n
@@ -363,14 +453,20 @@ func (h *IngestHandler) IngestEvents(w http.ResponseWriter, r *http.Request) {
 	insert("scene loads", len(sceneLoads), func() error { return h.repo.InsertSceneLoads(ctx, sceneLoads) })
 	insert("exceptions", len(exceptions), func() error { return h.repo.InsertExceptions(ctx, exceptions) })
 	insert("crashes", len(crashes), func() error { return h.repo.InsertCrashes(ctx, crashes) })
+	insert("custom events", len(customs), func() error { return h.repo.InsertCustomEvents(ctx, customs) })
+	insert("custom metrics", len(metricRows), func() error { return h.repo.InsertCustomMetrics(ctx, metricRows) })
 
+	if moreErrors > 0 {
+		errors = append(errors, "... and "+strconv.Itoa(moreErrors)+" more")
+	}
 	resp := IngestResponse{
-		Accepted:   accepted,
-		Duplicates: dups.total(),
-		Rejected:   rejected,
-		Failed:     failed,
-		Stored:     failed == 0,
-		Errors:     errors,
+		Accepted:      accepted,
+		Duplicates:    dups.total(),
+		Rejected:      rejected,
+		Failed:        failed,
+		Stored:        failed == 0,
+		RejectedTypes: rejTypes,
+		Errors:        errors,
 	}
 	status := http.StatusOK
 
@@ -399,6 +495,7 @@ func (h *IngestHandler) IngestEvents(w http.ResponseWriter, r *http.Request) {
 		zap.Int("failed", failed),
 		zap.Int("ctx_dropped", ctxStats.Dropped),
 		zap.Int("ctx_truncated", ctxStats.Truncated),
+		zap.Any("rejected_types", rejTypes),
 		zap.String("sdk_version", sdkVersion),
 		zap.String("client_ip", clientIP),
 	)
