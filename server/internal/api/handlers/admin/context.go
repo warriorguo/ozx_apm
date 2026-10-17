@@ -31,7 +31,8 @@ func writeJSON(w http.ResponseWriter, v interface{}) {
 }
 
 // filterAndSource parses the filter and the "source" parameter (perf, janks,
-// startups, scene_loads, exceptions, crashes, all); false after writing a 400.
+// startups, scene_loads, exceptions, crashes, custom_events, custom_metrics,
+// all); false after writing a 400.
 func (h *ContextHandler) filterAndSource(w http.ResponseWriter, r *http.Request) (models.AdminFilter, string, bool) {
 	q := r.URL.Query()
 	f, err := parseAdminFilter(q, contextDefaultRange)
@@ -41,7 +42,7 @@ func (h *ContextHandler) filterAndSource(w http.ResponseWriter, r *http.Request)
 	}
 	source := q.Get("source")
 	if !storage.ValidContextSource(source) {
-		http.Error(w, "source must be one of perf, janks, startups, scene_loads, exceptions, crashes, all", http.StatusBadRequest)
+		http.Error(w, "source must be one of perf, janks, startups, scene_loads, exceptions, crashes, custom_events, custom_metrics, all", http.StatusBadRequest)
 		return f, "", false
 	}
 	return f, source, true

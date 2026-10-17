@@ -730,6 +730,9 @@ var contextSources = map[string]string{
 	"scene_loads": "apm_scene_loads",
 	"exceptions":  "apm_exceptions",
 	"crashes":     "apm_crashes",
+	// APM-6
+	"custom_events":  "apm_custom_events",
+	"custom_metrics": "apm_custom_metrics",
 }
 
 // ValidContextSource reports whether source names a context source.
