@@ -514,9 +514,12 @@ namespace OzxApm.Tests
         {
             GameContext.Set("roomId", "r-1");
             string message = RoomError(5);
+            // A local, not the constant: Mono creates a string literal the first
+            // time the lambda runs, which the constraint would count.
+            string stack = Stack;
             Error(message);
             Error(message);
-            Assert.That(() => _collector.HandleLogMessage(message, Stack, LogType.Error), Is.Not.AllocatingGCMemory());
+            Assert.That(() => _collector.HandleLogMessage(message, stack, LogType.Error), Is.Not.AllocatingGCMemory());
         }
 
         [Test]
