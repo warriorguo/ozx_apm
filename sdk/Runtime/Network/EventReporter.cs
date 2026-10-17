@@ -171,6 +171,15 @@ namespace OzxApm.Network
         {
             float now = _clock();
 
+            // Consent withdrawn: nothing may leave the device any more, not even
+            // a request that was already built or is under way. ApmClient cancels
+            // synchronously when consent changes; this covers any other path.
+            if (_state != State.Idle && !_config.TechnicalAllowed)
+            {
+                CancelInFlight();
+                return;
+            }
+
             if (now >= _nextReachabilityCheck)
             {
                 _nextReachabilityCheck = now + ReachabilityPollSeconds;
@@ -188,7 +197,7 @@ namespace OzxApm.Network
             {
                 case State.Idle:
                     if ((now >= _nextAttemptTime || (now >= _highValueAttemptTime && _storage.HighValueWaiting)) &&
-                        now >= _uploadsAllowedAt && _config.Consent == ConsentState.Granted)
+                        now >= _uploadsAllowedAt && _config.TechnicalAllowed)
                     {
                         if (!_firstRequestCreated)
                             _storage.ReleaseForFirstUpload();
@@ -204,9 +213,10 @@ namespace OzxApm.Network
                         poll = _storage.PollUpload(out batch);
                     if (poll == UploadPoll.Ready)
                     {
-                        if (_config.Consent != ConsentState.Granted)
+                        if (!_config.TechnicalAllowed)
                         {
-                            // Consent was withdrawn meanwhile: do not send.
+                            // Consent was withdrawn meanwhile: do not send. (Only
+                            // reachable if the check above was skipped this frame.)
                             _storage.CompleteUpload(batch, UploadOutcome.Retry);
                             _state = State.Idle;
                         }
@@ -280,6 +290,20 @@ namespace OzxApm.Network
         /// </summary>
         public void Shutdown()
         {
+            CancelInFlight();
+        }
+
+        /// <summary>
+        /// Drops the current request, whatever its stage (APM-14: consent withdrawn,
+        /// device id reset): a batch being prepared is not sent, a request that was
+        /// built is never started, one under way is aborted. Its batch goes back to
+        /// storage as not delivered (Clear deletes it there, or it is sent once
+        /// consent is granted again). A request whose bytes already reached the
+        /// server before the abort may still be stored there: server-side deletion
+        /// (RELEASE.md, APM-14) covers that. Main thread.
+        /// </summary>
+        public void CancelInFlight()
+        {
             DisposeFinished();
             if (_request != null)
             {
@@ -290,7 +314,7 @@ namespace OzxApm.Network
                 }
                 catch
                 {
-                    // Shutting down; nothing to do.
+                    // Dropping it anyway; nothing more to do.
                 }
                 _request = null;
             }

@@ -182,10 +182,84 @@ namespace OzxApm.Core
         public float LowValueUploadIntervalSeconds { get; set; } = 120.0f;
 
         /// <summary>
-        /// Player consent. Nothing is enqueued, written to disk or uploaded unless Granted.
-        /// Defaults to Granted (pre-APM-14 behaviour). Change at runtime with ApmClient.SetConsent.
+        /// Technical consent (crashes, exceptions, performance) until the player
+        /// makes a choice with ApmClient.SetConsent. A stored choice (RememberConsent)
+        /// wins over this default. Granted by default (markets where diagnostics
+        /// need no opt-in); set it to Undecided where collection needs consent first.
         /// </summary>
-        public ConsentState Consent { get; set; } = ConsentState.Granted;
+        public ConsentState DefaultTechnicalConsent { get; set; } = ConsentState.Granted;
+
+        /// <summary>
+        /// Analytics (operations) consent until the player makes a choice.
+        /// Undecided by default: nothing is collected until the game asks.
+        /// </summary>
+        public ConsentState DefaultAnalyticsConsent { get; set; } = ConsentState.Undecided;
+
+        /// <summary>
+        /// Store the player's choice (SetConsent) in PlayerPrefs and use it on the
+        /// next launch instead of the defaults. Turn it off if the game keeps the
+        /// choice itself and calls ApmClient.SetConsent at every launch.
+        /// </summary>
+        public bool RememberConsent { get; set; } = true;
+
+        /// <summary>
+        /// Opt-in preset (e.g. mainland China): both categories Undecided, so the
+        /// SDK collects, stores and uploads nothing until the game calls
+        /// ApmClient.SetConsent. Returns this config.
+        /// </summary>
+        public ApmConfig UseOptInConsent()
+        {
+            DefaultTechnicalConsent = ConsentState.Undecided;
+            DefaultAnalyticsConsent = ConsentState.Undecided;
+            return this;
+        }
+
+        /// <summary>
+        /// Pre-APM-14 single consent: reads the technical state; setting it sets
+        /// both defaults and the current state of both categories. Prefer the
+        /// Default*Consent properties and ApmClient.SetConsent(category, state).
+        /// </summary>
+        public ConsentState Consent
+        {
+            get => GetConsent(ConsentCategory.Technical);
+            set
+            {
+                DefaultTechnicalConsent = value;
+                DefaultAnalyticsConsent = value;
+                SetConsentState(ConsentCategory.Technical, value);
+                SetConsentState(ConsentCategory.Analytics, value);
+            }
+        }
+
+        // Current state per category, read from any thread (storage worker,
+        // log callbacks). -1: not set yet, the default applies.
+        private int _technicalConsent = -1;
+        private int _analyticsConsent = -1;
+
+        /// <summary>Current consent of a category (the default until one is set).</summary>
+        internal ConsentState GetConsent(ConsentCategory category)
+        {
+            int value = category == ConsentCategory.Analytics
+                ? System.Threading.Volatile.Read(ref _analyticsConsent)
+                : System.Threading.Volatile.Read(ref _technicalConsent);
+            if (value >= 0)
+                return (ConsentState)value;
+            return category == ConsentCategory.Analytics ? DefaultAnalyticsConsent : DefaultTechnicalConsent;
+        }
+
+        internal void SetConsentState(ConsentCategory category, ConsentState state)
+        {
+            if (category == ConsentCategory.Analytics)
+                System.Threading.Volatile.Write(ref _analyticsConsent, (int)state);
+            else
+                System.Threading.Volatile.Write(ref _technicalConsent, (int)state);
+        }
+
+        /// <summary>
+        /// True while technical data may be collected, stored and uploaded. One
+        /// volatile read: checked on every enqueue, write and upload.
+        /// </summary>
+        internal bool TechnicalAllowed => GetConsent(ConsentCategory.Technical) == ConsentState.Granted;
 
         /// <summary>
         /// Request timeout in seconds

@@ -37,7 +37,11 @@ namespace OzxApm.Core
 
         // Read by Log() from any thread; avoids touching the UnityEngine.Object off the main thread.
         private static volatile ApmConfig _logConfig;
-        private static ConsentState? _consentBeforeInit;
+        // The game's latest SetConsent per ConsentCategory in this process (-1: none);
+        // it wins over the stored choice and the config default (ResolveConsent).
+        private static readonly int[] _explicitConsent = { -1, -1 };
+        private static bool _resetDeviceIdBeforeInit;
+        private static readonly ApmConfig s_builtInDefaults = new ApmConfig();
         private static int _internalErrorCount;
 
         private ApmConfig _config;
@@ -57,6 +61,8 @@ namespace OzxApm.Core
         private List<ICollector> _collectors = new List<ICollector>();
         private string _currentScene;
         private bool _isStopping;
+        // Collectors run (technical consent Granted). Main thread.
+        private bool _collecting;
 
         // Static per device: read once at Initialize instead of per event
         // (SystemInfo strings cross into native code and allocate on every call).
@@ -92,7 +98,9 @@ namespace OzxApm.Core
                             // Create new GameObject
                             var go = new GameObject("[OzxApm]");
                             _instance = go.AddComponent<ApmClient>();
-                            DontDestroyOnLoad(go);
+                            // Only valid in play mode (EditMode tests create the client too).
+                            if (Application.isPlaying)
+                                DontDestroyOnLoad(go);
                         }
                     }
                     return _instance;
@@ -146,45 +154,238 @@ namespace OzxApm.Core
             Initialize(config);
         }
 
+        // ------------------------------------------------------------------
+        // Privacy consent (APM-14)
+        //
+        // Two categories, each Undecided / Granted / Denied (ConsentCategory,
+        // ConsentState). Technical covers everything the SDK collects today;
+        // Analytics is for APM-12 operations events (none collected yet).
+        //
+        // The state of a category is, in this order: the game's SetConsent call,
+        // the choice stored in PlayerPrefs by an earlier SetConsent
+        // (ApmConfig.RememberConsent), the ApmConfig default
+        // (DefaultTechnicalConsent: Granted, DefaultAnalyticsConsent: Undecided;
+        // ApmConfig.UseOptInConsent makes both Undecided).
+        //
+        // Technical not Granted: collectors are stopped (no per-frame work, no
+        // allocation), nothing is enqueued, written or uploaded, and a request
+        // under way is aborted. Undecided keeps what is already stored (it is
+        // uploaded once consent is granted); Denied deletes it: queued and stored
+        // events, quarantined batches, the sequence file, the event directory,
+        // the network debug log, and the device/session ids in PlayerPrefs.
+        // ------------------------------------------------------------------
+
         /// <summary>
-        /// Current consent state. Events are only collected, stored and uploaded when Granted.
+        /// Technical consent (pre-APM-14 single consent). Same as
+        /// GetConsent(ConsentCategory.Technical).
         /// </summary>
-        public static ConsentState Consent
+        public static ConsentState Consent => GetConsent(ConsentCategory.Technical);
+
+        /// <summary>
+        /// Current consent of a category. Before Initialize: the game's
+        /// SetConsent, else the stored choice, else the built-in default
+        /// (Technical Granted, Analytics Undecided). Main thread.
+        /// </summary>
+        public static ConsentState GetConsent(ConsentCategory category)
         {
-            get
+            try
             {
-                if (_isInitialized && _instance != null && _instance._config != null)
-                    return _instance._config.Consent;
-                return _consentBeforeInit ?? ConsentState.Granted;
+                var config = _logConfig;
+                if (_isInitialized && config != null)
+                    return config.GetConsent(category);
+                return ResolveConsent(config ?? s_builtInDefaults, category);
+            }
+            catch (Exception ex)
+            {
+                ReportInternalError("GetConsent", ex);
+                return ConsentState.Undecided;
             }
         }
 
         /// <summary>
-        /// Sets the player's consent. Takes effect immediately: while not Granted,
-        /// nothing is enqueued, written to disk or uploaded. Can be called before
-        /// Initialize. Main thread. Until consent is Granted the SDK also writes no
-        /// PlayerPrefs (device/session ids are kept in memory); they are stored when
-        /// consent is granted. Persisting the choice and deleting already stored
-        /// data on Denied are part of APM-14.
+        /// Sets the consent of every category (pre-APM-14 single consent).
+        /// Same as SetConsent(category, state) for Technical and Analytics.
         /// </summary>
         public static void SetConsent(ConsentState state)
         {
-            _consentBeforeInit = state;
-            var config = _logConfig;
-            if (config != null)
-                config.Consent = state;
+            SetConsentInternal(true, true, state);
+        }
 
-            if (state == ConsentState.Granted && _isInitialized && !ReferenceEquals(_instance, null))
+        /// <summary>
+        /// Sets the player's consent for one category. Takes effect at once and is
+        /// stored for the next launches (ApmConfig.RememberConsent). Can be called
+        /// before Initialize. Main thread.
+        ///
+        /// Technical: Granted starts collecting and uploading; Undecided stops
+        /// both and keeps what is stored; Denied stops both and deletes every
+        /// stored event and SDK file (asynchronously, on the storage thread,
+        /// within milliseconds) and the stored device/session ids. Events still
+        /// queued or being uploaded when it is called are never sent; a request
+        /// whose bytes had already reached the server may have been stored there
+        /// (delete it with the admin API, RELEASE.md APM-14). Calling it with
+        /// Denied again deletes again.
+        ///
+        /// Analytics: only stored and reported today (GetConsent, GetStats); the
+        /// SDK collects no analytics events yet (APM-12 will, and only when Granted).
+        /// </summary>
+        public static void SetConsent(ConsentCategory category, ConsentState state)
+        {
+            SetConsentInternal(category == ConsentCategory.Technical, category == ConsentCategory.Analytics, state);
+        }
+
+        private static void SetConsentInternal(bool technical, bool analytics, ConsentState state)
+        {
+            try
             {
-                try
+                if (!ConsentStore.IsValid(state))
                 {
-                    _instance._sessionManager?.OnConsentGranted();
+                    Log(LogLevel.Warning, $"SetConsent: invalid state {(int)state} ignored");
+                    return;
                 }
-                catch (Exception ex)
-                {
-                    ReportInternalError("SetConsent", ex);
-                }
+                if (technical)
+                    _explicitConsent[(int)ConsentCategory.Technical] = (int)state;
+                if (analytics)
+                    _explicitConsent[(int)ConsentCategory.Analytics] = (int)state;
+
+                // Before Initialize the choice is applied (and stored) by Initialize.
+                if (_isInitialized && !ReferenceEquals(_instance, null))
+                    _instance.ApplyConsent(technical, analytics, state);
             }
+            catch (Exception ex)
+            {
+                ReportInternalError("SetConsent", ex);
+            }
+        }
+
+        /// <summary>The consent a category starts with (see the section comment).</summary>
+        private static ConsentState ResolveConsent(ApmConfig config, ConsentCategory category)
+        {
+            int explicitState = _explicitConsent[(int)category];
+            if (explicitState >= 0)
+                return (ConsentState)explicitState;
+            if (config.RememberConsent && ConsentStore.TryLoad(category, out var stored))
+                return stored;
+            var fallback = category == ConsentCategory.Analytics ? config.DefaultAnalyticsConsent : config.DefaultTechnicalConsent;
+            return ConsentStore.IsValid(fallback) ? fallback : ConsentState.Undecided;
+        }
+
+        private void ApplyConsent(bool technical, bool analytics, ConsentState state)
+        {
+            // State first: from here on no thread enqueues, writes or uploads.
+            if (analytics)
+                _config.SetConsentState(ConsentCategory.Analytics, state);
+            if (technical)
+            {
+                _config.SetConsentState(ConsentCategory.Technical, state);
+                OnTechnicalConsent(state);
+            }
+            Log(LogLevel.Info, $"Consent {(technical && analytics ? "all" : technical ? "technical" : "analytics")}: {state}");
+            StoreExplicitConsent();
+        }
+
+        private void OnTechnicalConsent(ConsentState state)
+        {
+            if (state == ConsentState.Granted)
+            {
+                _sessionManager.OnConsentGranted();
+                SetCollecting(true);
+                _reporter.RetryNow();
+                return;
+            }
+
+            SetCollecting(false);
+            _reporter.CancelInFlight();
+            if (state == ConsentState.Denied)
+                DeleteLocalTechnicalData();
+        }
+
+        /// <summary>Denied: nothing of the technical data stays on the device.</summary>
+        private void DeleteLocalTechnicalData()
+        {
+            _offlineStorage.Clear();
+            _networkLogger?.ClearLogs();
+            _sessionManager.OnConsentDenied();
+        }
+
+        /// <summary>Writes the game's SetConsent choices to PlayerPrefs (RememberConsent).</summary>
+        private void StoreExplicitConsent()
+        {
+            if (!_config.RememberConsent)
+                return;
+            try
+            {
+                bool changed = false;
+                for (int c = 0; c < _explicitConsent.Length; c++)
+                {
+                    if (_explicitConsent[c] >= 0)
+                        changed |= ConsentStore.Set((ConsentCategory)c, (ConsentState)_explicitConsent[c]);
+                }
+                if (changed)
+                    PlayerPrefs.Save();
+            }
+            catch (Exception ex)
+            {
+                ReportInternalError("StoreConsent", ex);
+            }
+        }
+
+        /// <summary>
+        /// The anonymous device id sent with every event: what the player gives
+        /// support to have their data deleted (RELEASE.md, APM-14). Main thread.
+        /// </summary>
+        public static string GetDeviceId()
+        {
+            try
+            {
+                if (_isInitialized && !ReferenceEquals(_instance, null) && _instance._sessionManager != null)
+                    return _instance._sessionManager.DeviceId;
+                return DeviceInfo.GetDeviceId(false);
+            }
+            catch (Exception ex)
+            {
+                ReportInternalError("GetDeviceId", ex);
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// Replaces the anonymous device id with a new random one (APM-14) and
+        /// returns it. Also starts a new session (session ids are random and never
+        /// derived from the device id, so nothing links the old id to the new one),
+        /// deletes every locally stored event (they carry the old id), aborts an
+        /// upload under way, and restarts the event sequence at 1. The new id is
+        /// stored only with technical consent. Data already on the server keeps the
+        /// old id: get it with GetDeviceId first and delete it with the admin API.
+        /// Works before Initialize. Main thread.
+        /// </summary>
+        public static string ResetDeviceId()
+        {
+            try
+            {
+                if (_isInitialized && !ReferenceEquals(_instance, null))
+                    return _instance.ResetDeviceIdInternal();
+
+                // Before Initialize: Initialize clears the stored events and stores
+                // the new id if consent allows.
+                _resetDeviceIdBeforeInit = true;
+                DeviceInfo.ResetDeviceId(false);
+                return DeviceInfo.GetDeviceId(false);
+            }
+            catch (Exception ex)
+            {
+                ReportInternalError("ResetDeviceId", ex);
+                return null;
+            }
+        }
+
+        private string ResetDeviceIdInternal()
+        {
+            _reporter.CancelInFlight();
+            _offlineStorage.Clear(true);
+            _sessionManager.ResetDeviceId();
+            _sessionManager.StartNewSession();
+            Log(LogLevel.Info, "Device id reset; local events deleted");
+            return _sessionManager.DeviceId;
         }
 
         /// <summary>
@@ -293,11 +494,11 @@ namespace OzxApm.Core
         }
 
         /// <summary>
-        /// Records a custom breadcrumb for crash context
+        /// Records a custom breadcrumb for crash context. Ignored without technical consent.
         /// </summary>
         public static void RecordBreadcrumb(string message)
         {
-            if (_isInitialized && Instance._exceptionCollector != null)
+            if (_isInitialized && Instance._collecting && Instance._exceptionCollector != null)
             {
                 Instance._exceptionCollector.RecordBreadcrumb(message);
             }
@@ -375,8 +576,6 @@ namespace OzxApm.Core
         private void InitializeInternal(ApmConfig config)
         {
             _config = config;
-            if (_consentBeforeInit.HasValue)
-                _config.Consent = _consentBeforeInit.Value;
             _logConfig = config;
 
             if (!_config.Enabled)
@@ -385,11 +584,17 @@ namespace OzxApm.Core
                 return;
             }
 
+            // Consent first (PlayerPrefs reads; a write only for a SetConsent made
+            // before Initialize): everything below obeys it.
+            _config.SetConsentState(ConsentCategory.Technical, ResolveConsent(_config, ConsentCategory.Technical));
+            _config.SetConsentState(ConsentCategory.Analytics, ResolveConsent(_config, ConsentCategory.Analytics));
+            StoreExplicitConsent();
+
             Log(LogLevel.Info, $"Initializing APM SDK v{SdkVersion} for {config.AppVersion}");
 
             // Initialize core components. None of these read or parse stored
             // events on this thread; the storage worker does that in the background.
-            _sessionManager = new SessionManager(() => _config.Consent == ConsentState.Granted);
+            _sessionManager = new SessionManager(() => _config.TechnicalAllowed);
             _platform = DeviceInfo.GetPlatformString();
             _deviceModel = DeviceInfo.GetDeviceModel();
             _osVersion = DeviceInfo.GetOSVersion();
@@ -399,9 +604,23 @@ namespace OzxApm.Core
             _netType = DeviceInfo.GetNetworkType();
             _nextNetTypeCheck = Time.realtimeSinceStartup + NetTypePollSeconds;
             _uploadsEnabled = !Application.isEditor || config.UploadInEditor;
-            _offlineStorage = new OfflineStorage(config);
+            _offlineStorage = StoragePathForTests != null
+                ? new OfflineStorage(config, StoragePathForTests, false)
+                : new OfflineStorage(config);
             _networkLogger = new NetworkLogger(config);
             _reporter = new EventReporter(config, _offlineStorage, _networkLogger);
+            if (_resetDeviceIdBeforeInit)
+            {
+                // ResetDeviceId before Initialize: stored events carry the old id.
+                _resetDeviceIdBeforeInit = false;
+                _offlineStorage.Clear(true);
+            }
+            if (_config.GetConsent(ConsentCategory.Technical) == ConsentState.Denied)
+            {
+                // Nothing may stay on the device while denied (files left by a
+                // crash right after SetConsent(Denied), or by an older SDK).
+                DeleteLocalTechnicalData();
+            }
             _offlineStorage.Start();
 
             // Initialize collectors
@@ -412,7 +631,7 @@ namespace OzxApm.Core
             _currentScene = SceneManager.GetActiveScene().name;
 
             _isInitialized = true;
-            Log(LogLevel.Info, $"APM SDK initialized successfully (build type {_buildType})");
+            Log(LogLevel.Info, $"APM SDK initialized successfully (build type {_buildType}, consent technical {_config.GetConsent(ConsentCategory.Technical)}, analytics {_config.GetConsent(ConsentCategory.Analytics)})");
             if (!_uploadsEnabled)
                 Log(LogLevel.Info, "Running in the Editor: events are stored but not uploaded (ApmConfig.UploadInEditor)");
         }
@@ -452,18 +671,53 @@ namespace OzxApm.Core
                 _collectors.Add(_exceptionCollector);
             }
 
-            // Start all collectors
             _collectorMarkers.Clear();
             foreach (var collector in _collectors)
-            {
                 _collectorMarkers.Add(new ProfilerMarker("OzxApm.Collector." + collector.GetType().Name));
+
+            // The startup tracker measures this launch whatever the consent (it
+            // keeps a few timestamps in memory; its event is dropped at enqueue
+            // without consent). The others only run with technical consent.
+            if (_startupTracker != null)
+            {
                 try
                 {
-                    collector.Start();
+                    _startupTracker.Start();
                 }
                 catch (Exception ex)
                 {
-                    ReportInternalError(collector.GetType().Name + ".Start", ex);
+                    ReportInternalError("StartupTracker.Start", ex);
+                }
+            }
+            _collecting = false;
+            SetCollecting(_config.TechnicalAllowed);
+        }
+
+        /// <summary>
+        /// Starts or stops every collector but the startup tracker (technical
+        /// consent). A stopped collector costs nothing per frame and holds no
+        /// pending data: ExceptionCollector.Stop hands its pending repeat counts to
+        /// EnqueueEvent, which drops them without consent.
+        /// </summary>
+        private void SetCollecting(bool on)
+        {
+            if (_collecting == on)
+                return;
+            _collecting = on;
+            foreach (var collector in _collectors)
+            {
+                if (ReferenceEquals(collector, _startupTracker))
+                    continue;
+                try
+                {
+                    if (on)
+                        collector.Start();
+                    else
+                        collector.Stop();
+                }
+                catch (Exception ex)
+                {
+                    ReportInternalError(collector.GetType().Name + (on ? ".Start" : ".Stop"), ex);
                 }
             }
         }
@@ -477,7 +731,8 @@ namespace OzxApm.Core
             var stats = new ApmStats
             {
                 Initialized = _isInitialized,
-                Consent = Consent,
+                Consent = GetConsent(ConsentCategory.Technical),
+                AnalyticsConsent = GetConsent(ConsentCategory.Analytics),
                 ContextKeys = GameContext.Count,
                 ContextRejected = GameContext.RejectedCount,
                 ContextTruncated = GameContext.TruncatedCount
@@ -486,6 +741,7 @@ namespace OzxApm.Core
                 return stats;
 
             var client = _instance;
+            stats.Collecting = client._collecting;
             if (client._offlineStorage != null)
             {
                 stats.PendingEvents = client._offlineStorage.PendingEventCount;
@@ -511,6 +767,34 @@ namespace OzxApm.Core
 
         private long _lastUpdateTicks;
 
+        // ---- Test seams (EditMode) ----
+
+        /// <summary>Storage directory for the next Initialize; the worker is then pumped by the test.</summary>
+        internal static string StoragePathForTests;
+        internal OfflineStorage StorageForTests => _offlineStorage;
+        internal EventReporter ReporterForTests => _reporter;
+        internal void UpdateForTests() => Update();
+
+        /// <summary>Destroys the client and forgets every static state (consent calls, shutdown flag).</summary>
+        internal static void ResetForTests()
+        {
+            var instance = _instance;
+            if (!ReferenceEquals(instance, null))
+            {
+                instance.ShutdownInternal();
+                if (instance != null)
+                    DestroyImmediate(instance.gameObject);
+            }
+            _instance = null;
+            _isInitialized = false;
+            _isShuttingDown = false;
+            _logConfig = null;
+            _resetDeviceIdBeforeInit = false;
+            for (int i = 0; i < _explicitConsent.Length; i++)
+                _explicitConsent[i] = -1;
+            StoragePathForTests = null;
+        }
+
         private void Update()
         {
             if (!_isInitialized || !_config.Enabled)
@@ -529,6 +813,23 @@ namespace OzxApm.Core
 
         private void UpdateInternal()
         {
+            if (!_collecting)
+            {
+                // No technical consent: no collector, no upload. Only the startup
+                // tracker counts its first frames, and without a worker thread the
+                // storage is pumped (it may have a Clear to carry out). No allocation.
+                try
+                {
+                    _startupTracker?.Update();
+                    _offlineStorage.Tick();
+                }
+                catch (Exception ex)
+                {
+                    ReportInternalError("Update", ex);
+                }
+                return;
+            }
+
             // Update collectors
             using (s_collectorsMarker.Auto())
             {
@@ -649,6 +950,7 @@ namespace OzxApm.Core
                     }
                 }
                 _collectors.Clear();
+                _collecting = false;
 
                 SceneManager.sceneLoaded -= OnSceneLoaded;
 
@@ -689,8 +991,9 @@ namespace OzxApm.Core
             if (!_isInitialized || evt == null)
                 return;
 
-            // Consent gate: without consent the event is not even queued.
-            if (_config.Consent != ConsentState.Granted)
+            // Consent gate (APM-14): without technical consent the event is not
+            // even queued. Any thread: one volatile read.
+            if (!_config.TechnicalAllowed)
                 return;
 
             try

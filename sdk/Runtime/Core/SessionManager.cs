@@ -65,6 +65,28 @@ namespace OzxApm.Core
         }
 
         /// <summary>
+        /// Technical consent denied (APM-14): removes the stored device and session
+        /// ids from PlayerPrefs. They stay in memory for this process (and are
+        /// stored again if consent is granted); a launch that stays denied starts
+        /// with new ones. Saves PlayerPrefs only if something was removed.
+        /// </summary>
+        public void OnConsentDenied()
+        {
+            bool removed = false;
+            foreach (var key in new[] { SessionIdKey, SessionStartKey })
+            {
+                if (!PlayerPrefs.HasKey(key))
+                    continue;
+                PlayerPrefs.DeleteKey(key);
+                removed = true;
+            }
+            if (removed)
+                PlayerPrefs.Save();
+            _sessionPersisted = false;
+            DeviceInfo.ForgetStoredDeviceId();
+        }
+
+        /// <summary>
         /// Sets the user ID for correlation
         /// </summary>
         public void SetUserId(string userId)

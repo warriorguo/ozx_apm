@@ -50,6 +50,8 @@ namespace OzxApm.Network
         public string DebugJson;
 
         internal readonly List<string> SegmentNames = new List<string>(4);
+        /// <summary>OfflineStorage.Clear generation the batch was built in; a later Clear voids it.</summary>
+        internal long ClearGeneration;
     }
 
     public enum UploadPoll
@@ -86,7 +88,9 @@ namespace OzxApm.Network
     /// empty to non-empty, at most PersistIntervalMs later in a burst).
     /// If the thread cannot be created the caller drives the worker with Tick().
     ///
-    /// Nothing is written (no file, no directory) unless consent is Granted.
+    /// Nothing is written (no file, no directory) unless technical consent is
+    /// Granted, and Clear (consent denied, device id reset) deletes everything,
+    /// including the directory (APM-14).
     /// Only one instance may own a directory at a time; a second instance on
     /// the same directory (e.g. re-initialising while the old worker is still
     /// running) falls back to memory-only mode.
@@ -142,6 +146,8 @@ namespace OzxApm.Network
         private bool _flushRequested;
         private bool _releaseFirstRequested;
         private bool _clearRequested;
+        private bool _resetSeqRequested;
+        private long _clearGen;             // bumped by Clear; voids batches prepared before it
         private bool _uploadRequested;
         private UploadPoll _uploadState = UploadPoll.Empty;
         private UploadBatch _preparedUpload;
@@ -222,6 +228,8 @@ namespace OzxApm.Network
         internal static bool FailThreadStartForTests;
         /// <summary>Test seam: clock for segment ages (seal and low-value upload interval).</summary>
         internal Func<DateTime> UtcNowForTests;
+        /// <summary>Test seam: called on the worker before (false) and after (true) it prepares an upload.</summary>
+        internal Action<bool> PrepareUploadHookForTests;
 
         private DateTime UtcNow => UtcNowForTests != null ? UtcNowForTests() : DateTime.UtcNow;
 
@@ -346,7 +354,7 @@ namespace OzxApm.Network
         /// </summary>
         public void Enqueue(BaseEvent evt)
         {
-            if (evt == null || _config.Consent != ConsentState.Granted)
+            if (evt == null || !_config.TechnicalAllowed)
                 return;
 
             bool wake;
@@ -443,15 +451,28 @@ namespace OzxApm.Network
         }
 
         /// <summary>
-        /// Deletes all locally stored events, including quarantined batches
-        /// (async). Entry point for APM-14 (consent revoked).
+        /// Deletes every locally stored event: queued, being written, sealed and
+        /// quarantined, the sequence file and the directory itself (APM-14: consent
+        /// denied, device id reset). Queued events are dropped at once; the files go
+        /// on the worker's next iteration. A batch prepared for upload before the
+        /// call is void: PollUpload no longer returns it, and the caller must not send
+        /// one it already holds (EventReporter.CancelInFlight). Events enqueued after
+        /// the call are kept. With resetSequence the event sequence starts again at 1
+        /// (a new device id must not be linkable to the old one through seq).
         /// </summary>
-        public void Clear()
+        public void Clear(bool resetSequence = false)
         {
             lock (_lock)
             {
                 _clearRequested = true;
+                _resetSeqRequested |= resetSequence;
+                _clearGen++;
                 _pending.Clear();
+                if (_preparedUpload != null)
+                {
+                    _preparedUpload = null;
+                    _uploadState = UploadPoll.Empty;
+                }
                 MarkBusy();
             }
             _wake.Set();
@@ -494,6 +515,12 @@ namespace OzxApm.Network
                     batch = _preparedUpload;
                     _preparedUpload = null;
                     _uploadState = UploadPoll.Empty;
+                    if (batch != null && batch.ClearGeneration != _clearGen)
+                    {
+                        // Built from data that Clear has deleted since.
+                        batch = null;
+                        return UploadPoll.Empty;
+                    }
                 }
                 return state;
             }
@@ -702,7 +729,8 @@ namespace OzxApm.Network
                 LoadExisting();
             }
 
-            bool flush, clear, upload, releaseFirst;
+            bool flush, clear, resetSeq, upload, releaseFirst;
+            long clearGen;
             bool writeAllowed = DateTime.UtcNow >= _writeRetryAtUtc;
             lock (_lock)
             {
@@ -716,10 +744,13 @@ namespace OzxApm.Network
                 flush = _flushRequested;
                 releaseFirst = _releaseFirstRequested;
                 clear = _clearRequested;
+                resetSeq = _resetSeqRequested;
+                clearGen = _clearGen;
                 upload = _uploadRequested;
                 _flushRequested = false;
                 _releaseFirstRequested = false;
                 _clearRequested = false;
+                _resetSeqRequested = false;
                 _uploadRequested = false;
 
                 _completionDrain.Clear();
@@ -733,7 +764,7 @@ namespace OzxApm.Network
                     ApplyCompletion(_completionDrain[i]);
 
                 if (clear)
-                    DeleteAll();
+                    DeleteAll(resetSeq);
 
                 if (_drain.Count > 0)
                 {
@@ -757,7 +788,8 @@ namespace OzxApm.Network
 
                 EnforceCap();
 
-                if (flush && _lowWriter.Buffered.Count == 0 && _highWriter.Buffered.Count == 0)
+                // Without consent nothing is written, not even the sequence file.
+                if (flush && _config.TechnicalAllowed && _lowWriter.Buffered.Count == 0 && _highWriter.Buffered.Count == 0)
                 {
                     bool nothingPending;
                     lock (_lock)
@@ -769,7 +801,11 @@ namespace OzxApm.Network
                 }
 
                 if (upload)
-                    PrepareUpload();
+                {
+                    PrepareUploadHookForTests?.Invoke(false);
+                    PrepareUpload(clearGen);
+                    PrepareUploadHookForTests?.Invoke(true);
+                }
             }
             finally
             {
@@ -999,7 +1035,7 @@ namespace OzxApm.Network
         private void WriteEvents(List<BaseEvent> events)
         {
             // Second consent gate: consent may have been revoked after enqueue.
-            if (_config.Consent != ConsentState.Granted)
+            if (!_config.TechnicalAllowed)
             {
                 for (int i = 0; i < events.Count; i++)
                     PerfSamplePool.Return(events[i]);
@@ -1570,7 +1606,7 @@ namespace OzxApm.Network
             segment.Mem = null;
         }
 
-        private void DeleteAll()
+        private void DeleteAll(bool resetSeq)
         {
             CloseOpenStreams();
             foreach (var w in Writers)
@@ -1599,6 +1635,32 @@ namespace OzxApm.Network
                 Warn($"Failed to clear quarantine: {ex.Message}");
             }
 
+            // The sequence file, then the directory: nothing of the SDK is left on
+            // disk. Within this process seq goes on from where it was (unless reset);
+            // the next write reserves, and so rewrites, it first.
+            if (resetSeq)
+                _seq = 0;
+            _seqReserved = _seq;
+            if (_persistToDisk && _ownsDirectory)
+            {
+                try
+                {
+                    foreach (var name in new[] { SeqFileName, SeqFileName + ".tmp" })
+                    {
+                        string path = Path.Combine(_storagePath, name);
+                        if (File.Exists(path))
+                            File.Delete(path);
+                    }
+                    if (Directory.Exists(_storagePath) && Directory.GetFileSystemEntries(_storagePath).Length == 0)
+                        Directory.Delete(_storagePath);
+                    _directoryReady = false;
+                }
+                catch (Exception ex)
+                {
+                    Warn($"Failed to delete the event directory: {ex.Message}");
+                }
+            }
+
             lock (_lock)
             {
                 _preparedUpload = null;
@@ -1611,11 +1673,11 @@ namespace OzxApm.Network
         // Upload preparation (worker thread)
         // ------------------------------------------------------------------
 
-        private void PrepareUpload()
+        private void PrepareUpload(long clearGen)
         {
             UploadBatch batch = null;
 
-            if (_config.Consent == ConsentState.Granted && _inFlight.Count == 0)
+            if (_config.TechnicalAllowed && _inFlight.Count == 0)
             {
                 ReleaseDueLowValue();
                 while (_segments.Count > 0 && batch == null)
@@ -1629,6 +1691,7 @@ namespace OzxApm.Network
 
             if (batch != null)
             {
+                batch.ClearGeneration = clearGen;
                 for (int i = 0; i < batch.SegmentNames.Count; i++)
                     _inFlight.Add(batch.SegmentNames[i]);
             }

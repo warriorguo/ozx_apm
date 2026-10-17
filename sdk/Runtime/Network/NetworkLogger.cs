@@ -252,7 +252,7 @@ namespace OzxApm.Network
                 }
 
                 // The log contains request bodies: no file without consent.
-                if (_config.Consent != ConsentState.Granted)
+                if (!_config.TechnicalAllowed)
                     return;
 
                 try

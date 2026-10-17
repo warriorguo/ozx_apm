@@ -9,7 +9,12 @@ namespace OzxApm.Core
     public struct ApmStats
     {
         public bool Initialized;
+        /// <summary>Technical consent (APM-14).</summary>
         public ConsentState Consent;
+        /// <summary>Analytics consent (APM-14; no analytics events are collected yet).</summary>
+        public ConsentState AnalyticsConsent;
+        /// <summary>Collectors are running (technical consent Granted).</summary>
+        public bool Collecting;
         /// <summary>Events enqueued but not yet written by the storage worker.</summary>
         public int PendingEvents;
         /// <summary>Bytes of events stored locally and not yet confirmed by the server.</summary>

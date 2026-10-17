@@ -395,18 +395,24 @@ namespace OzxApm.Tests
             Assert.AreEqual(3, _transport.Requests.Count, "retried as soon as the network came back");
         }
 
+        // APM-14: a request under way when consent is withdrawn is aborted; its
+        // batch stays stored (Undecided) and goes out once consent is back.
         [Test]
-        public void ConsentWithdrawnMidUpload_FinishesInFlight_StartsNothingNew()
+        public void ConsentWithdrawnMidUpload_AbortsInFlight_StartsNothingNew()
         {
             Enqueue(2);
             _reporter.NotifyGameReady();
             Step();
             Assert.AreEqual(1, _transport.Requests.Count);
+            var inFlight = Last;
+            Assert.IsTrue(inFlight.Started);
 
-            _config.Consent = ConsentState.Denied;
-            Last.Respond(200, "{}");
+            _config.Consent = ConsentState.Undecided;
             Step();
-            Assert.AreEqual(1, StoredSegments(), "the in-flight batch completed normally");
+            Assert.IsTrue(inFlight.Aborted, "the request under way is aborted");
+            inFlight.Respond(200, "{}"); // a late answer changes nothing
+            Step();
+            Assert.AreEqual(2, StoredSegments(), "not counted as delivered");
 
             Step(10f);
             Step(10f);
@@ -415,6 +421,58 @@ namespace OzxApm.Tests
             _config.Consent = ConsentState.Granted;
             Step(1f);
             Assert.AreEqual(2, _transport.Requests.Count);
+            Assert.AreEqual(inFlight.Payload, Last.Payload, "the aborted batch is sent again");
+        }
+
+        [Test]
+        public void CancelInFlight_BeforeTheRequestStarted_NeverStartsIt()
+        {
+            Enqueue(1);
+            _reporter.NotifyGameReady();
+            _reporter.Update(); // Idle -> WaitingForBatch
+            _reporter.Update(); // batch ready -> request built (Created), started next frame
+            Assert.AreEqual(1, _transport.Requests.Count);
+            var built = Last;
+            Assert.IsFalse(built.Started);
+
+            _config.Consent = ConsentState.Denied;
+            _reporter.CancelInFlight(); // what ApmClient.SetConsent does
+            _storage.Clear();
+            Step();
+            Step(10f);
+            Assert.IsFalse(built.Started, "never sent");
+            Assert.AreEqual(1, _transport.Requests.Count);
+            Assert.AreEqual(0, StoredSegments());
+
+            // Consent back: only what is enqueued from now on is sent.
+            _config.Consent = ConsentState.Granted;
+            Enqueue(1);
+            Step(1f);
+            Assert.AreEqual(2, _transport.Requests.Count);
+            Assert.AreNotEqual(built.Payload, Last.Payload);
+        }
+
+        [Test]
+        public void DeniedWhileWaitingForABatch_OldDataIsNeverSent()
+        {
+            Enqueue(3);
+            _reporter.NotifyGameReady();
+            _reporter.Update(); // WaitingForBatch: the worker prepares a batch
+
+            _config.Consent = ConsentState.Denied;
+            _reporter.CancelInFlight();
+            _storage.Clear();
+            _storage.Pump();
+            Step(10f);
+            Assert.AreEqual(0, _transport.Requests.Count);
+
+            _config.Consent = ConsentState.Granted;
+            Step(1f);
+            Step(10f);
+            Assert.AreEqual(0, _transport.Requests.Count, "the deleted batch is gone");
+            Enqueue(1);
+            Step(1f);
+            Assert.AreEqual(1, _transport.Requests.Count);
         }
 
         [Test]

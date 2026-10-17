@@ -70,7 +70,9 @@ namespace OzxApm.Utils
         }
 
         /// <summary>
-        /// Resets the device ID; with persist=false the new id is not written yet.
+        /// Resets the device ID; with persist=false the new id is not written yet,
+        /// and the old one is removed from PlayerPrefs (it must not come back on
+        /// the next launch).
         /// </summary>
         public static void ResetDeviceId(bool persist)
         {
@@ -78,6 +80,23 @@ namespace OzxApm.Utils
             _deviceIdPersisted = false;
             if (persist)
                 PersistDeviceId();
+            else
+                ForgetStoredDeviceId();
+        }
+
+        /// <summary>
+        /// Removes the stored device id from PlayerPrefs (technical consent
+        /// denied, APM-14). The id in memory stays for this process and is stored
+        /// again by PersistDeviceId if consent is granted; otherwise the next
+        /// launch starts with a new one. PlayerPrefs.Save only if a key was removed.
+        /// </summary>
+        public static void ForgetStoredDeviceId()
+        {
+            _deviceIdPersisted = false;
+            if (!PlayerPrefs.HasKey(DeviceIdKey))
+                return;
+            PlayerPrefs.DeleteKey(DeviceIdKey);
+            PlayerPrefs.Save();
         }
 
         /// <summary>Test seam: forget the cached id.</summary>
