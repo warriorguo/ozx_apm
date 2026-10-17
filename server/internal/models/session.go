@@ -105,6 +105,10 @@ type TimelineItem struct {
 	RepeatUntil *time.Time `json:"repeat_until,omitempty"`
 	// TimeUnknown: the line had no time; Time is that of the row carrying it.
 	TimeUnknown bool `json:"time_unknown,omitempty"`
+	// AfterSeq (not sent): the breadcrumb was recorded right after the row
+	// with this sequence number, in the same millisecond (its carrier's lines
+	// are in recording order); it orders the breadcrumb after that row.
+	AfterSeq uint64 `json:"-"`
 }
 
 // ContextChange is one key of a context change. From is "" when the key was

@@ -199,3 +199,36 @@ func TestNearest(t *testing.T) {
 		t.Error("no cut expected")
 	}
 }
+
+// The half-built room on a device: room_enter (a row) and the warning logged
+// right after it share a millisecond. The exception's lines are in recording
+// order, so the warning comes after room_enter, not before every row of that
+// millisecond; a line before any covered one keeps its place before the rows.
+func TestSort_LineAfterCoveredRowInSameMillisecond(t *testing.T) {
+	ts := utc("2026-10-17T20:18:24.913Z")
+	rows := []models.TimelineItem{
+		{Type: models.TimelineCustomEvent, Time: ts, Seq: 40, Name: "room_enter"},
+		{Type: models.TimelineCustomEvent, Time: ts, Seq: 42, Name: "room_built"},
+		{Type: models.TimelineException, Time: ts.Add(12 * time.Millisecond), Seq: 43, Message: "InvalidOperationException: x"},
+	}
+	crumbs := []models.TimelineItem{
+		crumb("2026-10-17T20:18:24.913Z", models.CrumbWarning, "before anything", 0),
+		crumb("2026-10-17T20:18:24.913Z", models.CrumbEvent, "room_enter roomId=r-12", 0),
+		crumb("2026-10-17T20:18:24.913Z", models.CrumbWarning, "Room layout missing for r-12", 0),
+		crumb("2026-10-17T20:18:24.920Z", models.CrumbWarning, "later", 0),
+	}
+	kept, dropped := DropCovered(crumbs, rows)
+	if dropped != 1 {
+		t.Fatalf("dropped %d", dropped)
+	}
+	items := append(append([]models.TimelineItem{{Type: models.TimelineContext, Time: ts}}, rows...), kept...)
+	Sort(items)
+	var got []string
+	for _, it := range items {
+		got = append(got, it.Type+":"+it.Name+it.Text)
+	}
+	want := "context:,breadcrumb:before anything,custom_event:room_enter,breadcrumb:Room layout missing for r-12,custom_event:room_built,breadcrumb:later,exception:"
+	if strings.Join(got, ",") != want {
+		t.Errorf("got  %s\nwant %s", strings.Join(got, ","), want)
+	}
+}

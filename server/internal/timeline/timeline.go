@@ -251,22 +251,34 @@ func DropCovered(crumbs, rows []models.TimelineItem) ([]models.TimelineItem, int
 	sort.SliceStable(byTime, func(i, j int) bool { return byTime[i].Time.Before(byTime[j].Time) })
 	out := crumbs[:0:0]
 	dropped := 0
+	// The last dropped line and the row standing for it: a line that follows
+	// it in the same millisecond was recorded after that row (a carrier's
+	// lines are in the SDK's recording order), so it is ordered after it,
+	// not before every row of that millisecond.
+	var lastTime time.Time
+	var lastRow *models.TimelineItem
 	for i := range crumbs {
 		c := &crumbs[i]
-		covered := false
+		var by *models.TimelineItem
 		if !c.TimeUnknown && coverable(c.Kind) {
 			lo := c.Time.Add(-coverTolerance(c.Kind))
 			k := sort.Search(len(byTime), func(j int) bool { return !byTime[j].Time.Before(lo) })
 			for ; k < len(byTime) && !byTime[k].Time.After(c.Time.Add(coverTolerance(c.Kind))); k++ {
 				if covers(c, byTime[k]) {
-					covered = true
+					by = byTime[k]
 					break
 				}
 			}
 		}
-		if covered {
+		if by != nil {
 			dropped++
+			lastTime, lastRow = c.Time, by
 			continue
+		}
+		if lastRow != nil && !c.TimeUnknown && c.Time.Equal(lastTime) {
+			c.AfterSeq = lastRow.Seq
+		} else {
+			lastRow = nil
 		}
 		out = append(out, *c)
 	}
@@ -290,30 +302,38 @@ func Diff(prev, cur map[string]string) []models.ContextChange {
 	return changes
 }
 
-// rank orders items of the same millisecond: a context change first (it was
-// in effect when the row was recorded), then breadcrumbs (they happened
-// before the rows that carry them), then rows by sequence number.
-func rank(t string) int {
-	switch t {
-	case models.TimelineContext:
-		return 0
-	case models.TimelineBreadcrumb:
-		return 1
+// position orders items of the same millisecond: a context change first (it
+// was in effect when the row was recorded), then breadcrumbs (they happened
+// before the rows that carry them), then rows by sequence number; a
+// breadcrumb recorded right after a row (AfterSeq) comes just after that row.
+func position(it *models.TimelineItem) (int, uint64, int) {
+	switch {
+	case it.Type == models.TimelineContext:
+		return 0, 0, 0
+	case it.Type == models.TimelineBreadcrumb && it.AfterSeq > 0:
+		return 2, it.AfterSeq, 1
+	case it.Type == models.TimelineBreadcrumb:
+		return 1, 0, 0
 	}
-	return 2
+	return 2, it.Seq, 0
 }
 
-// Sort orders the items by time, then rank, then the SDK's sequence number.
+// Sort orders the items by time, then position.
 func Sort(items []models.TimelineItem) {
 	sort.SliceStable(items, func(i, j int) bool {
 		a, b := &items[i], &items[j]
 		if !a.Time.Equal(b.Time) {
 			return a.Time.Before(b.Time)
 		}
-		if ra, rb := rank(a.Type), rank(b.Type); ra != rb {
-			return ra < rb
+		ga, sa, ta := position(a)
+		gb, sb, tb := position(b)
+		if ga != gb {
+			return ga < gb
 		}
-		return a.Seq < b.Seq
+		if sa != sb {
+			return sa < sb
+		}
+		return ta < tb
 	})
 }
 
