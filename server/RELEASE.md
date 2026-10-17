@@ -1026,12 +1026,16 @@ the `apm_exception_daily` view.
 
 ### SDK
 
-- The repeat path (the same text again within the 60-second window) is a
-  hash lookup of the message and stack: no parsing and **no allocation**
-  (before: Regex + MD5 + string formatting, about 2.4 KB per call).
-  Measured on Unity's Mono 2022.3 outside Unity (M-series Mac): 0.31 us per
-  repeat of a 700-character error, 3.1 us for an 8 KB one, 0 bytes; the
-  code before APM-4: 2.2 us and 2400 bytes per repeat.
+- The repeat path (the same text again within the 60-second window, where
+  numbers in the message's first line may differ: an error logged every
+  frame with a changing roomId is a repeat) is a hash lookup of the message
+  and stack: no parsing and **no allocation** (before: Regex + MD5 + string
+  formatting, about 2.4 KB per call). Measured on Unity's Mono 2022.3
+  outside Unity (M-series Mac): 0.7 us per repeat of a 700-character error
+  (0.8 us with a changing roomId), 8 us for an 8 KB one, 0 bytes; the code
+  before APM-4: 2.3 us and 2400 bytes per repeat. The only texts this
+  merges although their fingerprints differ are exception types whose names
+  differ only in digits, in the same place.
 - Parsing happens once per distinct text and window: 13-14 us and 18 KB for
   a typical bus error (3 frames), about 70 us and 138 KB for an 8 KB message
   with a 60-frame inner chain (compacted to 4.4 KB), event and breadcrumbs

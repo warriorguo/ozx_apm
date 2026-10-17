@@ -67,16 +67,23 @@ namespace OzxApm.Collectors
             public ContextSnapshot RepeatContext; // game context at the first repeat
         }
 
-        // The whole text is hashed (string.GetHashCode, native on Mono and
-        // IL2CPP): what makes two wrapped exceptions different (the outer
-        // exception's frames) can be anywhere in a long message. Two different
-        // texts share an entry only if both 32-bit hashes and both lengths are
-        // equal.
+        // Key of a log text for the repeat path. The message's first line is
+        // hashed with every run of digits counted as one '#': that is where
+        // ids and counts that change from call to call are (an error logged
+        // every frame with the frame's roomId or entity id stays one cheap
+        // repeat), and the fingerprint never depends on their values (the
+        // message template replaces numbers). The rest of the message (an
+        // embedded exception's frames, whose outer frames decide the group and
+        // can be anywhere in a long text) and the stack are hashed exactly.
+        // Two texts share an entry only if all hashes and lengths are equal;
+        // the only texts it merges with different fingerprints are exception
+        // type names that differ only in their digits (e.g. Error1Exception
+        // and Error2Exception in the same place).
         private struct RawKey
         {
-            public int MessageHash;
+            public ulong MessageHash;
+            public int RestLength;
             public int StackHash;
-            public int MessageLength;
             public int StackLength;
             public LogType Type;
         }
@@ -90,13 +97,52 @@ namespace OzxApm.Collectors
             public bool Equals(RawKey a, RawKey b)
             {
                 return a.MessageHash == b.MessageHash && a.StackHash == b.StackHash &&
-                       a.MessageLength == b.MessageLength && a.StackLength == b.StackLength && a.Type == b.Type;
+                       a.RestLength == b.RestLength && a.StackLength == b.StackLength && a.Type == b.Type;
             }
 
             public int GetHashCode(RawKey k)
             {
-                return unchecked(k.MessageHash ^ (k.StackHash * 31) ^ k.MessageLength ^ (int)k.Type);
+                return unchecked((int)k.MessageHash ^ (int)(k.MessageHash >> 32) ^ (k.StackHash * 31) ^ k.RestLength ^ (int)k.Type);
             }
+        }
+
+        // Hash of s in which, in the first line, a run of digits counts as one
+        // '#'. Two 32-bit lanes (djb2-xor, alternate characters) make a 64-bit
+        // key at the speed of string.GetHashCode. No allocation.
+        private static ulong MessageKeyHash(string s, out int restLength)
+        {
+            uint h1 = 5381, h2 = 52711;
+            int i = 0, n = s.Length;
+            bool inDigits = false, odd = false;
+            for (; i < n && s[i] != '\n'; i++)
+            {
+                char c = s[i];
+                if (c >= '0' && c <= '9')
+                {
+                    if (inDigits)
+                        continue;
+                    inDigits = true;
+                    c = '#';
+                }
+                else
+                {
+                    inDigits = false;
+                }
+                if (odd)
+                    h2 = unchecked(((h2 << 5) + h2) ^ c);
+                else
+                    h1 = unchecked(((h1 << 5) + h1) ^ c);
+                odd = !odd;
+            }
+            restLength = n - i;
+            for (; i + 1 < n; i += 2)
+            {
+                h1 = unchecked(((h1 << 5) + h1) ^ s[i]);
+                h2 = unchecked(((h2 << 5) + h2) ^ s[i + 1]);
+            }
+            if (i < n)
+                h1 = unchecked(((h1 << 5) + h1) ^ s[i]);
+            return ((ulong)h1 << 32) | h2;
         }
 
         public bool IsActive => _isActive;
@@ -227,13 +273,13 @@ namespace OzxApm.Collectors
             stackTrace = stackTrace ?? "";
             long nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 
-            // A repeat of a text already seen in this window: count it. No
-            // parsing, no allocation.
+            // A repeat of a text already seen in this window (up to the numbers
+            // in its first line): count it. No parsing, no allocation.
             var key = new RawKey
             {
-                MessageHash = message.GetHashCode(),
+                MessageHash = MessageKeyHash(message, out int restLength),
+                RestLength = restLength,
                 StackHash = stackTrace.GetHashCode(),
-                MessageLength = message.Length,
                 StackLength = stackTrace.Length,
                 Type = type
             };

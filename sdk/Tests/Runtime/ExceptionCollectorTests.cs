@@ -240,6 +240,43 @@ namespace OzxApm.Tests
             Assert.AreEqual(2, _events[before].count);
         }
 
+        // An error logged every frame with a changing number (roomId, entity
+        // id) is a repeat too: numbers in the message's first line do not
+        // make a new text.
+        [Test]
+        public void RepeatPath_WithAChangingNumber_DoesNotAllocate()
+        {
+            string stack = "Ozx.Core.GameEventBus:Publish(RoomEnteredEvent)\n";
+            var messages = new string[4];
+            for (int i = 0; i < messages.Length; i++)
+                messages[i] = "[GameEventBus] Error handling event RoomEnteredEvent: " + RoomLoaderText(100 + i * 7919);
+            _collector.HandleLogMessage(messages[0], stack, LogType.Error);
+            _collector.HandleLogMessage(messages[1], stack, LogType.Error);
+            string third = messages[2];
+
+            Assert.That(() => _collector.HandleLogMessage(third, stack, LogType.Error), Is.Not.AllocatingGCMemory());
+            _collector.HandleLogMessage(messages[3], stack, LogType.Error);
+            Assert.AreEqual(1, _events.Count);
+            _collector.FlushPending();
+            Assert.AreEqual(3, _events[1].count);
+        }
+
+        // Numbers elsewhere (here: in the frames) still separate texts, and so groups.
+        [Test]
+        public void NumbersInFrames_StillSeparateGroups()
+        {
+            string stack = "Ozx.Core.GameEventBus:Publish(RoomEnteredEvent)\n";
+            _collector.HandleLogMessage("Failed: " + RoomLoaderText(5).Replace("LoadTemplate", "LoadStage1"), stack, LogType.Error);
+            _collector.HandleLogMessage("Failed: " + RoomLoaderText(5).Replace("LoadTemplate", "LoadStage2"), stack, LogType.Error);
+            Assert.AreEqual(2, _events.Count);
+            Assert.AreNotEqual(_events[0].fingerprint, _events[1].fingerprint);
+        }
+
+        private static string RoomLoaderText(int roomId) =>
+            "System.InvalidOperationException: Room template not found for roomId=" + roomId + "\n" +
+            "  at Ozx.Rooms.RoomLoader.LoadTemplate (System.Int32 roomId) [0x00000] in <00000000000000000000000000000000>:0 \n" +
+            "  at Ozx.Core.GameEventBus.Publish[T] (T evt) [0x00000] in <00000000000000000000000000000000>:0 \n";
+
         private const string SpawnWaveText = "System.NullReferenceException: Object reference not set to an instance of an object.\n" +
             "  at Ozx.Rooms.EnemySpawner.SpawnWave (System.Int32 roomId) [0x00000] in <00000000000000000000000000000000>:0 \n" +
             "  at Ozx.Core.GameEventBus.Publish[T] (T evt) [0x00000] in <00000000000000000000000000000000>:0 \n";
