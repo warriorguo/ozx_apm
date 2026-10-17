@@ -630,3 +630,190 @@ context (`ALTER TABLE <t> DROP COLUMN ...`, admin privilege).
   admin numbers for default/dev/unknown/all and a context filter as expected;
   then the 111d9bf binary restarted on the migrated tables (ingest and admin
   work) and the new binary again (no warnings).
+
+## APM-14: privacy consent (SDK) and deletion by device (admin API)
+
+Two independent parts: the SDK's consent handling (game builds) and an admin
+endpoint that deletes everything stored for one device. No change to the wire
+format or to the event tables. Deploy order: **server, then the grant, then
+SDK builds** (any order works, but deletion requests can only be honoured once
+the first two are done).
+
+### SDK: consent
+
+Categories (`ConsentCategory`): `Technical` (everything the SDK collects today:
+exceptions, crashes, perf samples, jank, startup, scene loads) and `Analytics`
+(APM-12 operations events; none collected yet, the state is stored and
+reported so the game can ask now). States (`ConsentState`): `Undecided`
+(`Unknown` is the old name), `Granted`, `Denied`.
+
+```csharp
+var config = new ApmConfig { /* ... */ };
+// Defaults until the player chooses (shown: the built-in ones, for Google Play):
+config.DefaultTechnicalConsent = ConsentState.Granted;
+config.DefaultAnalyticsConsent = ConsentState.Undecided;
+// Opt-in markets (e.g. mainland China): collect nothing until the game asks.
+// config.UseOptInConsent();          // both Undecided
+// config.RememberConsent = false;    // the game stores the choice itself
+ApmClient.Initialize(config);
+
+ApmClient.SetConsent(ConsentCategory.Technical, ConsentState.Granted);
+ApmClient.SetConsent(ConsentCategory.Analytics, ConsentState.Denied);
+ApmClient.GetConsent(ConsentCategory.Technical);
+string id = ApmClient.GetDeviceId();     // what support needs to delete server data
+string newId = ApmClient.ResetDeviceId();
+```
+
+- Where a category's state comes from, in order: the game's `SetConsent`
+  (also before `Initialize`), the choice stored in PlayerPrefs by an earlier
+  `SetConsent` (keys `ozx_apm_consent_technical` / `ozx_apm_consent_analytics`,
+  0/1/2; `ApmConfig.RememberConsent`, on by default), the config default.
+  Defaults are never stored, only choices. `Initialize` only reads PlayerPrefs.
+  A game that calls `PlayerPrefs.DeleteAll()` also deletes the stored choice.
+- Technical not `Granted`: collectors are stopped (`ApmClient.Update` then only
+  advances the startup tracker: no allocation, measured by an EditMode test),
+  nothing is enqueued, written to disk (not even the sequence file) or uploaded,
+  and the upload under way is cancelled (a request that was built is never
+  started, one in progress is aborted; its batch goes back to storage).
+  `RecordBreadcrumb` is ignored.
+- `Undecided` keeps what is already stored and uploads it once consent is
+  granted. `Denied` deletes, within milliseconds on the storage thread: queued
+  and stored events, quarantined batches, the `seq` file and the
+  `ozx_apm_offline` directory itself, the network debug log, and the device and
+  session ids in PlayerPrefs (kept in memory for the process; a launch that
+  stays denied gets new ones). It also deletes at `Initialize` if files were
+  left behind (killed right after the choice, or an older SDK). `Granted`
+  again resumes with the in-memory ids and stores them again.
+- In-flight data: events queued, being written or being uploaded when consent
+  is withdrawn are never sent. A request whose bytes had already reached the
+  server before the abort may still be stored there; delete it with the admin
+  API.
+- `ResetDeviceId()`: a new random device id and a new session (session ids are
+  random, never derived from the device id), local events deleted (they carry
+  the old id), the upload under way cancelled, event `seq` restarted at 1.
+  Stored only with technical consent. Works before `Initialize`. Server data
+  keeps the old id: read `GetDeviceId()` first and delete it with the admin API.
+- `ApmStats` has `Consent` (technical), `AnalyticsConsent` and `Collecting`.
+- Compatibility: `ApmClient.SetConsent(state)`, `ApmClient.Consent` and
+  `ApmConfig.Consent` keep working and cover both categories
+  (`config.Consent = X` sets both defaults). **SDK rollback warning:** a build
+  with an SDK older than this ignores the stored choice and collects with its
+  config (Granted unless the game sets `config.Consent`), so a player who
+  denied would be collected again by that build. Do not ship an older SDK to
+  players once a consent dialog is live.
+- Analytics (APM-12): operations events must check
+  `GetConsent(ConsentCategory.Analytics) == Granted` before enqueue, be stored
+  in their own segments so `Denied` can delete only them, and the upload gate
+  (today: technical consent) must become per category.
+
+### Server: `POST /api/privacy/delete` and `POST /api/privacy/verify`
+
+```sh
+ID=0123456789abcdef0123456789abcdef   # the device id (ApmClient.GetDeviceId)
+curl -sS -X POST http://<admin-host>/api/privacy/delete \
+  -H 'Content-Type: application/json' -H "X-Apm-Confirm-Delete: $ID" \
+  -d "{\"id_type\":\"device_id\",\"id\":\"$ID\"}"
+curl -sS -X POST http://<admin-host>/api/privacy/verify \
+  -H 'Content-Type: application/json' \
+  -d "{\"id_type\":\"device_id\",\"id\":\"$ID\"}"
+```
+
+- `X-Apm-Confirm-Delete` must repeat the id (400 otherwise). It guards against
+  typos and, because it is not in the admin CORS allow-list, against requests
+  from other web origins. The admin API itself has **no authentication** (as
+  before: it must only be reachable from the internal network).
+- Tables: every MergeTree-family table of the database that has the column
+  (`device_id`): the six event tables, tables added later with the column
+  (APM-12 `ops_events`) and leftover copies such as `*_pre_apm19`.
+  `id_type: player_id` is rejected until APM-12 stores a player id; it then only
+  needs an entry in `models.PrivacyIDTypes`.
+- The `apm_*_daily` aggregates are **not** changed: they are sums per date,
+  version, platform and scene/fingerprint, with no device or player column, and
+  ClickHouse never propagates a delete to a materialized view's target. They
+  keep counting the deleted device's past events anonymously.
+- Mechanism: per table with rows of the device, `ALTER TABLE <t> DELETE WHERE
+  device_id = ?` with `mutations_sync = 2` (waits for the mutation); tables
+  without rows are skipped. Lightweight `DELETE FROM` is not used: on 24.1 and
+  26.1 it also needs `ALTER UPDATE(_row_exists)`, which 26.1 can only grant per
+  table and 24.1, granted on `ozx_apm.*`, turns into `ALTER UPDATE` on every
+  column (verified). Cost: each part that holds a row of the device is
+  rewritten; parts without one are not. Fine at the current volume; at much
+  larger volume, schedule deletions off-peak.
+- ReplacingMergeTree (APM-19): the mutation removes every copy present when it
+  starts, duplicates included; merges never bring a row back (tested with
+  `OPTIMIZE ... FINAL` and `FINAL` reads). A row inserted after the mutation
+  started (an upload still in flight, an `async_insert` buffer) survives:
+  `verify` shows it and running the deletion again removes it. Ask the player
+  to deny consent or reset the id first, so nothing new arrives.
+- Responses: `200` `status: done` (nothing left); `202` `status: running`
+  (still going after 20 s; it continues in the background, one deletion at a
+  time, 30 min deadline) or `incomplete` (rows were left: run it again); `503`
+  `failed` when ClickHouse refuses (the error names the missing grant; logged
+  as an error with `request_id` and `id_hash`); `500` other errors; `400` bad
+  request.
+  Bodies carry per-table `rows_before`/`rows_after` and the id's SHA-256
+  (`id_hash`), never the id. Idempotent. The admin nginx proxy times out at
+  30 s, above the 20 s wait.
+- Audit: table `apm_privacy_deletions` (created by `Migrate` with the
+  `CREATE TABLE` grant, also in `scripts/migrate.sql`): `request_id, at,
+  id_type, id_hash, status, tables, rows_before, rows_after, error,
+  requested_by`. A `running` row is written before anything is deleted (no
+  record, no deletion: 500) and a final row at the end. No TTL (one small row
+  per request, evidence that a request was honoured). A server restart during
+  a deletion leaves only the `running` row: run it again. `verify` lists the
+  records of the id (by hash).
+
+### Privileges (admin, on n192)
+
+The `apm` service account needs `ALTER DELETE` on `ozx_apm.*`. It is defined in
+`/etc/clickhouse-server/users.d/apm.xml` (APM-16), so a SQL `GRANT` is refused
+there; edit the grants line and ClickHouse reloads it by itself:
+
+```xml
+<grants>
+    <query>GRANT SELECT, INSERT, CREATE TABLE, ALTER ADD COLUMN, ALTER DELETE ON ozx_apm.*</query>
+</grants>
+```
+
+```sh
+clickhouse-client -q "SHOW GRANTS FOR apm"   # must list ALTER DELETE ON ozx_apm.*
+```
+
+For an account created with SQL: `GRANT ALTER DELETE ON ozx_apm.* TO apm`.
+Check afterwards: deleting a device that has rows answers 200, not 503.
+Nothing else needs the grant; the server starts and runs without it (deletion
+requests then answer 503).
+
+### Rolling deploy and rollback
+
+Old and new binaries serve side by side: the old one ignores the audit table
+and has no privacy endpoints. **Rollback:** redeploy the previous binary; keep
+`apm_privacy_deletions` (it is the record of honoured requests). The grant can
+stay, or be removed from `apm.xml`. Deleted rows cannot be restored (that is
+the point; no backup is taken).
+
+### Verified
+
+- Server: `go vet`, `go test ./...`, handler unit tests (`-race`): 200/202/400/
+  500/503 paths, confirmation header, validation, audit before deletion, one
+  deletion at a time, background completion. Integration on ClickHouse
+  26.1.12, 24.1.8 and 23.8.16 (34/34, 34/34 and 32/32 + 2 skipped: 23.8's local
+  default account cannot create users): two devices in all six tables with a
+  re-sent duplicate in another part, plus a `*_pre_apm19` copy; deletion leaves
+  0 rows of the device (plain and `FINAL`, also after `OPTIMIZE FINAL`), the
+  other device's rows and the four aggregates unchanged; a late insert is found
+  by `verify` and removed by a second run; a third run is a no-op; the audit
+  table holds no raw id. As a copy of the `apm` account (26.1, 24.1): 503 naming
+  the grant, no row touched, audited as failed; after `GRANT ALTER DELETE` the
+  same scenario passes.
+- SDK: C# 8 compile with and without `UNITY_2021_2_OR_NEWER`; EditMode tests
+  (Unity 2022.3.62) for every transition, persistence across a relaunch,
+  `RememberConsent` off, deletion of files left at launch, `ResetDeviceId`
+  (before and after `Initialize`), the exception collector off while denied,
+  the upload/Clear races (one deterministic interleaving, two threaded stress
+  tests) and no allocation per frame or per event while denied. Mutation
+  checks: removing the Clear generation check or the reporter's consent
+  cancel makes a test fail.
+- Not verified: on a device (test plan written, not run yet), the XML-defined `apm`
+  account with the new grant (the tests use a SQL-defined copy), deletion time
+  at production volume, iOS.

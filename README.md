@@ -162,6 +162,32 @@ ApmClient.ClearContext();
   network type. The admin shows release builds by default. In the Unity Editor
   events are stored but not uploaded unless `ApmConfig.UploadInEditor = true`.
 
+### Privacy consent
+
+Two categories, each `Undecided`, `Granted` or `Denied`: `Technical`
+(everything the SDK collects: exceptions, crashes, performance) and
+`Analytics` (operations events, APM-12; none collected yet). Only `Granted`
+collects; nothing is enqueued, written to disk or uploaded otherwise.
+
+```csharp
+config.DefaultTechnicalConsent = ConsentState.Granted;    // built-in default
+config.DefaultAnalyticsConsent = ConsentState.Undecided;  // built-in default
+// config.UseOptInConsent();   // opt-in markets: both Undecided, nothing until asked
+
+ApmClient.SetConsent(ConsentCategory.Technical, ConsentState.Denied);  // also before Initialize
+ApmClient.GetConsent(ConsentCategory.Analytics);
+string deviceId = ApmClient.GetDeviceId();   // give it to support for server-side deletion
+ApmClient.ResetDeviceId();                   // new id + new session, local events deleted
+```
+
+- The player's choice is stored in PlayerPrefs and wins over the defaults on
+  the next launches (`ApmConfig.RememberConsent`, on by default).
+- `Denied` stops the collectors and deletes every locally stored event and SDK
+  file, the debug network log and the stored device/session ids; the upload
+  under way is aborted. `Undecided` stops collecting but keeps what is stored.
+- Main thread. Details, server-side deletion and the admin grant:
+  `server/RELEASE.md` (APM-14).
+
 ## API Endpoints
 
 ### Ingestion
@@ -199,6 +225,22 @@ curl "http://localhost:8080/v1/exceptions?app_version=1.0.0&limit=50"
 **GET /v1/crashes** - Crash list
 ```bash
 curl "http://localhost:8080/v1/crashes?platform=Android"
+```
+
+### Privacy deletion (admin server)
+
+**POST /api/privacy/delete** - Delete every stored row of a device (APM-14).
+Needs `ALTER DELETE` for the ClickHouse account; see `server/RELEASE.md`.
+```bash
+curl -X POST http://localhost:8081/api/privacy/delete \
+  -H "Content-Type: application/json" -H "X-Apm-Confirm-Delete: $DEVICE_ID" \
+  -d "{\"id_type\":\"device_id\",\"id\":\"$DEVICE_ID\"}"
+```
+
+**POST /api/privacy/verify** - Rows left per table and the deletion requests
+```bash
+curl -X POST http://localhost:8081/api/privacy/verify \
+  -H "Content-Type: application/json" -d "{\"id_type\":\"device_id\",\"id\":\"$DEVICE_ID\"}"
 ```
 
 ## Event Types
