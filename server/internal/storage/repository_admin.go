@@ -525,8 +525,13 @@ func (r *Repository) GetCrashDetail(ctx context.Context, fingerprint string, f m
 	return detail, nil
 }
 
-// GetExceptionGroups returns grouped exception data
-func (r *Repository) GetExceptionGroups(ctx context.Context, f models.AdminFilter, page, pageSize int) ([]models.ExceptionGroup, int64, error) {
+// GetExceptionGroups returns grouped exception data, ordered by sort (one of
+// ExceptionSorts; "" = count), largest / most recent first.
+func (r *Repository) GetExceptionGroups(ctx context.Context, f models.AdminFilter, sort string, page, pageSize int) ([]models.ExceptionGroup, int64, error) {
+	orderBy, ok := exceptionSorts[sort]
+	if !ok {
+		return nil, 0, fmt.Errorf("unknown sort: %s", sort)
+	}
 	whereClause, args := tableWhere(TableExceptions.Name, f)
 
 	// Get total count
@@ -543,9 +548,9 @@ func (r *Repository) GetExceptionGroups(ctx context.Context, f models.AdminFilte
 		FROM apm_exceptions
 		%s
 		GROUP BY fingerprint
-		ORDER BY cnt DESC, fingerprint
+		ORDER BY %s, fingerprint
 		LIMIT %d OFFSET %d
-	`, exceptionGroupColumns, whereClause, pageSize, offset)
+	`, exceptionGroupColumns, whereClause, orderBy, pageSize, offset)
 
 	exceptions := []models.ExceptionGroup{}
 	err := r.queryRows(ctx, query, args, func(rows driver.Rows) error {
@@ -578,13 +583,14 @@ const exceptionGroupColumns = `
 			argMax(throw_site, timestamp) as throw_site,
 			argMax(call_site, timestamp) as call_site,
 			toInt64(uniqExactIf(session_id, error_seq = 1)) as first_error_sessions,
-			toInt64(sumIf(count, unhandled != '')) as unhandled_count`
+			toInt64(sumIf(count, unhandled != '')) as unhandled_count,
+			toInt64(uniqExactIf(session_id, error_seq > 0)) as sessions_with_seq`
 
 func scanExceptionGroup(rows interface{ Scan(dest ...any) error }, e *models.ExceptionGroup) error {
 	var version int64
 	if err := rows.Scan(&e.Fingerprint, &e.Message, &e.Count, &e.SessionCount, &e.FirstSeen, &e.LastSeen,
 		&version, &e.ExceptionType, &e.MessageTemplate, &e.ThrowSite, &e.CallSite,
-		&e.FirstErrorSessions, &e.UnhandledCount); err != nil {
+		&e.FirstErrorSessions, &e.UnhandledCount, &e.SessionsWithSeq); err != nil {
 		return err
 	}
 	e.FingerprintVersion = int(version)
@@ -621,7 +627,7 @@ func (r *Repository) GetExceptionDetail(ctx context.Context, fp string, f models
 	row := r.client.conn.QueryRow(ctx, query, args...)
 	if err := row.Scan(&detail.Fingerprint, &detail.Message, &detail.Count, &detail.SessionCount, &detail.FirstSeen, &detail.LastSeen,
 		&version, &detail.ExceptionType, &detail.MessageTemplate, &detail.ThrowSite, &detail.CallSite,
-		&detail.FirstErrorSessions, &detail.UnhandledCount,
+		&detail.FirstErrorSessions, &detail.UnhandledCount, &detail.SessionsWithSeq,
 		&detail.FirstVersion, &detail.LastVersion); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil
@@ -651,31 +657,26 @@ func (r *Repository) GetExceptionDetail(ctx context.Context, fp string, f models
 	s.Parsed = fingerprint.Analyze(fingerprint.Input{LogType: s.LogType, Message: s.Message, Stack: s.Stack, Embedded: s.EmbeddedException})
 
 	occQuery := fmt.Sprintf(`
-		SELECT timestamp, event_id, toInt64(count), app_version, build_type, platform, device_model, os_version,
-			scene, session_id, ctx, breadcrumbs, toInt64(error_seq), toInt64(session_ms), unhandled, ctx_merged = 1
+		SELECT %s
 		FROM apm_exceptions
 		%s
 		ORDER BY timestamp DESC, event_id
 		LIMIT %d
-	`, whereClause, exceptionOccurrences)
+	`, occurrenceColumns, whereClause, exceptionOccurrences)
 	err := r.queryRows(ctx, occQuery, args, func(rows driver.Rows) error {
-		var o models.ExceptionOccurrence
-		if err := rows.Scan(&o.Timestamp, &o.EventID, &o.Count, &o.AppVersion, &o.BuildType, &o.Platform, &o.DeviceModel,
-			&o.OSVersion, &o.Scene, &o.SessionID, &o.Context, &o.Breadcrumbs,
-			&o.ErrorSeq, &o.SessionMs, &o.Unhandled, &o.CtxMerged); err != nil {
+		o, err := scanOccurrence(rows)
+		if err != nil {
 			return err
-		}
-		if o.Context == nil {
-			o.Context = map[string]string{}
-		}
-		if o.Breadcrumbs == nil {
-			o.Breadcrumbs = []string{}
 		}
 		detail.Occurrences = append(detail.Occurrences, o)
 		return nil
 	})
 	if err != nil {
 		return nil, fmt.Errorf("occurrences: %w", err)
+	}
+
+	if detail.Trend, err = r.exceptionTrend(ctx, whereClause, args, f); err != nil {
+		return nil, fmt.Errorf("trend: %w", err)
 	}
 
 	// Occurrences (sum of count), not rows.

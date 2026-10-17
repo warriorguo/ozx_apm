@@ -152,6 +152,11 @@ type ExceptionGroup struct {
 	// older SDKs.
 	FirstErrorSessions int64 `json:"first_error_sessions"`
 	UnhandledCount     int64 `json:"unhandled_count"`
+	// APM-11: sessions whose rows of this group carry an error sequence
+	// (SDK with APM-3). FirstErrorSessions / SessionsWithSeq is the share of
+	// sessions in which this group was the first error; rows of older SDKs
+	// are in neither.
+	SessionsWithSeq int64 `json:"sessions_with_seq"`
 }
 
 // ExceptionDetail is one exception group for the detail page (APM-11): the
@@ -167,6 +172,51 @@ type ExceptionDetail struct {
 	Occurrences  []ExceptionOccurrence `json:"occurrences"`
 	VersionDist  []VersionDist         `json:"version_distribution"`
 	DeviceDist   []DeviceDist          `json:"device_distribution"`
+	// APM-11: occurrences (sum of count) per time bucket over the filter's range.
+	Trend ExceptionTrend `json:"trend"`
+}
+
+// ExceptionTrend is a group's occurrences per bucket of IntervalSeconds;
+// buckets without occurrences are left out.
+type ExceptionTrend struct {
+	IntervalSeconds int                   `json:"interval_seconds"`
+	Points          []ExceptionTrendPoint `json:"points"`
+}
+
+type ExceptionTrendPoint struct {
+	Timestamp time.Time `json:"timestamp"`
+	Count     int64     `json:"count"` // occurrences (sum of count)
+	Sessions  int64     `json:"sessions"`
+}
+
+// ExceptionOccurrencesResponse is one page of a group's occurrences, most
+// recent first (/api/exceptions/occurrences, APM-11).
+type ExceptionOccurrencesResponse struct {
+	Fingerprint string                `json:"fingerprint"`
+	Occurrences []ExceptionOccurrence `json:"occurrences"`
+	TotalCount  int64                 `json:"total_count"` // rows
+	Page        int                   `json:"page"`
+	PageSize    int                   `json:"page_size"`
+}
+
+// ExceptionDistribution is a group's occurrences (sum of count) per value of
+// a column (app_version, build_type, device_model, platform, os_version) or of
+// a context key (GroupBy "ctx:<key>"; Value "" = key not set). Merged:
+// occurrences whose value of the key is unknown because the SDK merged them
+// across contexts (APM-3); not in Rows, Total includes them.
+type ExceptionDistribution struct {
+	Fingerprint string                     `json:"fingerprint"`
+	GroupBy     string                     `json:"group_by"`
+	Total       int64                      `json:"total"`
+	Merged      int64                      `json:"merged"`
+	Truncated   bool                       `json:"truncated"`
+	Rows        []ExceptionDistributionRow `json:"rows"`
+}
+
+type ExceptionDistributionRow struct {
+	Value    string `json:"value"`
+	Count    int64  `json:"count"`
+	Sessions int64  `json:"sessions"`
 }
 
 // ExceptionSample is the representative occurrence: what the SDK sent, and
@@ -199,6 +249,7 @@ type ExceptionOccurrence struct {
 	OSVersion   string            `json:"os_version"`
 	Scene       string            `json:"scene"`
 	SessionID   string            `json:"session_id"`
+	DeviceID    string            `json:"device_id"` // APM-11: the anonymous device id (to list its sessions)
 	Context     map[string]string `json:"context"`
 	Breadcrumbs []string          `json:"breadcrumbs"`
 	// APM-3 (0 / "" / false for rows of older SDKs): which error of its
