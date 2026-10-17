@@ -48,7 +48,11 @@ func TestInsertPaths_RoundTripIdentically(t *testing.T) {
 				Timestamp: ts, EventID: "e2", Seq: 2, AppVersion: "1.2.3", Platform: "Android",
 				SessionID: session, DeviceID: "d", Fingerprint: "fp", Message: trickyText, Stack: "at A\nat B", Count: 7,
 			}
-			if err := repo.InsertJanks(ctx, []models.Jank{jank, jank}); err != nil {
+			// Two rows with different event_ids: since APM-19 the tables are
+			// ReplacingMergeTree, which collapses rows with the same event_id.
+			jank2 := jank
+			jank2.EventID = "e1b"
+			if err := repo.InsertJanks(ctx, []models.Jank{jank, jank2}); err != nil {
 				t.Fatalf("insert janks: %v", err)
 			}
 			if err := repo.InsertExceptions(ctx, []models.Exception{exc}); err != nil {
@@ -58,7 +62,7 @@ func TestInsertPaths_RoundTripIdentically(t *testing.T) {
 			var got models.Jank
 			row := client.Conn().QueryRow(ctx, `SELECT timestamp, event_id, seq, app_version, platform, device_model, os_version,
 				session_id, device_id, scene, duration_ms, max_frame_ms, recent_gc_count, recent_gc_alloc_kb, recent_events
-				FROM apm_janks WHERE session_id = ? LIMIT 1`, session)
+				FROM apm_janks WHERE session_id = ? AND event_id = 'e1'`, session)
 			if err := row.Scan(&got.Timestamp, &got.EventID, &got.Seq, &got.AppVersion, &got.Platform, &got.DeviceModel,
 				&got.OSVersion, &got.SessionID, &got.DeviceID, &got.Scene, &got.DurationMs, &got.MaxFrameMs,
 				&got.RecentGCCount, &got.RecentGCAllocKB, &got.RecentEvents); err != nil {
