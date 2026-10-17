@@ -354,6 +354,9 @@ namespace OzxApm.Tests
                 ExceptionParser.Analyze("exception", UnityMessage(ex), UnityStack(ex), "").Fingerprint,
                 ExceptionParser.Analyze("error", "x", "", ex.ToString()).Fingerprint,
                 "Unity's log of an exception and its ToString group together");
+            Assert.AreEqual(
+                ExceptionParser.Analyze("exception", UnityMessage(ex), UnityStackAtForm(ex), "").Fingerprint,
+                ExceptionParser.Analyze("error", "x", "", ex.ToString()).Fingerprint, "also in the (at file:line) form");
 
             RunOnThread(() =>
             {
@@ -400,6 +403,108 @@ namespace OzxApm.Tests
 
             RunOnThread(() => _collector.OnUnobservedForTests(new AggregateException(ex, new ArgumentException("second"))));
             StringAssert.StartsWith("System.AggregateException", _events.Last().message);
+        }
+
+        // ---- Review fixes: sessions, summary, untracked echo, unhandled overflow ----
+
+        // A new session without a pause (focus lost > 30 s, device id reset):
+        // the window closes, its counts keep their session, the new session's
+        // first error is error_seq 1 in its own row.
+        [Test]
+        public void NewSession_ClosesTheWindow()
+        {
+            _clock.Begin(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), "session-A");
+            _collector.Update();
+            Error(PlainError(1));
+            Error(PlainError(1));
+            Error(PlainError(1));
+            _clock.Begin(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), "session-B");
+            Error(PlainError(1));
+
+            Assert.AreEqual(3, _events.Count);
+            Assert.AreEqual("session-A", _events[0].session_id);
+            Assert.AreEqual(1, _events[0].error_seq);
+            var countA = _events[1];
+            Assert.AreEqual(2, countA.count);
+            Assert.AreEqual("session-A", countA.session_id);
+            Assert.AreEqual(2, countA.error_seq);
+            var firstB = _events[2];
+            Assert.AreEqual("session-B", firstB.session_id);
+            Assert.AreEqual(1, firstB.error_seq);
+            Assert.AreEqual(1, firstB.count);
+            Assert.IsNotNull(firstB.breadcrumbs, "a first occurrence again");
+
+            // Update notices a new session too.
+            Error(PlainError(1));
+            _clock.Begin(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), "session-C");
+            _collector.Update();
+            Assert.AreEqual(4, _events.Count);
+            Assert.AreEqual("session-B", _events[3].session_id);
+        }
+
+        [Test]
+        public void Summary_KeepsOnlyWhatAllItsOccurrencesShared()
+        {
+            GameContext.Set("levelId", "3");
+            GameContext.Set("roomId", "r-1");
+            for (int f = 0; f < ExceptionCollector.MaxFingerprintsPerWindow; f++)
+                Error(PlainError(f));
+            Error(PlainError(200));
+            GameContext.Set("roomId", "r-2");
+            Error(PlainError(201));
+            _collector.FlushPending();
+            var summary = _events.Single(e => e.message.StartsWith("[OzxApm] ", StringComparison.Ordinal));
+            Assert.AreEqual(2, summary.count);
+            Assert.IsTrue(summary.ctx_merged);
+            Assert.AreEqual("3", Ctx(summary, "levelId"));
+            Assert.IsNull(Ctx(summary, "roomId"));
+            Assert.IsNull(summary.unhandled);
+        }
+
+        [Test]
+        public void UntrackedException_AndItsUnhandledReport_CountOnce()
+        {
+            for (int f = 0; f < ExceptionCollector.MaxFingerprintsPerWindow; f++)
+                Error(PlainError(f));
+            var a = Capture(() => ApmTestGame.Throwers.Explode(11));
+            var b = Capture(() => ApmTestGame.Throwers.Explode(12));
+            RunOnThread(() =>
+            {
+                // Log first, then the report; then the report first, then the log (twice:
+                // the second log is a cached text).
+                _collector.HandleLogMessage(UnityMessage(a), UnityStack(a), LogType.Exception);
+                _collector.OnUnhandledForTests(a, false);
+                _collector.OnUnhandledForTests(b, false);
+                _collector.HandleLogMessage(UnityMessage(b), UnityStack(b), LogType.Exception);
+                _collector.OnUnhandledForTests(b, false);
+                _collector.HandleLogMessage(UnityMessage(b), UnityStack(b), LogType.Exception);
+            });
+            _collector.FlushPending();
+            var summary = _events.Single(e => e.message.StartsWith("[OzxApm] ", StringComparison.Ordinal));
+            Assert.AreEqual(3, summary.count, "three exceptions, each counted once");
+            Assert.AreEqual(ExceptionCollector.MaxFingerprintsPerWindow + 3, Sum(_events));
+        }
+
+        [Test]
+        public void UnhandledOccurrences_AreNotMergedWithLoggedOnes()
+        {
+            var ex = Capture(() => ApmTestGame.Throwers.Explode(13));
+            int rooms = ExceptionCollector.MaxBucketsPerFingerprint + 2;
+            RunOnThread(() =>
+            {
+                _collector.OnUnhandledForTests(ex, false); // first occurrence, unhandled
+                for (int r = 0; r < rooms; r++)
+                {
+                    GameContext.Set("roomId", "r-" + r);
+                    _collector.HandleLogMessage("x: " + ex.Message, "", LogType.Error); // other group, ignore
+                    _collector.OnUnobservedForTests(new AggregateException(ex));
+                }
+            });
+            _collector.FlushPending();
+            var group = _events.Where(e => e.fingerprint == _events[0].fingerprint).ToList();
+            Assert.AreEqual(1 + rooms, Sum(group));
+            Assert.IsTrue(group.All(e => e.unhandled != null), "every occurrence stays unhandled");
+            Assert.IsFalse(group.Any(e => e.ctx_merged && e.count == 0));
         }
 
         // ---- Cost ----
@@ -457,7 +562,22 @@ namespace OzxApm.Tests
         // type and message, and the frames in Unity's format.
         private static string UnityMessage(Exception ex) => ex.GetType().Name + ": " + ex.Message;
 
+        // Debug.LogException(ex) as Unity's log callback gets it on Mono/IL2CPP:
+        // the frames of Exception.ToString() as they are (see the APM-4 corpus,
+        // server/internal/fingerprint/testdata/mono/*.unity_logexception.txt).
         private static string UnityStack(Exception ex)
+        {
+            var lines = new List<string>();
+            foreach (var raw in ex.ToString().Split('\n'))
+            {
+                if (raw.TrimStart().StartsWith("at ", StringComparison.Ordinal))
+                    lines.Add(raw.TrimEnd('\r'));
+            }
+            return string.Join("\n", lines) + "\n";
+        }
+
+        // The same frames in the "Type.Method (args) (at file:line)" form.
+        private static string UnityStackAtForm(Exception ex)
         {
             var lines = new List<string>();
             foreach (var raw in ex.ToString().Split('\n'))

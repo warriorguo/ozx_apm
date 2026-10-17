@@ -164,7 +164,7 @@ namespace OzxApm.Core
             _sessionStart = DateTime.UtcNow;
             _lastActivity = _sessionStart;
             _sessionPersisted = false;
-            Clock.Begin(new DateTimeOffset(_sessionStart).ToUnixTimeMilliseconds());
+            Clock.Begin(new DateTimeOffset(_sessionStart).ToUnixTimeMilliseconds(), _sessionId);
 
             // Persist session info for crash recovery (only with consent)
             if (CanPersist)
@@ -236,6 +236,7 @@ namespace OzxApm.Core
     {
         private long _startUnixMs;
         private int _generation;
+        private volatile string _sessionId;
 
         /// <summary>Changes with every new session.</summary>
         public int Generation => Volatile.Read(ref _generation);
@@ -243,8 +244,12 @@ namespace OzxApm.Core
         /// <summary>Start of the current session, Unix milliseconds (UTC).</summary>
         public long StartUnixMs => Interlocked.Read(ref _startUnixMs);
 
-        internal void Begin(long startUnixMs)
+        /// <summary>The current session's id.</summary>
+        public string SessionId => _sessionId;
+
+        internal void Begin(long startUnixMs, string sessionId = null)
         {
+            _sessionId = sessionId;
             Interlocked.Exchange(ref _startUnixMs, startUnixMs);
             Interlocked.Increment(ref _generation);
         }

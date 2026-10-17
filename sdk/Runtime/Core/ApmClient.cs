@@ -1051,7 +1051,10 @@ namespace OzxApm.Core
                 evt.platform = _platform;
                 evt.device_model = _deviceModel;
                 evt.os_version = _osVersion;
-                evt.session_id = _sessionManager.SessionId;
+                // A collector may have set the session the event happened in
+                // (exception counts closed after a new session started).
+                if (string.IsNullOrEmpty(evt.session_id))
+                    evt.session_id = _sessionManager.SessionId;
                 evt.device_id = _sessionManager.DeviceId;
                 evt.scene = _currentScene;
                 StampContext(evt, _buildType, _gpu, _ramClass, _netType);

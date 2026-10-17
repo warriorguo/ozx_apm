@@ -106,18 +106,21 @@ namespace OzxApm.Collectors
         // ---- Window state, guarded by _sync ----
         private readonly Dictionary<string, Entry> _entries =
             new Dictionary<string, Entry>(MaxFingerprintsPerWindow, StringComparer.Ordinal);
-        // Entry of each distinct log text seen in the window (Untracked for texts
-        // of fingerprints beyond MaxFingerprintsPerWindow), so that a repeat is
-        // counted without parsing it again or allocating. Keyed by hashes of the
-        // text.
+        // Entry of each distinct log text seen in the window (an IsUntracked one
+        // for texts of fingerprints beyond MaxFingerprintsPerWindow), so that a
+        // repeat is counted without parsing it again or allocating. Keyed by
+        // hashes of the text.
         private readonly Dictionary<RawKey, Entry> _byRawKey =
             new Dictionary<RawKey, Entry>(MaxRawKeys, RawKeyComparer.Instance);
-        private static readonly Entry Untracked = new Entry();
         private int _windowStartTick;
         private int _immediateSent;
         private int _bucketsUsed;
         private int _untrackedCount;
-        private Occurrence _untrackedFirst;
+        private Occurrence _untrackedFirst; // its Ctx/Unhandled: what all summarized occurrences shared
+        private bool _untrackedMerged;
+        // The session the window's occurrences belong to (closed when it changes).
+        private int _windowGeneration = int.MinValue;
+        private string _windowSessionId;
         private readonly HashSet<string> _untrackedFingerprints = new HashSet<string>(StringComparer.Ordinal);
         // First occurrences held for HoldMs (off-main-thread logged exceptions).
         private readonly List<HeldEvent> _held = new List<HeldEvent>();
@@ -173,6 +176,8 @@ namespace OzxApm.Collectors
             public int BucketCount;
             public Bucket Last;     // the bucket counted last: checked first
             public Bucket Overflow;
+            public Bucket UnhandledOverflow; // unhandled occurrences beyond the limits: never merged with logged ones
+            public bool IsUntracked; // beyond MaxFingerprintsPerWindow: counted in the window's summary
         }
 
         /// <summary>Occurrences of one fingerprint in one game context (and kind).</summary>
@@ -302,6 +307,8 @@ namespace OzxApm.Collectors
         {
             _mainThreadId = Environment.CurrentManagedThreadId;
             Volatile.Write(ref _windowStartTick, Environment.TickCount);
+            lock (_sync)
+                SyncSessionLocked();
             _isActive = true;
         }
         internal SessionClock ClockForTests { set => _clock = value; }
@@ -327,6 +334,8 @@ namespace OzxApm.Collectors
             // Main thread (ApmClient).
             _mainThreadId = Environment.CurrentManagedThreadId;
             Volatile.Write(ref _windowStartTick, Environment.TickCount);
+            lock (_sync)
+                SyncSessionLocked();
             _isActive = true;
 
             // One callback for every thread: logMessageReceivedThreaded is called
@@ -343,7 +352,9 @@ namespace OzxApm.Collectors
                 return;
 
             int now = Environment.TickCount;
-            if (unchecked(now - Volatile.Read(ref _windowStartTick)) >= WindowMs)
+            var clock = _clock;
+            if (unchecked(now - Volatile.Read(ref _windowStartTick)) >= WindowMs ||
+                (clock != null && clock.Generation != Volatile.Read(ref _windowGeneration)))
                 FlushPending();
             else if (Volatile.Read(ref _heldCount) > 0)
                 ReleaseHeld(now, false);
@@ -370,8 +381,29 @@ namespace OzxApm.Collectors
             lock (_sync)
             {
                 events = CloseWindowLocked();
+                SyncSessionLocked();
             }
             EnqueueAll(events);
+        }
+
+        /// <summary>
+        /// Caller holds _sync. If a new session started since the window opened,
+        /// closes the window (its events keep the old session's id) and returns
+        /// its events, to be enqueued after the lock is released; null otherwise.
+        /// So no count spans two sessions and error_seq restarts cleanly.
+        /// </summary>
+        private List<ExceptionEvent> SyncSessionLocked()
+        {
+            var clock = _clock;
+            if (clock == null)
+                return null;
+            int generation = clock.Generation;
+            if (generation == _windowGeneration)
+                return null;
+            var events = _windowGeneration == int.MinValue ? null : CloseWindowLocked();
+            _windowGeneration = generation;
+            _windowSessionId = clock.SessionId;
+            return events;
         }
 
         /// <summary>Totals since start: occurrences seen, events enqueued, occurrences only in a summary.</summary>
@@ -506,24 +538,33 @@ namespace OzxApm.Collectors
                 Type = type
             };
             var ctx = GameContext.Current;
+            List<ExceptionEvent> closed = null;
+            bool counted = false;
             lock (_sync)
             {
+                // Checked under the lock: after Stop's final flush nothing is counted.
+                if (!_isActive)
+                    return;
+                closed = SyncSessionLocked();
                 if (_byRawKey.TryGetValue(key, out var known))
                 {
-                    if (track && IsEchoOfUnhandled(known))
-                        return;
-                    var occ = NewOccurrenceLocked(nowMs, ctx, null);
-                    if (ReferenceEquals(known, Untracked))
+                    counted = true;
+                    if (!(track && IsEchoOfUnhandled(known)))
                     {
-                        CountUntrackedLocked(ref occ, null);
-                        return;
+                        var occ = NewOccurrenceLocked(nowMs, ctx, null);
+                        object target = known;
+                        if (known.IsUntracked)
+                            CountUntrackedLocked(ref occ, null);
+                        else
+                            target = CountLocked(known, ref occ);
+                        if (track)
+                            RememberLog(known.Fingerprint, target, ref occ);
                     }
-                    var bucket = CountLocked(known, ref occ);
-                    if (track)
-                        RememberLog(known.Fingerprint, bucket, ref occ);
-                    return;
                 }
             }
+            EnqueueAll(closed);
+            if (counted)
+                return;
 
             // First time this text is seen in the window: parse it (allocates),
             // outside the lock.
@@ -539,10 +580,14 @@ namespace OzxApm.Collectors
             bool hold, bool track)
         {
             ExceptionEvent first = null;
+            List<ExceptionEvent> closed = null;
             lock (_sync)
             {
-                if (track && unhandled == null && IsEchoOfUnhandled(info))
+                if (!_isActive)
                     return;
+                closed = SyncSessionLocked();
+                if (track && unhandled == null && IsEchoOfUnhandled(info))
+                    goto Done;
 
                 // Another thread may have added the text meanwhile.
                 Entry entry;
@@ -550,19 +595,23 @@ namespace OzxApm.Collectors
                 {
                     if (!_entries.TryGetValue(info.Fingerprint, out entry))
                     {
-                        entry = _entries.Count < MaxFingerprintsPerWindow ? info : Untracked;
-                        if (entry == info)
+                        entry = info;
+                        if (_entries.Count < MaxFingerprintsPerWindow)
                             _entries[info.Fingerprint] = info;
+                        else
+                            info.IsUntracked = true;
                     }
                     if (cacheKey && _byRawKey.Count < MaxRawKeys)
                         _byRawKey[key] = entry;
                 }
 
                 var occ = NewOccurrenceLocked(nowMs, ctx, unhandled);
-                if (ReferenceEquals(entry, Untracked))
+                if (entry.IsUntracked)
                 {
-                    CountUntrackedLocked(ref occ, info.Fingerprint);
-                    return;
+                    CountUntrackedLocked(ref occ, entry.Fingerprint);
+                    if (track)
+                        RememberLog(entry.Fingerprint, entry, ref occ);
+                    goto Done;
                 }
 
                 if (entry == info && _immediateSent < MaxImmediatePerWindow)
@@ -571,7 +620,7 @@ namespace OzxApm.Collectors
                     // with the time it happened and the breadcrumbs that led to it.
                     _immediateSent++;
                     _eventsEnqueued++;
-                    first = BuildEvent(entry, 1, ref occ, false,
+                    first = BuildEvent(entry, 1, ref occ, false, _windowSessionId,
                         SnapshotBreadcrumbsLocked(MaxBreadcrumbsPerEvent, MaxBreadcrumbLength));
                     if (hold)
                     {
@@ -597,7 +646,9 @@ namespace OzxApm.Collectors
                     // Record as breadcrumb (once per group and window, not per repeat)
                     RecordBreadcrumbLocked("Exception: " + Truncate(FirstLine(info.Message), 100), nowMs);
                 }
+            Done:;
             }
+            EnqueueAll(closed);
             if (first != null)
                 Enqueue(first);
         }
@@ -658,9 +709,11 @@ namespace OzxApm.Collectors
             long nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
             bool mainThread = Environment.CurrentManagedThreadId == _mainThreadId;
             ExceptionEvent release = null;
+            List<ExceptionEvent> closed = null;
             bool done = false;
             lock (_sync)
             {
+                closed = SyncSessionLocked();
                 if (!mainThread && ReferenceEquals(t_logOwner, this) && t_logFingerprint == info.Fingerprint &&
                     unchecked(Environment.TickCount - t_logTick) < EchoWindowMs)
                 {
@@ -677,14 +730,26 @@ namespace OzxApm.Collectors
                     else if (target is Bucket bucket && t_logWindow == _windowId && bucket.Count > 0 &&
                              _entries.TryGetValue(info.Fingerprint, out var entry))
                     {
-                        bucket.Count--;
                         var occ = t_logOccurrence;
-                        occ.Unhandled = kind;
-                        CountLocked(entry, ref occ);
+                        if (bucket.Count == 1 && bucket.Unhandled == null)
+                        {
+                            // Only this occurrence: the count itself becomes unhandled.
+                            bucket.Unhandled = kind;
+                        }
+                        else if (bucket.FirstSeq != occ.Seq)
+                        {
+                            bucket.Count--;
+                            occ.Unhandled = kind;
+                            CountLocked(entry, ref occ);
+                        }
+                        // else: it was the first of a count that went on; moving it would
+                        // leave the count with the wrong first occurrence. Left unmarked.
                     }
+                    // An untracked one (in the window's summary): counted once already.
                 }
             }
 
+            EnqueueAll(closed);
             if (release != null)
                 Enqueue(release);
             if (!done)
@@ -716,7 +781,7 @@ namespace OzxApm.Collectors
                 t_echoFingerprint = null;
                 return false;
             }
-            if (ReferenceEquals(entry, Untracked) || entry.Fingerprint != t_echoFingerprint)
+            if (entry.Fingerprint != t_echoFingerprint)
                 return false;
             t_echoFingerprint = null;
             return true;
@@ -811,24 +876,23 @@ namespace OzxApm.Collectors
                     e.Buckets[e.BucketCount++] = b;
                     _bucketsUsed++;
                 }
-                else if (e.Overflow == null || e.Overflow.Count == 0)
-                {
-                    b = e.Overflow = new Bucket { Ctx = occ.Ctx, Unhandled = occ.Unhandled };
-                }
                 else
                 {
-                    // More contexts than are kept apart: keep only what they share.
-                    b = e.Overflow;
-                    if (!b.Ctx.SameAs(occ.Ctx))
+                    // More contexts than are kept apart: one count per fingerprint
+                    // (one for logged, one for unhandled occurrences) keeping only
+                    // the context entries they share. An unhandled one keeps the
+                    // first kind it saw.
+                    ref Bucket overflow = ref (occ.Unhandled == null ? ref e.Overflow : ref e.UnhandledOverflow);
+                    if (overflow == null || overflow.Count == 0)
                     {
-                        b.Ctx = b.Ctx.Intersect(occ.Ctx);
-                        b.Merged = true;
+                        overflow = new Bucket { Ctx = occ.Ctx, Unhandled = occ.Unhandled };
                     }
-                    if (!string.Equals(b.Unhandled, occ.Unhandled, StringComparison.Ordinal))
+                    else if (!overflow.Ctx.SameAs(occ.Ctx))
                     {
-                        b.Unhandled = null;
-                        b.Merged = true;
+                        overflow.Ctx = overflow.Ctx.Intersect(occ.Ctx);
+                        overflow.Merged = true;
                     }
+                    b = overflow;
                 }
             }
             if (b.Count == 0)
@@ -845,7 +909,7 @@ namespace OzxApm.Collectors
         private static Bucket FindBucket(Entry e, ref Occurrence occ)
         {
             var last = e.Last;
-            if (last != null && last != e.Overflow && ReferenceEquals(last.Ctx, occ.Ctx) &&
+            if (last != null && last != e.Overflow && last != e.UnhandledOverflow && ReferenceEquals(last.Ctx, occ.Ctx) &&
                 string.Equals(last.Unhandled, occ.Unhandled, StringComparison.Ordinal))
                 return last;
             for (int i = 0; i < e.BucketCount; i++)
@@ -860,7 +924,20 @@ namespace OzxApm.Collectors
         private void CountUntrackedLocked(ref Occurrence occ, string fingerprint)
         {
             if (_untrackedCount == 0)
+            {
                 _untrackedFirst = occ;
+                _untrackedMerged = false;
+            }
+            else
+            {
+                if (!_untrackedFirst.Ctx.SameAs(occ.Ctx))
+                {
+                    _untrackedFirst.Ctx = _untrackedFirst.Ctx.Intersect(occ.Ctx);
+                    _untrackedMerged = true;
+                }
+                if (!string.Equals(_untrackedFirst.Unhandled, occ.Unhandled, StringComparison.Ordinal))
+                    _untrackedFirst.Unhandled = null; // mixed: reported as logged
+            }
             if (_untrackedCount < int.MaxValue)
                 _untrackedCount++;
             _untrackedTotal++;
@@ -886,9 +963,11 @@ namespace OzxApm.Collectors
             {
                 var e = kvp.Value;
                 for (int i = 0; i < e.BucketCount; i++)
-                    AddBucketEvent(ref events, e, e.Buckets[i]);
+                    AddBucketEvent(ref events, e, e.Buckets[i], _windowSessionId);
                 if (e.Overflow != null)
-                    AddBucketEvent(ref events, e, e.Overflow);
+                    AddBucketEvent(ref events, e, e.Overflow, _windowSessionId);
+                if (e.UnhandledOverflow != null)
+                    AddBucketEvent(ref events, e, e.UnhandledOverflow, _windowSessionId);
             }
 
             if (_untrackedCount > 0)
@@ -907,7 +986,7 @@ namespace OzxApm.Collectors
                 };
                 summary.Fingerprint = ExceptionParser.Analyze(summary.LogType, summary.Message, "", "").Fingerprint;
                 var occ = _untrackedFirst;
-                (events ?? (events = new List<ExceptionEvent>())).Add(BuildEvent(summary, _untrackedCount, ref occ, false, null));
+                (events ?? (events = new List<ExceptionEvent>())).Add(BuildEvent(summary, _untrackedCount, ref occ, _untrackedMerged, _windowSessionId, null));
             }
 
             _entries.Clear();
@@ -915,6 +994,7 @@ namespace OzxApm.Collectors
             _untrackedFingerprints.Clear();
             _untrackedCount = 0;
             _untrackedFirst = default;
+            _untrackedMerged = false;
             _immediateSent = 0;
             _bucketsUsed = 0;
             _windowId++;
@@ -924,7 +1004,7 @@ namespace OzxApm.Collectors
             return events;
         }
 
-        private static void AddBucketEvent(ref List<ExceptionEvent> events, Entry e, Bucket b)
+        private static void AddBucketEvent(ref List<ExceptionEvent> events, Entry e, Bucket b, string sessionId)
         {
             if (b.Count <= 0)
                 return;
@@ -936,7 +1016,7 @@ namespace OzxApm.Collectors
                 Ctx = b.Ctx,
                 Unhandled = b.Unhandled
             };
-            (events ?? (events = new List<ExceptionEvent>())).Add(BuildEvent(e, b.Count, ref occ, b.Merged, null));
+            (events ?? (events = new List<ExceptionEvent>())).Add(BuildEvent(e, b.Count, ref occ, b.Merged, sessionId, null));
         }
 
         /// <summary>
@@ -1001,7 +1081,7 @@ namespace OzxApm.Collectors
             return info;
         }
 
-        private static ExceptionEvent BuildEvent(Entry info, int count, ref Occurrence occ, bool merged, List<string> breadcrumbs)
+        private static ExceptionEvent BuildEvent(Entry info, int count, ref Occurrence occ, bool merged, string sessionId, List<string> breadcrumbs)
         {
             // Repeat counts carry the same text as the first occurrence, so the
             // server computes the same fingerprint for them.
@@ -1019,6 +1099,8 @@ namespace OzxApm.Collectors
                 session_ms = occ.SessionMs,
                 unhandled = occ.Unhandled,
                 ctx_merged = merged,
+                // The session it happened in (null: the current one, set at enqueue).
+                session_id = sessionId,
                 // The context when it happened (not when it is enqueued).
                 ctx = occ.Ctx
             };
