@@ -26,7 +26,7 @@ func privacyTestDB(kind string) string {
 	return fmt.Sprintf("ozx_apm_apm14_%s_%d", kind, time.Now().UnixNano()%1e9)
 }
 
-// seedDevice writes rows of the device into all six event tables: n rows of
+// seedDevice writes rows of the device into all event tables: n rows of
 // each type, plus the first perf sample once more in a separate insert (a
 // re-sent duplicate in another part, as APM-19 phase B leaves until a merge).
 // Returns the number of distinct rows per table (the duplicate may be merged
@@ -42,6 +42,8 @@ func seedDevice(t *testing.T, client *storage.ClickHouseClient, device string, n
 	var loads []models.SceneLoad
 	var excs []models.Exception
 	var crashes []models.Crash
+	var customs []models.CustomEvent
+	var metricRows []models.CustomMetric
 	for i := 0; i < n; i++ {
 		id := fmt.Sprintf("%s-%d", device, i)
 		at := ts.Add(time.Duration(i) * time.Second)
@@ -51,6 +53,9 @@ func seedDevice(t *testing.T, client *storage.ClickHouseClient, device string, n
 		loads = append(loads, models.SceneLoad{Timestamp: at, EventID: id + "l", AppVersion: "1.0", Platform: "Android", SessionID: "s-" + device, DeviceID: device, SceneName: "A", LoadMs: 10})
 		excs = append(excs, models.Exception{Timestamp: at, EventID: id + "e", AppVersion: "1.0", Platform: "Android", SessionID: "s-" + device, DeviceID: device, Scene: "A", Fingerprint: "F", Message: "m", Stack: "s", Count: 2})
 		crashes = append(crashes, models.Crash{Timestamp: at, EventID: id + "c", AppVersion: "1.0", Platform: "Android", SessionID: "s-" + device, DeviceID: device, Scene: "A", CrashType: "native", Fingerprint: "C", Stack: "s", Breadcrumbs: []string{"b"}})
+		customs = append(customs, models.CustomEvent{Timestamp: at, EventID: id + "ce", AppVersion: "1.0", Platform: "Android", SessionID: "s-" + device, DeviceID: device, Scene: "A", Name: "room_enter", Count: 1,
+			Props: map[string]string{"roomId": "1"}})
+		metricRows = append(metricRows, customMetricRow(at, id+"cm", "1.0", "room_switch_ms", "s-"+device, device, 700))
 	}
 	must(t, repo.InsertPerfSamples(ctx, perf))
 	must(t, repo.InsertPerfSamples(ctx, perf[:1])) // duplicate in a second part
@@ -59,6 +64,8 @@ func seedDevice(t *testing.T, client *storage.ClickHouseClient, device string, n
 	must(t, repo.InsertSceneLoads(ctx, loads))
 	must(t, repo.InsertExceptions(ctx, excs))
 	must(t, repo.InsertCrashes(ctx, crashes))
+	must(t, repo.InsertCustomEvents(ctx, customs))
+	must(t, repo.InsertCustomMetrics(ctx, metricRows))
 	counts := map[string]uint64{}
 	for _, et := range storage.EventTables {
 		counts[et.Name] = uint64(n)
@@ -83,11 +90,13 @@ func deviceRows(t *testing.T, client *storage.ClickHouseClient, device string, f
 // whatever the test account may read).
 func viewTotals(t *testing.T, client *storage.ClickHouseClient) string {
 	t.Helper()
-	return fmt.Sprintf("fps=%d startup=%d exc=%d crash=%d",
+	return fmt.Sprintf("fps=%d startup=%d exc=%d crash=%d custom=%d metric=%d",
 		queryUint(t, client, "SELECT toUInt64(sum(sample_count)) FROM apm_fps_daily"),
 		queryUint(t, client, "SELECT toUInt64(sum(sample_count)) FROM apm_startup_daily"),
 		queryUint(t, client, "SELECT toUInt64(sum(total_count)) FROM apm_exception_daily"),
-		queryUint(t, client, "SELECT toUInt64(sum(crash_count)) FROM apm_crash_daily"))
+		queryUint(t, client, "SELECT toUInt64(sum(crash_count)) FROM apm_crash_daily"),
+		queryUint(t, client, "SELECT toUInt64(sum(total_count)) FROM apm_custom_event_daily"),
+		queryUint(t, client, "SELECT toUInt64(sumMerge(samples)) FROM apm_custom_metric_daily"))
 }
 
 func privacyPost(t *testing.T, router http.Handler, path, id, confirm string) (int, []byte) {
@@ -149,7 +158,8 @@ func runDeletionScenario(t *testing.T, owner *storage.ClickHouseClient, router h
 	var d models.PrivacyDeletion
 	decodeInto(t, body, &d)
 	// 3 per event table and the backup, plus the duplicate unless a merge removed it.
-	if d.Status != models.PrivacyStatusDone || d.RowsRemaining != 0 || d.RowsDeleted < 3*7 || d.RowsDeleted > 3*7+2 || len(d.Tables) != 7 {
+	nt := len(storage.EventTables) + 1
+	if d.Status != models.PrivacyStatusDone || d.RowsRemaining != 0 || d.RowsDeleted < uint64(3*nt) || d.RowsDeleted > uint64(3*nt+2) || len(d.Tables) != nt {
 		t.Errorf("deletion %+v", d)
 	}
 	t.Logf("deleted %d rows from %d tables", d.RowsDeleted, len(d.Tables))
@@ -191,7 +201,7 @@ func runDeletionScenario(t *testing.T, owner *storage.ClickHouseClient, router h
 	code, body = privacyPost(t, router, "/api/privacy/verify", target, "")
 	var v models.PrivacyVerification
 	decodeInto(t, body, &v)
-	if code != http.StatusOK || v.RowsRemaining != 0 || len(v.Tables) != 7 || len(v.Deletions) != 2 ||
+	if code != http.StatusOK || v.RowsRemaining != 0 || len(v.Tables) != nt || len(v.Deletions) != 2 ||
 		v.Deletions[0].Status != "done" || v.Deletions[0].RowsBefore != d.RowsDeleted {
 		t.Errorf("verify %d %+v", code, v)
 	}
@@ -204,12 +214,12 @@ func runDeletionScenario(t *testing.T, owner *storage.ClickHouseClient, router h
 	seedDevice(t, owner, target, 1)
 	code, body = privacyPost(t, router, "/api/privacy/verify", target, "")
 	decodeInto(t, body, &v)
-	if v.RowsRemaining < 6 || v.RowsRemaining > 7 { // one row per event table (+ the duplicate perf row)
+	if v.RowsRemaining < uint64(nt-1) || v.RowsRemaining > uint64(nt) { // one row per event table (+ the duplicate perf row)
 		t.Errorf("verify after a late insert: %d rows", v.RowsRemaining)
 	}
 	code, body = privacyPost(t, router, "/api/privacy/delete", target, target)
 	decodeInto(t, body, &d)
-	if code != http.StatusOK || d.Status != "done" || d.RowsDeleted < 6 || d.RowsRemaining != 0 {
+	if code != http.StatusOK || d.Status != "done" || d.RowsDeleted < uint64(nt-1) || d.RowsRemaining != 0 {
 		t.Errorf("second deletion %d %+v", code, d)
 	}
 	code, body = privacyPost(t, router, "/api/privacy/delete", target, target)

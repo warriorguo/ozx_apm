@@ -18,8 +18,8 @@ import (
 )
 
 // APM-17: Migrate (run at every server start) must produce the same schema as
-// scripts/migrate.sql: TTL on every event table and the four apm_*_daily
-// views, and it must upgrade the two kinds of existing databases without
+// scripts/migrate.sql: TTL on every event table and the apm_*_daily views
+// (four, six since APM-6), and it must upgrade the two kinds of existing databases without
 // losing rows:
 //   - "startup": tables created by Migrate before APM-17 (no TTL, no views);
 //   - "production": tables created by migrate.sql (TTL and views, as on n192).
@@ -153,6 +153,24 @@ func queryUint(t *testing.T, client *storage.ClickHouseClient, query string, arg
 	return n
 }
 
+// legacyEventTables are the event tables of the legacy schemas (the
+// fixture predates APM-6's apm_custom_events and apm_custom_metrics, which
+// Migrate creates with their TTL).
+func legacyEventTables() []storage.EventTable {
+	var out []storage.EventTable
+	for _, et := range storage.EventTables {
+		if et != storage.TableCustomEvents && et != storage.TableCustomMetrics {
+			out = append(out, et)
+		}
+	}
+	return out
+}
+
+// allViews are the apm_*_daily views of the schema, in name order.
+const allViews = "apm_crash_daily,apm_custom_event_daily,apm_custom_metric_daily,apm_exception_daily,apm_fps_daily,apm_startup_daily"
+
+const numViews = 6
+
 type schemaState struct {
 	ttl         map[string]bool // event table -> has TTL 30 days
 	views       []string        // apm_*_daily views present
@@ -224,7 +242,7 @@ func TestMigrate_FreshInstallHasTTLAndViews(t *testing.T) {
 			t.Errorf("%s has no 30-day TTL", et.Name)
 		}
 	}
-	if strings.Join(st.views, ",") != "apm_crash_daily,apm_exception_daily,apm_fps_daily,apm_startup_daily" || st.viewTargets != 4 {
+	if strings.Join(st.views, ",") != allViews || st.viewTargets != numViews {
 		t.Errorf("views %v, %d inner tables", st.views, st.viewTargets)
 	}
 	if n := logs.Len(); n != 0 {
@@ -233,7 +251,7 @@ func TestMigrate_FreshInstallHasTTLAndViews(t *testing.T) {
 
 	// Idempotent: a restart changes nothing and logs nothing.
 	must(t, client.Migrate(context.Background()))
-	if again := readSchemaState(t, client); len(again.views) != 4 || again.viewTargets != 4 {
+	if again := readSchemaState(t, client); len(again.views) != numViews || again.viewTargets != numViews {
 		t.Errorf("after restart: %+v", again)
 	}
 	if n := logs.Len(); n != 0 {
@@ -303,7 +321,7 @@ func seedLegacyRows(t *testing.T, client *storage.ClickHouseClient) string {
 
 func assertLegacyRowsIntact(t *testing.T, client *storage.ClickHouseClient, session string) {
 	t.Helper()
-	for _, et := range storage.EventTables {
+	for _, et := range legacyEventTables() {
 		if n := queryUint(t, client, "SELECT count() FROM "+et.Name+" WHERE session_id = ?", session); n != 1 {
 			t.Errorf("%s: %d rows of the legacy session, want 1", et.Name, n)
 		}
@@ -326,13 +344,17 @@ func TestMigrate_UpgradesStartupCreatedDatabase(t *testing.T) {
 
 	must(t, client.Migrate(context.Background()))
 	st := readSchemaState(t, client)
-	if len(st.views) != 4 || st.viewTargets != 4 {
+	if len(st.views) != numViews || st.viewTargets != numViews {
 		t.Errorf("views %v, %d inner tables", st.views, st.viewTargets)
 	}
-	for _, et := range storage.EventTables {
+	for _, et := range legacyEventTables() {
 		if st.ttl[et.Name] {
 			t.Errorf("%s: Migrate must not add a TTL to an existing table", et.Name)
 		}
+	}
+	// Tables Migrate creates (APM-6) have it.
+	if !st.ttl[storage.TableCustomEvents.Name] || !st.ttl[storage.TableCustomMetrics.Name] {
+		t.Errorf("new tables without TTL: %v", st.ttl)
 	}
 	if got := warnings(logs, warnNoTTL); len(got) != 6 {
 		t.Errorf("TTL warnings %v, want one per event table", got)
@@ -352,7 +374,7 @@ func TestMigrate_UpgradesStartupCreatedDatabase(t *testing.T) {
 	if n := logs.Len(); n != 0 {
 		t.Errorf("after the admin step: %d warnings: %v", n, logs.All())
 	}
-	if st := readSchemaState(t, client); len(st.views) != 4 || st.viewTargets != 4 {
+	if st := readSchemaState(t, client); len(st.views) != numViews || st.viewTargets != numViews {
 		t.Errorf("views doubled or lost: %+v", st)
 	}
 	// Rows inside the TTL survive it.
@@ -373,12 +395,12 @@ func TestMigrate_UpgradesProductionDatabase(t *testing.T) {
 	must(t, client.Migrate(context.Background()))
 	must(t, client.Migrate(context.Background()))
 	st := readSchemaState(t, client)
-	if len(st.views) != 4 || st.viewTargets != 4 {
+	if len(st.views) != numViews || st.viewTargets != numViews {
 		t.Errorf("views %v, %d inner tables", st.views, st.viewTargets)
 	}
 	for _, et := range storage.EventTables {
 		if !st.ttl[et.Name] {
-			t.Errorf("%s lost its TTL", et.Name)
+			t.Errorf("%s lost its TTL (or a new table has none)", et.Name)
 		}
 	}
 	if n := logs.Len(); n != 0 {
@@ -426,7 +448,7 @@ func TestMigrate_UpgradedTablesMatchFreshInstall(t *testing.T) {
 			execAll(t, client, legacySchema(t, kind))
 			session := seedLegacyRows(t, client)
 			must(t, client.Migrate(context.Background()))
-			for _, et := range storage.EventTables {
+			for _, et := range legacyEventTables() {
 				if got, want := columnsOf(t, client, et.Name), columnsOf(t, freshClient, et.Name); got != want {
 					t.Errorf("%s columns differ from a fresh install:\n got %s\nwant %s", et.Name, got, want)
 				}
@@ -474,7 +496,7 @@ func TestMigrate_WithServiceAccountPrivileges(t *testing.T) {
 			// missing must have been reported.
 			st := readSchemaState(t, client)
 			viewWarnings := warnings(logs, warnNoView)
-			if len(st.views)+len(viewWarnings) != 4 || st.viewTargets != len(st.views) {
+			if len(st.views)+len(viewWarnings) != numViews || st.viewTargets != len(st.views) {
 				t.Errorf("views %v (inner tables %d), warnings %v", st.views, st.viewTargets, viewWarnings)
 			}
 			t.Logf("service account: %d views present, %d not creatable", len(st.views), len(viewWarnings))
