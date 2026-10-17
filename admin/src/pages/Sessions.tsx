@@ -275,7 +275,7 @@ function SessionView({ sessionId, at, startTime, endTime }: SessionViewProps) {
       {data.truncated.length > 0 && (
         <p className="text-xs bg-amber-50 text-amber-800 rounded p-2">
           More data than shown for: {data.truncated.map((t) => typeLabels[t as TimelineType]?.label ?? t).join(', ')}.
-          {at ? ' The items nearest to the selected moment are shown.' : ' The earliest items are shown.'} Narrow the time
+          {at ? ' The items nearest to the selected moment are shown (for context changes, the earliest).' : ' The earliest items are shown.'} Narrow the time
           range to see the rest.
         </p>
       )}
@@ -310,7 +310,7 @@ function SessionHeader({ timeline: t }: { timeline: SessionTimeline }) {
         {s.device_id && (
           <p className="md:col-span-2 break-all">
             <span className="text-gray-500">Device id:</span> <span className="font-mono">{s.device_id}</span>{' '}
-            <Link to={deviceSessionsLink(s.device_id)} className="text-blue-600 hover:underline">
+            <Link to={deviceSessionsLink(s.device_id, s.last_seen)} className="text-blue-600 hover:underline">
               Other sessions of this device
             </Link>
           </p>

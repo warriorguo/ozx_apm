@@ -138,7 +138,7 @@ describe('Sessions page (APM-15)', () => {
     expect(document.querySelector('script')).toBeNull()
 
     // The device's other sessions, encoded.
-    expect(screen.getByText('Other sessions of this device').closest('a')!.getAttribute('href')).toBe('/sessions?device_id=dev%2FS1')
+    expect(screen.getByText('Other sessions of this device').closest('a')!.getAttribute('href')).toMatch(/^\/sessions\?device_id=dev%2FS1\&start_time=/)
 
     // Filter by type: hide the log lines and breadcrumbs, then the context.
     fireEvent.click(screen.getByLabelText('Show Log / breadcrumb'))
