@@ -112,6 +112,13 @@ namespace OzxApm.Utils
                     AppendField(sb, "message", exc.message);
                     AppendField(sb, "stack", exc.stack);
                     AppendField(sb, "count", exc.count);
+                    // APM-4; absent fields are what older SDKs send.
+                    if (!string.IsNullOrEmpty(exc.log_type))
+                        AppendField(sb, "log_type", exc.log_type);
+                    if (!string.IsNullOrEmpty(exc.embedded_exception))
+                        AppendField(sb, "embedded_exception", exc.embedded_exception);
+                    if (exc.breadcrumbs != null && exc.breadcrumbs.Count > 0)
+                        AppendFieldArray(sb, "breadcrumbs", exc.breadcrumbs);
                     break;
 
                 case CrashEvent crash:

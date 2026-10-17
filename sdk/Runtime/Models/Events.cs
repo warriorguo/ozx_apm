@@ -97,10 +97,21 @@ namespace OzxApm.Models
     [Serializable]
     public class ExceptionEvent : BaseEvent
     {
+        /// <summary>The SDK's fingerprint (de-duplication on the device); the server recomputes its own (APM-4).</summary>
         public string fingerprint;
         public string message;
         public string stack;
         public int count;
+        /// <summary>"exception", "error" or "assert" (APM-4).</summary>
+        public string log_type;
+        /// <summary>
+        /// The exception found in an error log's message (Exception.ToString():
+        /// type, message, stack, inner exceptions), extracted before the message
+        /// is cut to 500 characters; empty if there is none (APM-4).
+        /// </summary>
+        public string embedded_exception;
+        /// <summary>Breadcrumbs recorded before the first occurrence; null for repeat counts (APM-4).</summary>
+        public List<string> breadcrumbs;
 
         public ExceptionEvent()
         {

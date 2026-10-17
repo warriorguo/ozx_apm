@@ -1,8 +1,6 @@
 using System;
 using System.Collections.Generic;
 using System.Globalization;
-using System.Security.Cryptography;
-using System.Text;
 using UnityEngine;
 using OzxApm.Core;
 using OzxApm.Models;
@@ -25,9 +23,32 @@ namespace OzxApm.Collectors
         private const float DedupeWindowSeconds = 60f;
         private float _lastCleanupTime;
 
-        // Breadcrumbs for crash context
-        private readonly Queue<string> _breadcrumbs = new Queue<string>();
+        // What is sent (APM-4). The embedded exception is extracted from the
+        // full message before the message is cut, and kept under the stack's
+        // limit, not the message's.
+        internal const int MaxMessageLength = 500;
+        internal const int MaxStackLength = 8000;
+        internal const int MaxEmbeddedLength = 8000;
+
+        // Fingerprint of each distinct log text seen in the current window, so
+        // that a repeat is counted without parsing it again or allocating
+        // (APM-3/APM-4: an error logged every frame must stay cheap). Keyed by
+        // hashes of the text, cleared with the window.
+        private readonly Dictionary<RawKey, string> _fingerprintByRawKey =
+            new Dictionary<RawKey, string>(MaxRawKeys, RawKeyComparer.Instance);
+        private const int MaxRawKeys = 256;
+
+        // Breadcrumbs for crash context: a ring of (time, message), formatted
+        // only when they are sent, so recording one does not allocate.
         private const int MaxBreadcrumbs = 50;
+        private readonly long[] _breadcrumbTimes = new long[MaxBreadcrumbs];
+        private readonly string[] _breadcrumbMessages = new string[MaxBreadcrumbs];
+        private int _breadcrumbStart;
+        private int _breadcrumbCount;
+        // Sent with the first occurrence of an exception: the most recent ones,
+        // each cut to a bounded length (at most ~4.5 KB per event).
+        internal const int MaxBreadcrumbsPerEvent = 20;
+        internal const int MaxBreadcrumbLength = 200;
 
         // Within a dedupe window, the first occurrence of a fingerprint is enqueued
         // (and so persisted) immediately with count=1. Further occurrences are only
@@ -37,14 +58,53 @@ namespace OzxApm.Collectors
         private class ExceptionInfo
         {
             public string Fingerprint;
+            public string LogType;
             public string Message;
             public string Stack;
+            public string Embedded;
             public int RepeatCount;
             public long RepeatFirstSeenMs;
             public ContextSnapshot RepeatContext; // game context at the first repeat
         }
 
+        // The whole text is hashed (string.GetHashCode, native on Mono and
+        // IL2CPP): what makes two wrapped exceptions different (the outer
+        // exception's frames) can be anywhere in a long message. Two different
+        // texts share an entry only if both 32-bit hashes and both lengths are
+        // equal.
+        private struct RawKey
+        {
+            public int MessageHash;
+            public int StackHash;
+            public int MessageLength;
+            public int StackLength;
+            public LogType Type;
+        }
+
+        // A class comparer: no boxing, and no reliance on EqualityComparer<T>.Default
+        // for a value type under IL2CPP.
+        private sealed class RawKeyComparer : IEqualityComparer<RawKey>
+        {
+            public static readonly RawKeyComparer Instance = new RawKeyComparer();
+
+            public bool Equals(RawKey a, RawKey b)
+            {
+                return a.MessageHash == b.MessageHash && a.StackHash == b.StackHash &&
+                       a.MessageLength == b.MessageLength && a.StackLength == b.StackLength && a.Type == b.Type;
+            }
+
+            public int GetHashCode(RawKey k)
+            {
+                return unchecked(k.MessageHash ^ (k.StackHash * 31) ^ k.MessageLength ^ (int)k.Type);
+            }
+        }
+
         public bool IsActive => _isActive;
+
+        // Test seams: receive the events instead of ApmClient.EnqueueEvent, and
+        // activate without subscribing to Unity's log callback.
+        internal Action<ExceptionEvent> EnqueueForTests;
+        internal void ActivateForTests() => _isActive = true;
 
         public ExceptionCollector(ApmConfig config, ApmClient client)
         {
@@ -94,28 +154,45 @@ namespace OzxApm.Collectors
         }
 
         /// <summary>
-        /// Records a breadcrumb for crash context
+        /// Records a breadcrumb for crash context. Does not allocate.
         /// </summary>
         public void RecordBreadcrumb(string message)
         {
             if (string.IsNullOrEmpty(message))
                 return;
 
-            if (_breadcrumbs.Count >= MaxBreadcrumbs)
-            {
-                _breadcrumbs.Dequeue();
-            }
-
-            string timestamp = DateTime.UtcNow.ToString("HH:mm:ss.fff", CultureInfo.InvariantCulture);
-            _breadcrumbs.Enqueue($"[{timestamp}] {message}");
+            int i = (_breadcrumbStart + _breadcrumbCount) % MaxBreadcrumbs;
+            if (_breadcrumbCount == MaxBreadcrumbs)
+                _breadcrumbStart = (_breadcrumbStart + 1) % MaxBreadcrumbs;
+            else
+                _breadcrumbCount++;
+            _breadcrumbTimes[i] = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            _breadcrumbMessages[i] = message;
         }
 
         /// <summary>
-        /// Gets current breadcrumbs for crash reports
+        /// Gets current breadcrumbs for crash reports, oldest first, as
+        /// "[HH:mm:ss.fff] message" (UTC).
         /// </summary>
         public List<string> GetBreadcrumbs()
         {
-            return new List<string>(_breadcrumbs);
+            return SnapshotBreadcrumbs(MaxBreadcrumbs, int.MaxValue);
+        }
+
+        /// <summary>The most recent breadcrumbs (at most max), oldest first, each cut to maxLength.</summary>
+        internal List<string> SnapshotBreadcrumbs(int max, int maxLength)
+        {
+            int n = Math.Min(max, _breadcrumbCount);
+            var list = new List<string>(n);
+            for (int k = _breadcrumbCount - n; k < _breadcrumbCount; k++)
+            {
+                int i = (_breadcrumbStart + k) % MaxBreadcrumbs;
+                string time = DateTimeOffset.FromUnixTimeMilliseconds(_breadcrumbTimes[i]).UtcDateTime
+                    .ToString("HH:mm:ss.fff", CultureInfo.InvariantCulture);
+                string text = "[" + time + "] " + _breadcrumbMessages[i];
+                list.Add(text.Length > maxLength ? Truncate(text, maxLength) : text);
+            }
+            return list;
         }
 
         private void OnLogMessage(string message, string stackTrace, LogType type)
@@ -132,7 +209,8 @@ namespace OzxApm.Collectors
             }
         }
 
-        private void HandleLogMessage(string message, string stackTrace, LogType type)
+        // Internal for tests: the log callback's work.
+        internal void HandleLogMessage(string message, string stackTrace, LogType type)
         {
             if (!_isActive)
                 return;
@@ -146,41 +224,92 @@ namespace OzxApm.Collectors
                 return;
 
             message = message ?? "";
-            string fingerprint = GenerateFingerprint(message, stackTrace);
+            stackTrace = stackTrace ?? "";
             long nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 
-            if (_recentExceptions.TryGetValue(fingerprint, out var existing))
+            // A repeat of a text already seen in this window: count it. No
+            // parsing, no allocation.
+            var key = new RawKey
             {
-                // Deduplicate - count it, report at the end of the window
-                if (existing.RepeatCount == 0)
-                {
-                    existing.RepeatFirstSeenMs = nowMs;
-                    existing.RepeatContext = GameContext.Current;
-                }
-                existing.RepeatCount++;
-            }
-            else
+                MessageHash = message.GetHashCode(),
+                StackHash = stackTrace.GetHashCode(),
+                MessageLength = message.Length,
+                StackLength = stackTrace.Length,
+                Type = type
+            };
+            if (_fingerprintByRawKey.TryGetValue(key, out var knownFingerprint) &&
+                _recentExceptions.TryGetValue(knownFingerprint, out var known))
             {
-                // New exception
-                if (_recentExceptions.Count >= MaxRecentExceptions)
-                {
-                    FlushExceptions();
-                }
-
-                var info = new ExceptionInfo
-                {
-                    Fingerprint = fingerprint,
-                    Message = TruncateMessage(message, 500),
-                    Stack = TruncateStack(stackTrace, 4000)
-                };
-                _recentExceptions[fingerprint] = info;
-
-                // First occurrence goes to disk right away, with the time it happened.
-                Enqueue(info, 1, nowMs, null);
+                CountRepeat(known, nowMs);
+                return;
             }
 
-            // Record as breadcrumb
-            RecordBreadcrumb($"Exception: {TruncateMessage(message, 100)}");
+            // First time this text is seen in the window: parse it (allocates).
+            var info = Describe(message, stackTrace, type);
+            if (_fingerprintByRawKey.Count < MaxRawKeys)
+                _fingerprintByRawKey[key] = info.Fingerprint;
+
+            if (_recentExceptions.TryGetValue(info.Fingerprint, out var existing))
+            {
+                // Same group, different text (e.g. another roomId in the message).
+                CountRepeat(existing, nowMs);
+                return;
+            }
+
+            // New exception
+            if (_recentExceptions.Count >= MaxRecentExceptions)
+            {
+                FlushExceptions();
+            }
+            _recentExceptions[info.Fingerprint] = info;
+
+            // First occurrence goes to disk right away, with the time it happened
+            // and the breadcrumbs that led to it.
+            Enqueue(info, 1, nowMs, null, SnapshotBreadcrumbs(MaxBreadcrumbsPerEvent, MaxBreadcrumbLength));
+
+            // Record as breadcrumb (once per group and window, not per repeat)
+            RecordBreadcrumb("Exception: " + Truncate(FirstLine(message), 100));
+        }
+
+        private static void CountRepeat(ExceptionInfo info, long nowMs)
+        {
+            // Deduplicate - count it, report at the end of the window
+            if (info.RepeatCount == 0)
+            {
+                info.RepeatFirstSeenMs = nowMs;
+                info.RepeatContext = GameContext.Current;
+            }
+            info.RepeatCount++;
+        }
+
+        /// <summary>
+        /// Builds what is sent for a log and its fingerprint. An error or
+        /// assert whose message embeds an exception (OZX's GameEventBus logs
+        /// "[GameEventBus] Error handling event X: {ex}") gets that exception
+        /// extracted from the full message first; the fingerprint is computed
+        /// from exactly the fields that are sent, as the server will.
+        /// </summary>
+        private static ExceptionInfo Describe(string message, string stackTrace, LogType type)
+        {
+            string logType = type == LogType.Exception ? ExceptionParser.LogTypeException
+                : type == LogType.Assert ? ExceptionParser.LogTypeAssert
+                : ExceptionParser.LogTypeError;
+            string embedded = "";
+            if (type != LogType.Exception)
+            {
+                int i = ExceptionParser.FindEmbedded(message);
+                if (i >= 0)
+                    embedded = ExceptionParser.Compact(message.Substring(i), MaxEmbeddedLength);
+            }
+            var info = new ExceptionInfo
+            {
+                LogType = logType,
+                Message = TruncateMessage(message, MaxMessageLength),
+                Stack = TruncateStack(stackTrace, MaxStackLength),
+                Embedded = embedded
+            };
+            info.Fingerprint = ExceptionParser.Analyze(logType, info.Message, info.Stack, embedded).Fingerprint;
+            return info;
         }
 
         private void FlushExceptions()
@@ -189,71 +318,63 @@ namespace OzxApm.Collectors
             {
                 var info = kvp.Value;
                 if (info.RepeatCount > 0)
-                    Enqueue(info, info.RepeatCount, info.RepeatFirstSeenMs, info.RepeatContext);
+                    Enqueue(info, info.RepeatCount, info.RepeatFirstSeenMs, info.RepeatContext, null);
             }
 
             _recentExceptions.Clear();
+            _fingerprintByRawKey.Clear();
         }
 
-        private void Enqueue(ExceptionInfo info, int count, long timestampMs, ContextSnapshot context)
+        private void Enqueue(ExceptionInfo info, int count, long timestampMs, ContextSnapshot context, List<string> breadcrumbs)
         {
+            // Repeat counts carry the same text as the first occurrence, so the
+            // server computes the same fingerprint for them.
             var evt = new ExceptionEvent
             {
                 timestamp = timestampMs,
                 fingerprint = info.Fingerprint,
+                log_type = info.LogType,
                 message = info.Message,
                 stack = info.Stack,
+                embedded_exception = info.Embedded,
                 count = count,
+                breadcrumbs = breadcrumbs,
                 // null: the context at enqueue time (set by EnqueueEvent)
                 ctx = context
             };
 
-            _client.EnqueueEvent(evt);
+            if (EnqueueForTests != null)
+                EnqueueForTests(evt);
+            else
+                _client.EnqueueEvent(evt);
         }
 
-        private string GenerateFingerprint(string message, string stackTrace)
+        private static string FirstLine(string s)
         {
-            // Create a fingerprint based on the first line of stack and message type
-            string firstStackLine = "";
-            if (!string.IsNullOrEmpty(stackTrace))
-            {
-                int newlineIndex = stackTrace.IndexOf('\n');
-                firstStackLine = newlineIndex > 0 ? stackTrace.Substring(0, newlineIndex) : stackTrace;
-            }
-
-            // Remove line numbers for grouping
-            firstStackLine = System.Text.RegularExpressions.Regex.Replace(firstStackLine, @":\d+", "");
-
-            string input = $"{GetExceptionType(message)}|{firstStackLine}";
-
-            using (var md5 = MD5.Create())
-            {
-                byte[] hash = md5.ComputeHash(Encoding.UTF8.GetBytes(input));
-                return BitConverter.ToString(hash).Replace("-", "").ToLowerInvariant().Substring(0, 16);
-            }
+            int i = s.IndexOf('\n');
+            return i >= 0 ? s.Substring(0, i).TrimEnd('\r') : s;
         }
 
-        private string GetExceptionType(string message)
+        private static string Truncate(string s, int maxLength)
         {
-            // Try to extract exception type from message
-            int colonIndex = message.IndexOf(':');
-            if (colonIndex > 0 && colonIndex < 100)
-            {
-                return message.Substring(0, colonIndex).Trim();
-            }
-            return "UnknownException";
+            if (s.Length <= maxLength)
+                return s;
+            int n = maxLength;
+            if (char.IsHighSurrogate(s[n - 1]))
+                n--;
+            return s.Substring(0, n);
         }
 
-        private string TruncateMessage(string message, int maxLength)
+        private static string TruncateMessage(string message, int maxLength)
         {
             if (string.IsNullOrEmpty(message))
                 return "";
             if (message.Length <= maxLength)
                 return message;
-            return message.Substring(0, maxLength - 3) + "...";
+            return Truncate(message, maxLength - 3) + "...";
         }
 
-        private string TruncateStack(string stack, int maxLength)
+        private static string TruncateStack(string stack, int maxLength)
         {
             if (string.IsNullOrEmpty(stack))
                 return "";
@@ -261,7 +382,7 @@ namespace OzxApm.Collectors
                 return stack;
 
             // Keep the beginning (most important) and note truncation
-            return stack.Substring(0, maxLength - 20) + "\n[truncated...]";
+            return Truncate(stack, maxLength - 20) + "\n[truncated...]";
         }
     }
 }

@@ -83,6 +83,27 @@ namespace OzxApm.Tests
             StringAssert.Contains("\"seq\":42", json);
         }
 
+        // APM-4 fields: written when set, absent otherwise (what older SDKs send).
+        [Test]
+        public void SerializeEvent_ExceptionDetails()
+        {
+            var evt = new ExceptionEvent
+            {
+                fingerprint = "f", message = "m", count = 1, log_type = "error",
+                embedded_exception = "System.Exception: \"x\"\n  at A.B () [0x0] in <z>:0",
+                breadcrumbs = new List<string> { "[10:00:00.000] Scene: Main", "a \"quoted\" one" }
+            };
+            string json = JsonSerializer.SerializeEvent(evt);
+            StringAssert.Contains("\"log_type\":\"error\"", json);
+            StringAssert.Contains("\"embedded_exception\":\"System.Exception: \\\"x\\\"\\n  at A.B () [0x0] in <z>:0\"", json);
+            StringAssert.Contains("\"breadcrumbs\":[\"[10:00:00.000] Scene: Main\",\"a \\\"quoted\\\" one\"]", json);
+
+            string bare = JsonSerializer.SerializeEvent(new ExceptionEvent { fingerprint = "f", message = "m", count = 2 });
+            StringAssert.DoesNotContain("log_type", bare);
+            StringAssert.DoesNotContain("embedded_exception", bare);
+            StringAssert.DoesNotContain("breadcrumbs", bare);
+        }
+
         [Test]
         public void SerializeEvent_IsASingleLine()
         {
