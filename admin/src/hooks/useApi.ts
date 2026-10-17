@@ -118,11 +118,12 @@ export function useCustomDistribution(
   kind: 'events' | 'metrics',
   name: string,
   group: CustomGroup,
-  params: FilterParams
+  params: FilterParams,
+  enabled = true
 ) {
   return useQuery({
     queryKey: ['custom-distribution', kind, name, group, params],
     queryFn: () => api.getCustomDistribution(kind, name, group, params),
-    enabled: isValidContextKey(name) && (group.kind === 'by' || isValidContextKey(group.key)),
+    enabled: enabled && isValidContextKey(name) && (group.kind === 'by' || isValidContextKey(group.key)),
   })
 }

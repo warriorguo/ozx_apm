@@ -34,8 +34,10 @@ set -euo pipefail
 CH=${CH:-clickhouse-client}
 DB=${DB:-ozx_apm}
 MIGRATE_SQL=${MIGRATE_SQL:-"$(cd "$(dirname "$0")" && pwd)/migrate.sql"}
-TABLES="apm_perf_samples apm_janks apm_startups apm_scene_loads apm_exceptions apm_crashes"
-VIEWS="apm_fps_daily apm_startup_daily apm_exception_daily apm_crash_daily"
+# APM-6 added apm_custom_events / apm_custom_metrics (created by the server
+# with their TTL) and their two daily views.
+TABLES="apm_perf_samples apm_janks apm_startups apm_scene_loads apm_exceptions apm_crashes apm_custom_events apm_custom_metrics"
+VIEWS="apm_fps_daily apm_startup_daily apm_exception_daily apm_crash_daily apm_custom_event_daily apm_custom_metric_daily"
 # Same as storage.EventTTL. toDateTime(): 23.8 and 24.1 reject a TTL on DateTime64.
 TTL_EXPR="toDateTime(timestamp) + INTERVAL 30 DAY"
 

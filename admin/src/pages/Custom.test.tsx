@@ -81,6 +81,8 @@ describe('Custom page (APM-6)', () => {
       expect.objectContaining({ build_type: 'release' })
     )
     expect(api.getContextKeys).toHaveBeenCalledWith(expect.objectContaining({ source: 'custom_metrics' }))
+    // The default grouping waits for the keys: no request by app_version first.
+    expect(api.getCustomDistribution.mock.calls[0][2]).toEqual({ kind: 'key', key: 'roomId' })
 
     fireEvent.click(screen.getAllByText('Filter')[0])
     expect(await screen.findByText('roomId = r-1')).toBeInTheDocument()

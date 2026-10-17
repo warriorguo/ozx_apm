@@ -107,7 +107,17 @@ function ShareBar({ count, total, max }: { count: number; total: number; max: nu
   )
 }
 
-function Distribution({ kind, name, contextKeys }: { kind: 'events' | 'metrics'; name: string; contextKeys: string[] }) {
+function Distribution({
+  kind,
+  name,
+  contextKeys,
+  keysReady,
+}: {
+  kind: 'events' | 'metrics'
+  name: string
+  contextKeys: string[]
+  keysReady: boolean
+}) {
   const { queryParams, addContextFilter } = useFilters()
   const [chosen, setGroup] = useState<CustomGroup | null>(null)
   // Until one is picked: roomId if the data has it, else the most common
@@ -119,7 +129,8 @@ function Distribution({ kind, name, contextKeys }: { kind: 'events' | 'metrics';
       : contextKeys[0]
         ? { kind: 'key', key: contextKeys[0] }
         : { kind: 'by', key: 'app_version' })
-  const { data, isLoading, isError } = useCustomDistribution(kind, name, group, queryParams)
+  // Wait for the context keys: the default grouping depends on them.
+  const { data, isLoading, isError } = useCustomDistribution(kind, name, group, queryParams, keysReady || chosen !== null)
   const rows: CustomMetricStat[] = data?.rows ?? []
   const total = data?.total ?? 0
   const unit = data?.unit ?? ''
@@ -201,7 +212,7 @@ function Distribution({ kind, name, contextKeys }: { kind: 'events' | 'metrics';
   )
 }
 
-function MetricsTab({ contextKeys }: { contextKeys: string[] }) {
+function MetricsTab({ contextKeys, keysReady }: { contextKeys: string[]; keysReady: boolean }) {
   const { queryParams } = useFilters()
   const { data, isLoading, isError } = useCustomMetrics(queryParams)
   const [selected, setSelected] = useState('')
@@ -253,12 +264,12 @@ function MetricsTab({ contextKeys }: { contextKeys: string[] }) {
           </tbody>
         </table>
       </div>
-      {name && <Distribution key={name} kind="metrics" name={name} contextKeys={contextKeys} />}
+      {name && <Distribution key={name} kind="metrics" name={name} contextKeys={contextKeys} keysReady={keysReady} />}
     </>
   )
 }
 
-function EventsTab({ contextKeys }: { contextKeys: string[] }) {
+function EventsTab({ contextKeys, keysReady }: { contextKeys: string[]; keysReady: boolean }) {
   const { queryParams } = useFilters()
   const { data, isLoading, isError } = useCustomEvents(queryParams)
   const [selected, setSelected] = useState('')
@@ -303,7 +314,7 @@ function EventsTab({ contextKeys }: { contextKeys: string[] }) {
           </tbody>
         </table>
       </div>
-      {name && <Distribution key={name} kind="events" name={name} contextKeys={contextKeys} />}
+      {name && <Distribution key={name} kind="events" name={name} contextKeys={contextKeys} keysReady={keysReady} />}
     </>
   )
 }
@@ -313,8 +324,12 @@ function EventsTab({ contextKeys }: { contextKeys: string[] }) {
 export function Custom() {
   const { queryParams } = useFilters()
   const [tab, setTab] = useState<'metrics' | 'events'>('metrics')
-  const { data: keyData } = useContextKeys({ ...queryParams, source: tab === 'metrics' ? 'custom_metrics' : 'custom_events' })
+  const { data: keyData, isSuccess, isError } = useContextKeys({
+    ...queryParams,
+    source: tab === 'metrics' ? 'custom_metrics' : 'custom_events',
+  })
   const contextKeys = (keyData?.keys ?? []).map((k) => k.key)
+  const keysReady = isSuccess || isError
 
   return (
     <div>
@@ -333,7 +348,11 @@ export function Custom() {
           </button>
         ))}
       </div>
-      {tab === 'metrics' ? <MetricsTab contextKeys={contextKeys} /> : <EventsTab contextKeys={contextKeys} />}
+      {tab === 'metrics' ? (
+        <MetricsTab contextKeys={contextKeys} keysReady={keysReady} />
+      ) : (
+        <EventsTab contextKeys={contextKeys} keysReady={keysReady} />
+      )}
     </div>
   )
 }
