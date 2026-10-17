@@ -103,10 +103,11 @@ func TestDedupeBreadcrumbs(t *testing.T) {
 		crumb("2026-10-18T10:00:03Z", models.CrumbEvent, long[:185], 0),
 		crumb("2026-10-18T10:00:03Z", models.CrumbEvent, long, 0), // cut differently by two carriers
 		{Type: models.TimelineBreadcrumb, Time: utc("2026-10-18T10:00:04Z"), Kind: models.CrumbText, Text: "x", TimeUnknown: true},
-		{Type: models.TimelineBreadcrumb, Time: utc("2026-10-18T10:00:04Z"), Kind: models.CrumbText, Text: "x", TimeUnknown: true},
+		{Type: models.TimelineBreadcrumb, Time: utc("2026-10-18T10:00:04Z"), Kind: models.CrumbText, Text: "x", TimeUnknown: true}, // an old SDK repeating its lines: once
+		{Type: models.TimelineBreadcrumb, Time: utc("2026-10-18T10:00:04Z"), Kind: models.CrumbText, Text: "x", TimeUnknown: true, Source: "crash"},
 	}
 	out, dropped := DedupeBreadcrumbs(items)
-	if dropped != 2 || len(out) != 6 {
+	if dropped != 3 || len(out) != 6 {
 		t.Fatalf("dropped %d, kept %d: %+v", dropped, len(out), out)
 	}
 	if out[0].Repeats != 30 || out[3].Text != long {
@@ -120,6 +121,7 @@ func TestDropCovered(t *testing.T) {
 		{Type: models.TimelineCustomEvent, Time: utc("2026-10-18T10:00:02Z"), Name: "enemy_killed", Aggregated: true, Count: 9},
 		{Type: models.TimelineSceneLoad, Time: utc("2026-10-18T10:00:03Z"), SceneName: "Main"},
 		{Type: models.TimelineException, Time: utc("2026-10-18T10:00:05Z"), Message: "NullReferenceException: Object reference not set\n  at X"},
+		{Type: models.TimelineException, Time: utc("2026-10-18T10:00:06Z"), LogType: "error", Message: "Inventory sync failed after spam"},
 	}
 	crumbs := []models.TimelineItem{
 		crumb("2026-10-18T10:00:01Z", models.CrumbEvent, "room_enter roomId=12", 0),                                 // covered
@@ -129,9 +131,11 @@ func TestDropCovered(t *testing.T) {
 		crumb("2026-10-18T10:00:05Z", models.CrumbException, "NullReferenceException: Object reference not set", 0), // covered
 		crumb("2026-10-18T10:00:05Z", models.CrumbException, "InvalidOperationException: x", 0),                     // another exception
 		crumb("2026-10-18T10:00:05Z", models.CrumbWarning, "room_enter", 0),                                         // not an event
+		crumb("2026-10-18T10:00:06Z", models.CrumbError, "Inventory sync failed", 0),                                // the LogError row: covered
+		crumb("2026-10-18T10:00:06Z", models.CrumbAssert, "Inventory sync failed", 0),                               // an assert line: the row is an error
 	}
 	out, dropped := DropCovered(crumbs, rows)
-	if dropped != 3 || len(out) != 4 {
+	if dropped != 4 || len(out) != 5 {
 		t.Fatalf("dropped %d: %+v", dropped, out)
 	}
 	for _, c := range out {

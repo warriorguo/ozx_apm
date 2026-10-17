@@ -29,7 +29,14 @@ func TestSessionQueries_BindEveryValue(t *testing.T) {
 			t.Errorf("%s: args %v", name, c.args[:3])
 		}
 	}
-	// Merged counts never decide the context.
+	// Merged counts never decide the context; the sort carries no maps.
+	if strings.Contains(changes, ", ctx,") || strings.Contains(changes, "SELECT timestamp, src, ctx") {
+		t.Errorf("the window carries the context maps: %s", changes)
+	}
+	byHash, byHashArgs := contextsByHashQuery(q, []uint64{1, 2})
+	if strings.Count(byHash, "?") != len(byHashArgs) || byHashArgs[len(byHashArgs)-1].([]uint64)[1] != 2 {
+		t.Errorf("by hash: %s %v", byHash, byHashArgs)
+	}
 	if strings.Count(changes, "AND ctx_merged = 0") != 3 || !strings.Contains(changes, "LIMIT 11") {
 		t.Errorf("changes: %s", changes)
 	}
@@ -75,7 +82,7 @@ func TestPerfAndTrendIntervals(t *testing.T) {
 	cases := []struct {
 		span time.Duration
 		perf int
-	}{{0, 1}, {3 * time.Minute, 1}, {10 * time.Minute, 5}, {time.Hour, 30}, {3 * time.Hour, 60}, {19 * time.Hour, 300}, {20 * time.Hour, 900}, {30 * 24 * time.Hour, 3600}}
+	}{{0, 1}, {3 * time.Minute, 1}, {10 * time.Minute, 5}, {time.Hour, 30}, {3 * time.Hour, 60}, {19 * time.Hour, 300}, {20 * time.Hour, 900}, {30 * 24 * time.Hour, 21600}}
 	for _, c := range cases {
 		if got := PerfInterval(base, base.Add(c.span)); got != c.perf {
 			t.Errorf("perf %v: %d, want %d", c.span, got, c.perf)

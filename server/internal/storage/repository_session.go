@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
@@ -39,14 +40,14 @@ const (
 	SessionBreadcrumbItems = 2000
 	SessionContextChanges  = 1000
 	MaxPerfPoints          = 240
-	maxCrashStackChars     = 4000
+	maxCrashStackChars     = 300 // the time line shows the first line; the crash page has the stack
 	maxSessionMessageChars = 2000
 	DeviceSessionsLimit    = 100
 	// SessionRangeMax bounds the range of a session or device query.
 	SessionRangeMax = 31 * 24 * time.Hour
 )
 
-var perfIntervals = []int{1, 5, 10, 30, 60, 300, 900, 1800, 3600}
+var perfIntervals = []int{1, 5, 10, 30, 60, 300, 900, 1800, 3600, 3 * 3600, 6 * 3600, 12 * 3600, 86400}
 
 // sessionWhere selects one session's rows in [start, end] (milliseconds).
 func sessionWhere(sessionID string, start, end time.Time) (string, []interface{}) {
@@ -189,26 +190,46 @@ func sessionInfoQuery(q SessionQuery) (string, []interface{}) {
 		FROM (` + strings.Join(parts, "\n\t\tUNION ALL\n\t\t") + `)`, args
 }
 
-// contextChangesQuery returns the rows at which the session's context
-// differs from the previous row's (by time, then the SDK's sequence number):
-// a window over the hash of the sorted entries.
-func contextChangesQuery(q SessionQuery, limit int) (string, []interface{}) {
+// ctxHash is the hash of a context's sorted entries (Map keys are
+// LowCardinality; each entry becomes one plain string "key=value" (keys
+// cannot contain "="), so the hash does not
+// depend on nested LowCardinality support).
+const ctxHash = `cityHash64(arraySort(arrayMap((k, v) -> concat(toString(k), '=', v), mapKeys(ctx), mapValues(ctx))))`
+
+// ctxUnion renders, for every context source, cols (with %s for the source
+// name) over the session's rows, combined with UNION ALL.
+func ctxUnion(q SessionQuery, cols string) (string, []interface{}) {
 	where, whereArgs := sessionWhere(q.SessionID, q.Start, q.End)
 	parts := make([]string, 0, len(ctxSources))
 	var args []interface{}
 	for _, s := range ctxSources {
-		parts = append(parts, fmt.Sprintf("SELECT timestamp, seq, '%s' AS src, ctx, cityHash64(arraySort(arrayZip(mapKeys(ctx), mapValues(ctx)))) AS h FROM %s %s%s",
-			s.src, s.table, where, s.cond))
+		parts = append(parts, fmt.Sprintf("SELECT "+cols+" FROM %s %s%s", s.src, s.table, where, s.cond))
 		args = append(args, whereArgs...)
 	}
-	return fmt.Sprintf(`SELECT timestamp, src, ctx FROM (
-			SELECT timestamp, seq, src, ctx, h,
+	return strings.Join(parts, "\n\t\t\tUNION ALL\n\t\t\t"), args
+}
+
+// contextChangesQuery returns the rows at which the session's context
+// differs from the previous row's (by time, then the SDK's sequence number):
+// a window over the hash of the sorted entries. Only (time, seq, source,
+// hash) go through the sort; the contexts are fetched afterwards by hash
+// (contextsByHashQuery).
+func contextChangesQuery(q SessionQuery, limit int) (string, []interface{}) {
+	union, args := ctxUnion(q, "timestamp, seq, '%s' AS src, "+ctxHash+" AS h")
+	return fmt.Sprintf(`SELECT timestamp, src, h FROM (
+			SELECT timestamp, seq, src, h,
 				lagInFrame(h, 1, toUInt64(0)) OVER (ORDER BY timestamp, seq, src ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS prev
 			FROM (%s)
 		)
 		WHERE h != prev
 		ORDER BY timestamp, seq, src
-		LIMIT %d`, strings.Join(parts, "\n\t\t\tUNION ALL\n\t\t\t"), limit+1), args
+		LIMIT %d`, union, limit+1), args
+}
+
+// contextsByHashQuery returns one context per hash among the session's rows.
+func contextsByHashQuery(q SessionQuery, hashes []uint64) (string, []interface{}) {
+	union, args := ctxUnion(q, ctxHash+" AS h, ctx, '%s' AS src")
+	return `SELECT h, any(ctx) FROM (` + union + `) WHERE h IN ? GROUP BY h`, append(args, hashes)
 }
 
 // PerfInterval returns the bucket size (seconds) of the performance track
@@ -224,9 +245,24 @@ func PerfInterval(first, last time.Time) int {
 	return perfIntervals[len(perfIntervals)-1]
 }
 
+// sessionTimeout bounds one time line request below the admin server's write
+// timeout (30 s by default), so that its queries are cancelled rather than
+// left running after the client got a cut-off answer.
+const sessionTimeout = 25 * time.Second
+
+type sourceResult struct {
+	items  []models.TimelineItem
+	crumbs []models.TimelineItem
+	more   bool
+	err    error
+}
+
 // GetSessionTimeline returns everything stored for one session in the range,
-// merged by time.
+// merged by time. After the first query (the session's span), the per-type,
+// context and perf queries run in parallel.
 func (r *Repository) GetSessionTimeline(ctx context.Context, q SessionQuery) (*models.SessionTimeline, error) {
+	ctx, cancel := context.WithTimeout(ctx, sessionTimeout)
+	defer cancel()
 	tl := &models.SessionTimeline{
 		SessionID: q.SessionID, StartTime: q.Start.UTC(), EndTime: q.End.UTC(),
 		Items: []models.TimelineItem{}, Counts: map[string]int{}, Truncated: []string{}, Perf: []models.PerfPoint{},
@@ -262,39 +298,76 @@ func (r *Repository) GetSessionTimeline(ctx context.Context, q SessionQuery) (*m
 	where, whereArgs := sessionWhere(span.SessionID, span.Start, span.End)
 	order, orderArgs := sessionOrder(q.At)
 
-	// 2. The rows of each table.
-	var rows []models.TimelineItem
-	var crumbs []models.TimelineItem
-	for _, src := range sessionSources {
-		query := fmt.Sprintf("SELECT timestamp, event_id, seq, %s FROM %s %s %s LIMIT %d", src.columns, src.table, where, order, src.limit+1)
-		args := append(append([]interface{}{}, whereArgs...), orderArgs...)
-		var items []models.TimelineItem
-		more := false
-		err := r.queryRows(ctx, query, args, func(dr driver.Rows) error {
-			it := models.TimelineItem{Type: src.src}
-			var lines []string
-			if err := src.scan(dr, &it, &lines); err != nil {
-				return err
-			}
-			if len(items) == src.limit {
-				more = true // the extra row only says there were more
+	// 2. The rows of each table, the context changes and the perf track, in
+	// parallel (each query is small with the session index).
+	results := make([]sourceResult, len(sessionSources))
+	var changes []models.TimelineItem
+	var changesTruncated bool
+	var changesErr, perfErr error
+	var wg sync.WaitGroup
+	for i, src := range sessionSources {
+		wg.Add(1)
+		go func(i int, src sessionSource) {
+			defer wg.Done()
+			res := &results[i]
+			query := fmt.Sprintf("SELECT timestamp, event_id, seq, %s FROM %s %s %s LIMIT %d", src.columns, src.table, where, order, src.limit+1)
+			args := append(append([]interface{}{}, whereArgs...), orderArgs...)
+			res.err = r.queryRows(ctx, query, args, func(dr driver.Rows) error {
+				it := models.TimelineItem{Type: src.src}
+				var lines []string
+				if err := src.scan(dr, &it, &lines); err != nil {
+					return err
+				}
+				if len(res.items) == src.limit {
+					res.more = true // the extra row only says there were more
+					return nil
+				}
+				it.Time = it.Time.UTC()
+				for _, line := range lines {
+					res.crumbs = append(res.crumbs, timeline.ParseBreadcrumb(line, it.Time, src.src))
+				}
+				res.items = append(res.items, it)
 				return nil
+			})
+			if res.err != nil {
+				res.err = fmt.Errorf("%s: %w", src.table, res.err)
 			}
-			it.Time = it.Time.UTC()
-			for _, line := range lines {
-				crumbs = append(crumbs, timeline.ParseBreadcrumb(line, it.Time, src.src))
-			}
-			items = append(items, it)
-			return nil
-		})
-		if err != nil {
-			return nil, fmt.Errorf("%s: %w", src.table, err)
+		}(i, src)
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		changes, changesTruncated, changesErr = r.contextChanges(ctx, span)
+	}()
+	perfTruncated := false
+	if q.Perf && perfRows > 0 {
+		tl.PerfIntervalSeconds = PerfInterval(perfFirst, perfLast)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			tl.Perf, perfTruncated, perfErr = r.perfTrack(ctx, span, tl.PerfIntervalSeconds)
+		}()
+	}
+	wg.Wait()
+
+	var rows, crumbs []models.TimelineItem
+	for i, src := range sessionSources {
+		res := &results[i]
+		if res.err != nil {
+			return nil, res.err
 		}
-		if more {
+		if res.more {
 			tl.Truncated = append(tl.Truncated, src.src)
 		}
-		tl.Counts[src.src] = len(items)
-		rows = append(rows, items...)
+		tl.Counts[src.src] = len(res.items)
+		rows = append(rows, res.items...)
+		crumbs = append(crumbs, res.crumbs...)
+	}
+	if changesErr != nil {
+		return nil, fmt.Errorf("context changes: %w", changesErr)
+	}
+	if perfErr != nil {
+		return nil, fmt.Errorf("perf: %w", perfErr)
 	}
 
 	// 3. Breadcrumbs: once per line, not when the row they stand for is on
@@ -308,57 +381,79 @@ func (r *Repository) GetSessionTimeline(ctx context.Context, q SessionQuery) (*m
 	}
 	tl.Counts[models.TimelineBreadcrumb] = len(crumbs)
 
-	// 4. Context changes.
-	changes, truncated, err := r.contextChanges(ctx, span)
-	if err != nil {
-		return nil, fmt.Errorf("context changes: %w", err)
-	}
-	if truncated {
+	// 4. Context changes (the earliest SessionContextChanges).
+	if changesTruncated {
 		tl.Truncated = append(tl.Truncated, models.TimelineContext)
 	}
 	tl.Counts[models.TimelineContext] = len(changes)
+	if perfTruncated {
+		tl.Truncated = append(tl.Truncated, "perf")
+	}
 
 	tl.Items = append(append(append(tl.Items, rows...), crumbs...), changes...)
 	timeline.Sort(tl.Items)
-
-	// 5. Performance track.
-	if q.Perf && perfRows > 0 {
-		tl.PerfIntervalSeconds = PerfInterval(perfFirst, perfLast)
-		if tl.Perf, err = r.perfTrack(ctx, span, tl.PerfIntervalSeconds); err != nil {
-			return nil, fmt.Errorf("perf: %w", err)
-		}
-	}
 	return tl, nil
 }
 
 func (r *Repository) contextChanges(ctx context.Context, q SessionQuery) ([]models.TimelineItem, bool, error) {
+	type change struct {
+		ts  time.Time
+		src string
+		h   uint64
+	}
 	query, args := contextChangesQuery(q, SessionContextChanges)
-	var items []models.TimelineItem
-	var prev map[string]string
+	var found []change
 	truncated := false
-	n := 0
 	err := r.queryRows(ctx, query, args, func(rows driver.Rows) error {
-		var ts time.Time
-		var src string
-		var cur map[string]string
-		if err := rows.Scan(&ts, &src, &cur); err != nil {
+		var c change
+		if err := rows.Scan(&c.ts, &c.src, &c.h); err != nil {
 			return err
 		}
-		n++
-		if n > SessionContextChanges {
+		if len(found) == SessionContextChanges {
 			truncated = true
 			return nil
 		}
-		if changes := timeline.Diff(prev, cur); len(changes) > 0 {
-			items = append(items, models.TimelineItem{Time: ts.UTC(), Type: models.TimelineContext, Source: src, Changes: changes, Context: ctxMap(cur)})
-		}
-		prev = cur
+		found = append(found, c)
 		return nil
 	})
-	return items, truncated, err
+	if err != nil || len(found) == 0 {
+		return nil, truncated, err
+	}
+	seen := map[uint64]bool{}
+	var hashes []uint64
+	for _, c := range found {
+		if !seen[c.h] {
+			seen[c.h] = true
+			hashes = append(hashes, c.h)
+		}
+	}
+	byHash := map[uint64]map[string]string{}
+	query, args = contextsByHashQuery(q, hashes)
+	err = r.queryRows(ctx, query, args, func(rows driver.Rows) error {
+		var h uint64
+		var m map[string]string
+		if err := rows.Scan(&h, &m); err != nil {
+			return err
+		}
+		byHash[h] = m
+		return nil
+	})
+	if err != nil {
+		return nil, truncated, err
+	}
+	var items []models.TimelineItem
+	var prev map[string]string
+	for _, c := range found {
+		cur := byHash[c.h]
+		if changes := timeline.Diff(prev, cur); len(changes) > 0 {
+			items = append(items, models.TimelineItem{Time: c.ts.UTC(), Type: models.TimelineContext, Source: c.src, Changes: changes, Context: ctxMap(cur)})
+		}
+		prev = cur
+	}
+	return items, truncated, nil
 }
 
-func (r *Repository) perfTrack(ctx context.Context, q SessionQuery, interval int) ([]models.PerfPoint, error) {
+func (r *Repository) perfTrack(ctx context.Context, q SessionQuery, interval int) ([]models.PerfPoint, bool, error) {
 	where, args := sessionWhere(q.SessionID, q.Start, q.End)
 	query := fmt.Sprintf(`
 		SELECT toStartOfInterval(timestamp, INTERVAL %d SECOND) AS t, toInt64(count()),
@@ -367,25 +462,30 @@ func (r *Repository) perfTrack(ctx context.Context, q SessionQuery, interval int
 		GROUP BY t
 		ORDER BY t
 		LIMIT %d
-	`, interval, finiteFloat("avg(fps)"), finiteFloat("min(fps)"), finiteFloat("max(frame_time_ms)"), finiteFloat("max(mem_mb)"), where, 2*MaxPerfPoints)
+	`, interval, finiteFloat("avg(fps)"), finiteFloat("min(fps)"), finiteFloat("max(frame_time_ms)"), finiteFloat("max(mem_mb)"), where, MaxPerfPoints+1)
 	points := []models.PerfPoint{}
+	truncated := false
 	err := r.queryRows(ctx, query, args, func(rows driver.Rows) error {
 		var p models.PerfPoint
 		if err := rows.Scan(&p.Time, &p.Samples, &p.FPSAvg, &p.FPSMin, &p.FrameMsMax, &p.MemMBMax); err != nil {
 			return err
 		}
+		if len(points) == MaxPerfPoints {
+			truncated = true
+			return nil
+		}
 		p.Time = p.Time.UTC()
 		points = append(points, p)
 		return nil
 	})
-	return points, err
+	return points, truncated, err
 }
 
 // GetDeviceSessions lists the sessions of one device in [start, end], most
 // recent first (at most DeviceSessionsLimit).
 func (r *Repository) GetDeviceSessions(ctx context.Context, deviceID string, start, end time.Time) (*models.DeviceSessionsResponse, error) {
 	resp := &models.DeviceSessionsResponse{DeviceID: deviceID, StartTime: start.UTC(), EndTime: end.UTC(), Sessions: []models.SessionSummary{}}
-	where := "WHERE device_id = ? AND timestamp >= fromUnixTimestamp64Milli(toInt64(?)) AND timestamp <= fromUnixTimestamp64Milli(toInt64(?))"
+	where := "WHERE device_id = ? AND session_id != '' AND timestamp >= fromUnixTimestamp64Milli(toInt64(?)) AND timestamp <= fromUnixTimestamp64Milli(toInt64(?))"
 	whereArgs := []interface{}{deviceID, start.UnixMilli(), end.UnixMilli()}
 	parts := make([]string, 0, len(EventTables))
 	var args []interface{}

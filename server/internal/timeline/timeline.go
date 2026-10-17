@@ -131,9 +131,11 @@ func splitRepeat(s string) (string, int64, int64, bool) {
 }
 
 // dedupeKeyRunes: lines are compared on this many characters, because the
-// same line is cut to different lengths by different carriers (exceptions
-// keep 200/300 characters, janks 200).
-const dedupeKeyRunes = 160
+// same line is cut to different lengths by different carriers: the SDK cuts
+// the formatted line (time, kind and a repeat suffix included) to 200
+// characters for janks and breadcrumbs, 300 for an exception's log lines,
+// which leaves at least ~140 characters of a counted log line's text.
+const dedupeKeyRunes = 120
 
 func crumbKey(it *models.TimelineItem) string {
 	text := it.Text
@@ -152,18 +154,19 @@ func crumbKey(it *models.TimelineItem) string {
 
 // DedupeBreadcrumbs keeps one item per line: the same line (time, kind and
 // text) carried by several rows is kept once, with the highest repeat count
-// and the longest text. Lines without a time are kept as they are. Returns
-// the kept items and how many were dropped.
+// and the longest text. Lines without a time (older SDKs: every jank repeats
+// the last lines, with a relative time inside the text) are compared on
+// source, kind and the whole text. Returns the kept items and how many were
+// dropped.
 func DedupeBreadcrumbs(items []models.TimelineItem) ([]models.TimelineItem, int) {
 	out := make([]models.TimelineItem, 0, len(items))
 	index := map[string]int{}
 	dropped := 0
 	for _, it := range items {
-		if it.TimeUnknown {
-			out = append(out, it)
-			continue
-		}
 		k := crumbKey(&it)
+		if it.TimeUnknown {
+			k = "?\x00" + it.Source + "\x00" + it.Kind + "\x00" + it.Text
+		}
 		if i, ok := index[k]; ok {
 			dropped++
 			kept := &out[i]
@@ -205,19 +208,36 @@ func covers(crumb, row *models.TimelineItem) bool {
 	case models.CrumbScene:
 		return row.Type == models.TimelineSceneLoad && row.SceneName == crumb.Text
 	case models.CrumbException:
-		if row.Type != models.TimelineException {
-			return false
-		}
-		first, _, _ := strings.Cut(row.Message, "\n")
-		first = strings.TrimSpace(first)
-		c := strings.TrimSpace(crumb.Text)
-		return c != "" && (strings.HasPrefix(first, c) || strings.HasPrefix(c, first) && first != "")
+		return row.Type == models.TimelineException && sameLine(crumb.Text, row.Message)
+	case models.CrumbError, models.CrumbAssert:
+		// A Debug.LogError/assert is both an exception row (log_type error or
+		// assert) and a line of the recent-log ring that later rows carry.
+		return row.Type == models.TimelineException && row.LogType == crumb.Kind && sameLine(crumb.Text, row.Message)
+	}
+	return false
+}
+
+// sameLine reports whether a breadcrumb's text and the first line of a
+// message are the same line, one of them possibly cut.
+func sameLine(text, message string) bool {
+	first, _, _ := strings.Cut(message, "\n")
+	first = strings.TrimSpace(first)
+	c := strings.TrimSpace(text)
+	return c != "" && first != "" && (strings.HasPrefix(first, c) || strings.HasPrefix(c, first))
+}
+
+// coverable are the breadcrumb kinds a row on the time line can stand for.
+func coverable(kind string) bool {
+	switch kind {
+	case models.CrumbEvent, models.CrumbScene, models.CrumbException, models.CrumbError, models.CrumbAssert:
+		return true
 	}
 	return false
 }
 
 // DropCovered removes the breadcrumbs that duplicate a row on the time line
-// (an individually sent custom event, an exception, a scene load), so each
+// (an individually sent custom event, an exception or a logged error/assert,
+// a scene load), so each
 // thing that happened shows once. Returns the kept breadcrumbs and how many
 // were dropped.
 func DropCovered(crumbs, rows []models.TimelineItem) ([]models.TimelineItem, int) {
@@ -234,7 +254,7 @@ func DropCovered(crumbs, rows []models.TimelineItem) ([]models.TimelineItem, int
 	for i := range crumbs {
 		c := &crumbs[i]
 		covered := false
-		if !c.TimeUnknown && (c.Kind == models.CrumbEvent || c.Kind == models.CrumbScene || c.Kind == models.CrumbException) {
+		if !c.TimeUnknown && coverable(c.Kind) {
 			lo := c.Time.Add(-coverTolerance(c.Kind))
 			k := sort.Search(len(byTime), func(j int) bool { return !byTime[j].Time.Before(lo) })
 			for ; k < len(byTime) && !byTime[k].Time.After(c.Time.Add(coverTolerance(c.Kind))); k++ {

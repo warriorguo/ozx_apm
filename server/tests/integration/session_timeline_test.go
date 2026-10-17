@@ -94,6 +94,9 @@ func (e *apm4Env) halfBuiltRoomSession(t *testing.T, s string) {
 			"message":            "[GameEventBus] Error handling event RoomEnteredEvent: " + busRoomException,
 			"stack":              "Ozx.Core.GameEventBus:Publish(RoomEnteredEvent)\n",
 			"embedded_exception": busRoomException}),
+		// A plain Debug.LogError: an exception row, and a line every later row carries.
+		e.sessionEvent("exception", s, 13000, r12, map[string]interface{}{"fingerprint": "client-inv", "log_type": "error", "count": 1, "error_seq": 3, "session_ms": 13000,
+			"message": "Inventory sync failed after spam", "stack": "Ozx.Net.Sync:Run()\n"}),
 		// Calls beyond the SDK's budget, counted for the window.
 		e.sessionEvent("custom_event", s, 12000, r12, map[string]interface{}{"name": "enemy_killed", "count": 15, "aggregated": true}),
 		// A jank later carries some of the same lines (cut to 200 characters by the SDK).
@@ -101,6 +104,7 @@ func (e *apm4Env) halfBuiltRoomSession(t *testing.T, s string) {
 			"recent_events": []string{
 				e.clock(9000) + "Warning: Asset not found: anim/arack_red (x30 until " + e.clock(14000)[1:13] + ")",
 				e.clock(10000) + "Event: room_enter roomId=r-12",
+				e.clock(13000) + "Error: Inventory sync failed after spam",
 				e.clock(14900) + "Error: Pool exhausted for enemy 7",
 			}}),
 	)
@@ -192,7 +196,7 @@ func TestSessionTimeline_RoomOnlyHalfBuilt(t *testing.T) {
 			// The link: session id and the occurrence's time.
 			at := first.Timestamp.UTC().Format(time.RFC3339Nano)
 			tl := timelineOf(t, e, url.Values{"session_id": {first.SessionID}, "at": {at}, "perf": {"1"}})
-			if !tl.Found || tl.Session.DeviceID != "dev-S1" || tl.Session.AppVersion != "2.3" || tl.Session.Rows != 21+2+3+1+2+1+1 {
+			if !tl.Found || tl.Session.DeviceID != "dev-S1" || tl.Session.AppVersion != "2.3" || tl.Session.Rows != 21+2+3+1+3+1+1 {
 				t.Fatalf("session: %+v", tl.Session)
 			}
 			if tl.Session.StartedAt == nil || tl.Session.StartedAt.UnixMilli() != e.ts {
@@ -220,6 +224,7 @@ func TestSessionTimeline_RoomOnlyHalfBuilt(t *testing.T) {
 				"exception System.InvalidOperationException x1 seq 1",
 				"exception System.InvalidOperationException x40 seq 2",
 				"event enemy_killed x15 (aggregated)",
+				"exception  x1 seq 3",
 				"crumb error Pool exhausted for enemy 7",
 				"jank",
 			}
@@ -232,9 +237,10 @@ func TestSessionTimeline_RoomOnlyHalfBuilt(t *testing.T) {
 			if tl.Session.LastSeen.UnixMilli() != e.ts+20500 {
 				t.Errorf("last seen %v", tl.Session.LastSeen)
 			}
-			// 2 lines carried by both the exception and the jank, and 4 lines
-			// standing for rows on the time line (the scene load, 3 custom events).
-			if tl.DuplicateBreadcrumbs != 6 {
+			// 2 lines carried by both the exception and the jank, and 5 lines
+			// standing for rows on the time line (the scene load, 3 custom events,
+			// the LogError, which is also an exception row).
+			if tl.DuplicateBreadcrumbs != 7 {
 				t.Errorf("duplicate breadcrumbs: %d", tl.DuplicateBreadcrumbs)
 			}
 			for _, it := range tl.Items {
@@ -243,7 +249,7 @@ func TestSessionTimeline_RoomOnlyHalfBuilt(t *testing.T) {
 						t.Errorf("warning: %+v", it)
 					}
 				}
-				if it.Type == models.TimelineException && (it.ThrowSite == "" || it.Context["roomId"] != "r-12") {
+				if it.Type == models.TimelineException && it.ExceptionType != "" && (it.ThrowSite == "" || it.Context["roomId"] != "r-12") {
 					t.Errorf("exception item: %+v", it)
 				}
 			}
@@ -264,7 +270,7 @@ func TestSessionTimeline_RoomOnlyHalfBuilt(t *testing.T) {
 			var ds models.DeviceSessionsResponse
 			getAdmin(t, e.admin, "/api/sessions", url.Values{"device_id": {"dev-S1"}}, &ds)
 			if len(ds.Sessions) != 2 || ds.Sessions[0].SessionID != "S1-next" || ds.Sessions[1].SessionID != "S1-half" ||
-				ds.Sessions[1].Exceptions != 41 || ds.Sessions[1].Rows != tl.Session.Rows {
+				ds.Sessions[1].Exceptions != 42 || ds.Sessions[1].Rows != tl.Session.Rows {
 				t.Errorf("device sessions: %+v", ds)
 			}
 
