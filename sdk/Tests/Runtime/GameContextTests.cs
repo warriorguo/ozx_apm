@@ -393,6 +393,14 @@ namespace OzxApm.Tests
             string key = "key5", value = "value-5";
             Assert.That(() => { var unused = GameContext.Current; }, Is.Not.AllocatingGCMemory(), "GameContext.Current");
             Assert.That(() => { ApmClient.SetContext(key, value); }, Is.Not.AllocatingGCMemory(), "SetContext with the same value");
+
+            // Also when the value is cut: the cut copy is only made on a change,
+            // and after the first logged warnings nothing is formatted.
+            string longKey = "weapons", longValue = new string('w', 300);
+            for (int i = 0; i < 12; i++)
+                ApmClient.SetContext(longKey, longValue);
+            Assert.That(() => { ApmClient.SetContext(longKey, longValue); }, Is.Not.AllocatingGCMemory(), "SetContext with the same over-long value");
+            Assert.AreEqual(GameContext.MaxValueLength, ApmClient.GetContext("weapons").Length);
         }
 
         [Test]

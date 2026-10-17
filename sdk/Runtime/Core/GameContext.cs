@@ -182,14 +182,16 @@ namespace OzxApm.Core
                 Remove(key);
                 return true;
             }
+            // Length after cutting to MaxValueLength, never inside a surrogate pair.
+            // The cut copy is only made if the value changes: setting the same
+            // over-long value every frame must not allocate either.
+            int length = value.Length;
             bool truncated = false;
-            if (value.Length > MaxValueLength)
+            if (length > MaxValueLength)
             {
-                int cut = MaxValueLength;
-                // Never split a surrogate pair.
-                if (char.IsHighSurrogate(value[cut - 1]))
-                    cut--;
-                value = value.Substring(0, cut);
+                length = MaxValueLength;
+                if (char.IsHighSurrogate(value[length - 1]))
+                    length--;
                 truncated = true;
             }
 
@@ -197,18 +199,20 @@ namespace OzxApm.Core
             lock (s_lock)
             {
                 bool exists = s_values.TryGetValue(key, out string old);
-                if (exists && string.Equals(old, value, StringComparison.Ordinal))
+                if (exists && old.Length == length && string.CompareOrdinal(old, 0, value, 0, length) == 0)
                 {
                     // Unchanged: no new snapshot, no allocation.
                 }
                 else
                 {
+                    if (truncated)
+                        value = value.Substring(0, length);
                     int oldLength = exists ? EntryLength(key, old) : 0;
                     int newTotal = s_totalLength - oldLength + EntryLength(key, value);
                     if (!exists && s_values.Count >= MaxKeys)
-                        reason = "too many keys (max " + MaxKeys + ")";
+                        reason = "too many keys (max 64)";
                     else if (newTotal > MaxTotalLength)
-                        reason = "context too large (max " + MaxTotalLength + " characters)";
+                        reason = "context too large (max 4096 characters)";
 
                     if (reason == null)
                     {
@@ -231,7 +235,7 @@ namespace OzxApm.Core
                 return false;
             }
             if (truncated)
-                Violation("value cut to " + MaxValueLength + " characters", key, false);
+                Violation("value cut to 256 characters", key, false);
             return true;
         }
 

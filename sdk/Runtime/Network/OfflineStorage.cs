@@ -1411,7 +1411,12 @@ namespace OzxApm.Network
                 {
                     for (int m = 0; m < HighValueMarkers.Length; m++)
                     {
-                        if (StartsAnyLine(_readBuffer, length, HighValueMarkers[m]))
+                        // Legacy (pre-APM-2) files are one {"events":[...]} body without
+                        // context: their events follow '[' or ',', not a line start.
+                        bool found = s.Legacy
+                            ? IndexOf(_readBuffer, 0, length, HighValueMarkers[m]) >= 0
+                            : StartsAnyLine(_readBuffer, length, HighValueMarkers[m]);
+                        if (found)
                         {
                             s.HighValue = 1;
                             break;
