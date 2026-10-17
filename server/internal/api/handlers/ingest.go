@@ -260,6 +260,7 @@ func (h *IngestHandler) IngestEvents(w http.ResponseWriter, r *http.Request) {
 			// Server-side fingerprint (APM-4), before the duplicate lookup
 			// below, which matches on the stored fingerprint.
 			processor.ApplyFingerprint(&event)
+			processor.NormalizeOccurrenceInfo(&event)
 			exceptions = append(exceptions, event)
 
 		case models.EventTypeCrash:

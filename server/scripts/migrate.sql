@@ -140,6 +140,10 @@ CREATE TABLE IF NOT EXISTS apm_exceptions (
     throw_site String DEFAULT '',
     call_site String DEFAULT '',
     breadcrumbs Array(String),
+    error_seq UInt32 DEFAULT 0,
+    session_ms UInt64 DEFAULT 0,
+    unhandled LowCardinality(String) DEFAULT '',
+    ctx_merged UInt8 DEFAULT 0,
     INDEX idx_event_id event_id TYPE bloom_filter(0.001) GRANULARITY 1
 ) ENGINE = ReplacingMergeTree()
 PARTITION BY toYYYYMMDD(timestamp)
@@ -174,7 +178,8 @@ TTL toDateTime(timestamp) + INTERVAL 30 DAY;
 
 -- Additive column migrations for tables created by earlier releases
 -- (APM-2: event_id, seq; APM-5: build_type, gpu, ram_class, net_type, ctx;
--- APM-4: the exception columns from client_fingerprint to breadcrumbs).
+-- APM-4: the exception columns from client_fingerprint to breadcrumbs;
+-- APM-3: error_seq, session_ms, unhandled, ctx_merged).
 -- Metadata only (existing parts are not rewritten), idempotent.
 ALTER TABLE apm_perf_samples ADD COLUMN IF NOT EXISTS event_id String DEFAULT '';
 ALTER TABLE apm_perf_samples ADD COLUMN IF NOT EXISTS seq UInt64 DEFAULT 0;
@@ -221,6 +226,10 @@ ALTER TABLE apm_exceptions ADD COLUMN IF NOT EXISTS inner_exceptions Array(Strin
 ALTER TABLE apm_exceptions ADD COLUMN IF NOT EXISTS throw_site String DEFAULT '';
 ALTER TABLE apm_exceptions ADD COLUMN IF NOT EXISTS call_site String DEFAULT '';
 ALTER TABLE apm_exceptions ADD COLUMN IF NOT EXISTS breadcrumbs Array(String);
+ALTER TABLE apm_exceptions ADD COLUMN IF NOT EXISTS error_seq UInt32 DEFAULT 0;
+ALTER TABLE apm_exceptions ADD COLUMN IF NOT EXISTS session_ms UInt64 DEFAULT 0;
+ALTER TABLE apm_exceptions ADD COLUMN IF NOT EXISTS unhandled LowCardinality(String) DEFAULT '';
+ALTER TABLE apm_exceptions ADD COLUMN IF NOT EXISTS ctx_merged UInt8 DEFAULT 0;
 ALTER TABLE apm_crashes ADD COLUMN IF NOT EXISTS event_id String DEFAULT '';
 ALTER TABLE apm_crashes ADD COLUMN IF NOT EXISTS seq UInt64 DEFAULT 0;
 ALTER TABLE apm_crashes ADD COLUMN IF NOT EXISTS build_type LowCardinality(String) DEFAULT '';

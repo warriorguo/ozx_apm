@@ -87,9 +87,10 @@ func TestSchemaStatements_ContextColumnsOnEveryEventTable(t *testing.T) {
 	}
 }
 
-// APM-4: the exception columns come last in CREATE TABLE, and are added in
-// the same order after the APM-5 columns, so fresh and migrated tables match.
-func TestSchemaStatements_ExceptionColumnsAPM4(t *testing.T) {
+// APM-4, then APM-3: the exception columns come last in CREATE TABLE, and are
+// added in the same order after the APM-5 columns, so fresh and migrated
+// tables match.
+func TestSchemaStatements_ExceptionColumnsAPM4AndAPM3(t *testing.T) {
 	var create string
 	var alters []string
 	for _, stmt := range schemaStatements {
@@ -100,19 +101,21 @@ func TestSchemaStatements_ExceptionColumnsAPM4(t *testing.T) {
 			alters = append(alters, strings.TrimPrefix(stmt, "ALTER TABLE apm_exceptions ADD COLUMN IF NOT EXISTS "))
 		}
 	}
-	want := "    ctx Map(LowCardinality(String), String),\n    " + strings.Join(exceptionColumnsAPM4, ",\n    ") + ",\n    INDEX "
+	added := append(append([]string{}, exceptionColumnsAPM4...), exceptionColumnsAPM3...)
+	want := "    ctx Map(LowCardinality(String), String),\n    " + strings.Join(added, ",\n    ") + ",\n    INDEX "
 	if !strings.Contains(create, want) {
-		t.Errorf("CREATE TABLE apm_exceptions: APM-4 columns missing or out of order:\n%s", create)
+		t.Errorf("CREATE TABLE apm_exceptions: APM-4/APM-3 columns missing or out of order:\n%s", create)
 	}
-	tail := alters[len(alters)-len(exceptionColumnsAPM4):]
-	for i, col := range exceptionColumnsAPM4 {
+	tail := alters[len(alters)-len(added):]
+	for i, col := range added {
 		if tail[i] != col {
 			t.Errorf("migration %d: %q, want %q", i, tail[i], col)
 		}
 	}
 	for _, stmt := range schemaStatements {
-		if strings.HasPrefix(stmt, "CREATE TABLE IF NOT EXISTS apm_crashes ") && strings.Contains(stmt, "client_fingerprint") {
-			t.Error("APM-4 columns on apm_crashes")
+		if strings.HasPrefix(stmt, "CREATE TABLE IF NOT EXISTS apm_crashes ") &&
+			(strings.Contains(stmt, "client_fingerprint") || strings.Contains(stmt, "error_seq")) {
+			t.Error("exception columns on apm_crashes")
 		}
 	}
 }

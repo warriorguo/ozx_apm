@@ -7,6 +7,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/warriorguo/ozx_apm/server/internal/fingerprint"
+	"github.com/warriorguo/ozx_apm/server/internal/models"
 )
 
 func busError(eventID string, seq int, embedded string) string {
@@ -82,5 +83,38 @@ func TestIngest_ExceptionWithoutClientFingerprintIsRejected(t *testing.T) {
 	_, resp := postBatch(t, h, batchOf(sdkEventJSON("exception", "e1", 1, `,"message":"x","count":1`)), nil)
 	if resp.Rejected != 1 || len(store.exceptions) != 0 {
 		t.Errorf("%+v", resp)
+	}
+}
+
+// APM-3: error_seq, session_ms, unhandled and ctx_merged are stored as sent
+// (bounded); events of older SDKs have none of them.
+func TestIngest_ExceptionOccurrenceInfo(t *testing.T) {
+	store := &fakeEventStore{}
+	h := newIngestHandler(store, zap.NewNop())
+	_, resp := postBatch(t, h, batchOf(
+		sdkEventJSON("exception", "e1", 1, `,"fingerprint":"f","message":"Awake failed","stack":"","count":1,"log_type":"error","error_seq":1,"session_ms":2500`),
+		sdkEventJSON("exception", "e2", 2, `,"fingerprint":"f","message":"x","stack":"","count":40,"log_type":"error","error_seq":7,"session_ms":9000,"ctx_merged":true,"ctx":{"dataVersion":"7"}`),
+		sdkEventJSON("exception", "e3", 3, `,"fingerprint":"f","message":"System.Exception: y","stack":"","count":1,"log_type":"error","embedded_exception":"System.Exception: y","error_seq":8,"session_ms":9100,"unhandled":"task"`),
+		sdkEventJSON("exception", "e4", 4, `,"fingerprint":"f","message":"z","stack":"","count":1,"error_seq":-5,"session_ms":-1,"unhandled":"bogus"`),
+		sdkEventJSON("exception", "", 0, `,"fingerprint":"f","message":"old sdk","stack":"","count":2`),
+	), nil)
+	if resp.Accepted != 5 || resp.Rejected != 0 || len(store.exceptions) != 5 {
+		t.Fatalf("response %+v, stored %d", resp, len(store.exceptions))
+	}
+	got := func(i int) models.ExceptionOccurrenceInfo { return store.exceptions[i].ExceptionOccurrenceInfo }
+	if g := got(0); g.ErrorSeq != 1 || g.SessionMs != 2500 || g.Unhandled != "" || g.CtxMerged {
+		t.Errorf("first error: %+v", g)
+	}
+	if g := got(1); g.ErrorSeq != 7 || !g.CtxMerged || store.exceptions[1].Count != 40 || store.exceptions[1].Context["dataVersion"] != "7" {
+		t.Errorf("merged count: %+v", g)
+	}
+	if g := got(2); g.Unhandled != "task" || g.ErrorSeq != 8 {
+		t.Errorf("unhandled: %+v", g)
+	}
+	if g := got(3); g != (models.ExceptionOccurrenceInfo{}) {
+		t.Errorf("out of range: %+v", g)
+	}
+	if g := got(4); g != (models.ExceptionOccurrenceInfo{}) {
+		t.Errorf("old SDK: %+v", g)
 	}
 }

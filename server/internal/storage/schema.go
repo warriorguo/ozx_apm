@@ -65,7 +65,21 @@ type eventTableSchema struct {
 // addedColumns are table-specific columns added after eventColumns, in the
 // order they were added; CREATE TABLE puts them last, as the ALTERs do.
 var addedColumns = map[string][]string{
-	TableExceptions.Name: exceptionColumnsAPM4,
+	TableExceptions.Name: append(append([]string{}, exceptionColumnsAPM4...), exceptionColumnsAPM3...),
+}
+
+// exceptionColumnsAPM3 describe the occurrence(s) an exception row reports
+// (models.ExceptionOccurrenceInfo): error_seq is which error of its session
+// the row's first occurrence was (1 = the session's first error; 0 on rows of
+// older SDKs), session_ms the time since the session started, unhandled
+// empty or 'domain' / 'domain_terminating' / 'task', and ctx_merged 1 when the
+// row's count merges occurrences in different game contexts (ctx then holds
+// only the entries they shared).
+var exceptionColumnsAPM3 = []string{
+	"error_seq UInt32 DEFAULT 0",
+	"session_ms UInt64 DEFAULT 0",
+	"unhandled LowCardinality(String) DEFAULT ''",
+	"ctx_merged UInt8 DEFAULT 0",
 }
 
 // exceptionColumnsAPM4 are the exception columns of APM-4. fingerprint is
@@ -430,7 +444,8 @@ func SchemaSQL() string {
 	sb.WriteString(`
 -- Additive column migrations for tables created by earlier releases
 -- (APM-2: event_id, seq; APM-5: build_type, gpu, ram_class, net_type, ctx;
--- APM-4: the exception columns from client_fingerprint to breadcrumbs).
+-- APM-4: the exception columns from client_fingerprint to breadcrumbs;
+-- APM-3: error_seq, session_ms, unhandled, ctx_merged).
 -- Metadata only (existing parts are not rewritten), idempotent.
 `)
 	for _, s := range eventTableSchemas {

@@ -199,7 +199,8 @@ func (r *Repository) InsertExceptions(ctx context.Context, exceptions []models.E
 	}
 
 	batch, err := r.newInsert(ctx, "INSERT INTO apm_exceptions (timestamp, app_version, platform, device_model, os_version, session_id, device_id, scene, fingerprint, message, stack, count, event_id, seq, build_type, gpu, ram_class, net_type, ctx, "+
-		"client_fingerprint, fingerprint_version, log_type, exception_type, message_template, embedded_exception, inner_exceptions, throw_site, call_site, breadcrumbs)")
+		"client_fingerprint, fingerprint_version, log_type, exception_type, message_template, embedded_exception, inner_exceptions, throw_site, call_site, breadcrumbs, "+
+		"error_seq, session_ms, unhandled, ctx_merged)")
 	if err != nil {
 		return fmt.Errorf("prepare batch: %w", err)
 	}
@@ -235,6 +236,11 @@ func (r *Repository) InsertExceptions(ctx context.Context, exceptions []models.E
 			e.ThrowSite,
 			e.CallSite,
 			stringsColumn(e.Breadcrumbs),
+			// APM-3; bounded by processor.NormalizeOccurrenceInfo.
+			uint32(e.ErrorSeq),
+			uint64(e.SessionMs),
+			e.Unhandled,
+			boolColumn(e.CtxMerged),
 		)
 		if err != nil {
 			return fmt.Errorf("append to batch: %w", err)
@@ -250,6 +256,14 @@ func stringsColumn(s []string) []string {
 		return []string{}
 	}
 	return s
+}
+
+// boolColumn is a UInt8 column's value for a flag.
+func boolColumn(b bool) uint8 {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 // InsertCrashes batch inserts crash events

@@ -172,7 +172,35 @@ type Exception struct {
 	Count       uint32    `json:"count" ch:"count"`
 	EventContext
 	ExceptionDetails
+	ExceptionOccurrenceInfo
 }
+
+// ExceptionOccurrenceInfo is what APM-3 added to exceptions; zero/empty from
+// older SDKs. processor.NormalizeOccurrenceInfo bounds it before storage.
+//
+// An exception event reports one occurrence (count 1, sent when it happened)
+// or a count of occurrences in one de-duplication window and one game context
+// (Ctx is then that context). ErrorSeq and SessionMs describe the event's
+// first occurrence: which error of its session it was (1 = the session's
+// first error; every occurrence of every error counts) and the milliseconds
+// since the session started. Unhandled says the exception was not caught by
+// any code: "domain" (AppDomain.UnhandledException), "domain_terminating"
+// (the same, ending the process) or "task" (an unobserved faulted task).
+// CtxMerged: the count merges occurrences in different contexts (beyond the
+// SDK's per-window limit); the context then holds only what they shared.
+type ExceptionOccurrenceInfo struct {
+	ErrorSeq  int64  `json:"error_seq"`
+	SessionMs int64  `json:"session_ms"`
+	Unhandled string `json:"unhandled"`
+	CtxMerged bool   `json:"ctx_merged"`
+}
+
+// Values of ExceptionOccurrenceInfo.Unhandled ("" for a logged error).
+const (
+	UnhandledDomain            = "domain"
+	UnhandledDomainTerminating = "domain_terminating"
+	UnhandledTask              = "task"
+)
 
 // ExceptionDetails is what APM-4 added to exceptions.
 //

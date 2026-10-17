@@ -64,6 +64,37 @@ func ApplyFingerprint(e *models.Exception) {
 	d.InnerExceptions = inner
 }
 
+// MaxErrorSeq is the largest stored error_seq (the column is UInt32).
+const MaxErrorSeq = 1<<32 - 1
+
+// MaxSessionMs bounds session_ms: a session longer than a year is not one.
+const MaxSessionMs = 366 * 24 * 3600 * 1000
+
+// NormalizeOccurrenceInfo bounds the APM-3 fields of an exception event in
+// place: error_seq and session_ms are clamped to [0, max] (0 = unknown), and
+// an unhandled kind other than the SDK's is stored as "" (a logged error).
+// It never rejects the event.
+func NormalizeOccurrenceInfo(e *models.Exception) {
+	o := &e.ExceptionOccurrenceInfo
+	o.ErrorSeq = clamp(o.ErrorSeq, MaxErrorSeq)
+	o.SessionMs = clamp(o.SessionMs, MaxSessionMs)
+	switch o.Unhandled {
+	case models.UnhandledDomain, models.UnhandledDomainTerminating, models.UnhandledTask:
+	default:
+		o.Unhandled = ""
+	}
+}
+
+func clamp(v, max int64) int64 {
+	if v < 0 {
+		return 0
+	}
+	if v > max {
+		return max
+	}
+	return v
+}
+
 // capBreadcrumbs keeps the last MaxBreadcrumbs entries (the most recent ones),
 // each cut to MaxBreadcrumbLength characters, and never returns nil.
 func capBreadcrumbs(b []string) []string {
