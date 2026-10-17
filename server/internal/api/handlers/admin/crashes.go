@@ -33,23 +33,11 @@ func (h *CrashHandler) ListCrashes(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	q := r.URL.Query()
 
-	// Parse time range
-	endTime := time.Now()
-	startTime := endTime.Add(-7 * 24 * time.Hour)
-
-	if start := q.Get("start_time"); start != "" {
-		if t, err := time.Parse(time.RFC3339, start); err == nil {
-			startTime = t
-		}
+	f, err := parseAdminFilter(q, 7*24*time.Hour)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
 	}
-	if end := q.Get("end_time"); end != "" {
-		if t, err := time.Parse(time.RFC3339, end); err == nil {
-			endTime = t
-		}
-	}
-
-	appVersion := q.Get("app_version")
-	platform := q.Get("platform")
 
 	page := 1
 	if p := q.Get("page"); p != "" {
@@ -65,7 +53,7 @@ func (h *CrashHandler) ListCrashes(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	crashes, totalCount, err := h.repo.GetCrashGroups(ctx, startTime, endTime, appVersion, platform, page, pageSize)
+	crashes, totalCount, err := h.repo.GetCrashGroups(ctx, f, page, pageSize)
 	if err != nil {
 		h.logger.Error("failed to get crash groups", zap.Error(err))
 		http.Error(w, "internal error", http.StatusInternalServerError)
@@ -98,22 +86,13 @@ func (h *CrashHandler) GetCrashDetail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Parse time range
-	endTime := time.Now()
-	startTime := endTime.Add(-30 * 24 * time.Hour)
-
-	if start := q.Get("start_time"); start != "" {
-		if t, err := time.Parse(time.RFC3339, start); err == nil {
-			startTime = t
-		}
-	}
-	if end := q.Get("end_time"); end != "" {
-		if t, err := time.Parse(time.RFC3339, end); err == nil {
-			endTime = t
-		}
+	f, err := parseAdminFilter(q, 30*24*time.Hour)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
 	}
 
-	detail, err := h.repo.GetCrashDetail(ctx, fingerprint, startTime, endTime)
+	detail, err := h.repo.GetCrashDetail(ctx, fingerprint, f)
 	if err != nil {
 		h.logger.Error("failed to get crash detail", zap.Error(err), zap.String("fingerprint", fingerprint))
 		http.Error(w, "internal error", http.StatusInternalServerError)
@@ -151,23 +130,11 @@ func (h *ExceptionHandler) ListExceptions(w http.ResponseWriter, r *http.Request
 	ctx := r.Context()
 	q := r.URL.Query()
 
-	// Parse time range
-	endTime := time.Now()
-	startTime := endTime.Add(-7 * 24 * time.Hour)
-
-	if start := q.Get("start_time"); start != "" {
-		if t, err := time.Parse(time.RFC3339, start); err == nil {
-			startTime = t
-		}
+	f, err := parseAdminFilter(q, 7*24*time.Hour)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
 	}
-	if end := q.Get("end_time"); end != "" {
-		if t, err := time.Parse(time.RFC3339, end); err == nil {
-			endTime = t
-		}
-	}
-
-	appVersion := q.Get("app_version")
-	platform := q.Get("platform")
 
 	page := 1
 	if p := q.Get("page"); p != "" {
@@ -183,7 +150,7 @@ func (h *ExceptionHandler) ListExceptions(w http.ResponseWriter, r *http.Request
 		}
 	}
 
-	exceptions, totalCount, err := h.repo.GetExceptionGroups(ctx, startTime, endTime, appVersion, platform, page, pageSize)
+	exceptions, totalCount, err := h.repo.GetExceptionGroups(ctx, f, page, pageSize)
 	if err != nil {
 		h.logger.Error("failed to get exception groups", zap.Error(err))
 		http.Error(w, "internal error", http.StatusInternalServerError)
