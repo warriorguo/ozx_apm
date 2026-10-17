@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/warriorguo/ozx_apm/server/internal/models"
+	"github.com/warriorguo/ozx_apm/server/internal/storage"
 )
 
 // APM-15 (and APM-11's link into it) end to end: one session as the SDK
@@ -280,6 +281,45 @@ func TestSessionTimeline_RoomOnlyHalfBuilt(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// A session with more rows of a type than the time line returns: the ones
+// nearest to at are kept (the occurrence it was opened from stays visible),
+// or the earliest without at; the type is reported as truncated.
+func TestSessionTimeline_LimitKeepsTheRowsNearestToAt(t *testing.T) {
+	e := setupAPM4(t, false)
+	e.ts = time.Now().Add(-3 * time.Hour).Truncate(time.Second).UnixMilli()
+	n := storage.SessionRowsPerType + 200
+	events := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		events = append(events, e.sessionEvent("custom_event", "S5-many", int64(i)*100, nil, map[string]interface{}{"name": "tick", "count": 1}))
+	}
+	for i := 0; i < n; i += 500 {
+		end := i + 500
+		if end > n {
+			end = n
+		}
+		if resp := postIngest(t, e.ingest, events[i:end]...); resp.Accepted != end-i {
+			t.Fatalf("ingest: %+v", resp)
+		}
+	}
+	at := time.UnixMilli(e.ts + 1150*100).UTC()
+	tl := timelineOf(t, e, url.Values{"session_id": {"S5-many"}, "at": {at.Format(time.RFC3339Nano)}})
+	if tl.Counts[models.TimelineCustomEvent] != storage.SessionRowsPerType || len(tl.Truncated) != 1 || tl.Truncated[0] != models.TimelineCustomEvent {
+		t.Fatalf("counts %v, truncated %v", tl.Counts, tl.Truncated)
+	}
+	first, last := tl.Items[0].Time, tl.Items[len(tl.Items)-1].Time
+	if !last.Equal(time.UnixMilli(e.ts+int64(n-1)*100).UTC()) || first.UnixMilli() != e.ts+200*100 {
+		t.Errorf("kept %v .. %v", first, last)
+	}
+	tl = timelineOf(t, e, url.Values{"session_id": {"S5-many"}})
+	if tl.Items[0].Time.UnixMilli() != e.ts || tl.Items[len(tl.Items)-1].Time.UnixMilli() != e.ts+int64(storage.SessionRowsPerType-1)*100 {
+		t.Errorf("without at: %v .. %v", tl.Items[0].Time, tl.Items[len(tl.Items)-1].Time)
+	}
+	// The session's own span is reported in full.
+	if tl.Session.Rows != int64(n) {
+		t.Errorf("rows %d", tl.Session.Rows)
 	}
 }
 
