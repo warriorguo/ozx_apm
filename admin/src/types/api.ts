@@ -126,6 +126,13 @@ export interface ExceptionGroup {
   session_count: number
   first_seen: string
   last_seen: string
+  // APM-4: the server's grouping. Empty (version 0) for groups stored before
+  // it, and absent from older servers.
+  fingerprint_version?: number
+  exception_type?: string
+  message_template?: string
+  throw_site?: string
+  call_site?: string
 }
 
 export interface ExceptionListResponse {
