@@ -2031,16 +2031,44 @@ table.
   silently; crash stacks sent in full; all fixed with tests. Running the
   perf probe on the parallel version then found the clickhouse-go settings
   map race (above), fixed with a test.
+- Review before merge: the time line ran up to 9 queries at once on the
+  connection pool that ingest shares (10 connections, one process for the
+  SDK and admin ports): two time lines opened together could make ingest
+  wait for a connection. At most 4 time line queries now run at once across
+  requests (a test; time line still 37-46 ms on the 14 M row database).
+- On a device (Samsung A33, IL2CPP arm64 release build, local server from
+  this branch, then the test environment): the half-built room reads, from
+  the occurrence's "session time line at this moment": scene load, levelId
+  -> 3, roomId -> r-11, room_enter r-11, room_ready r-11, roomId r-11 ->
+  r-12, room_enter r-12, the warning "Room layout missing for r-12", the
+  exception, and no room_ready r-12. On n192 room_enter and the warning
+  shared a millisecond and the warning came first: same-millisecond lines
+  are now ordered after the row recorded before them in their carrier's
+  list (fixed with a test; checked again on n192). Detail: throw site
+  `RoomBuilder.LoadLayout` / `RoomLoader.LoadTemplate`, logged from
+  `GameEventBus.Publish` (no file/line on a release build: OZX-1277), the
+  occurrence's context `planId=p-7`, `masterSeed=184467440737`. Distribution
+  by roomId: 1001/1002/1003 one each; the per-frame NRE in three rooms
+  300/299/299 = the device's counts (898, merged 0); by version, build,
+  model, platform, OS. "First error of the session" lists the Awake failure,
+  not the NRE cascade after it. Sorts, `sort=bogus` 400, page 2, offset cap
+  400, a `ctx` filter. 11 context changes for a room every 3 s; aggregated
+  `enemy_killed` rows (1006, 1062) and metric windows on the time line; a
+  device's sessions; a 40-day range 400; an unknown session `found: false`;
+  a jank's recent events (scene, room_enter, the warning, the NRE).
+- Test environment (server release 304, admin 305): one start-up warning
+  naming the 8 tables (no ALTER ADD INDEX); time line of the session
+  0.12 s over HTTPS without the index; exception list sorts ~0.05 s.
 
 ### Not verified
 
-- On a device and on n192: nothing of this release (the plan is in
-  `/tmp/claude-501/apm11/verify_plan.txt`; the test app needs the two new
-  driver commands `fullroom=` / `halfroom=` from
-  `/tmp/claude-501/apm11/ApmTestDriver.cs`, which compiles against this
-  branch's SDK). File and line on a release build need OZX-1277.
+- File and line on a release build: they need OZX-1277.
+- `idx_session_id` on n192: the `apm` account cannot add it; until an admin
+  runs the statements above, time lines read the `session_id` column of
+  every table in the range (0.12 s at the test environment's volume).
 - Production volume: the numbers above are a local scratch database; the
   production row counts per day are not known here.
 - Crash rows: the SDK sends none yet; the time line shows them from test
   rows only.
-- The admin pages were tested with vitest (jsdom), not in a browser.
+- The admin pages were tested with vitest (jsdom) and through their API on
+  the test environment, not opened in a browser.
