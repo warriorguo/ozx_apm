@@ -133,11 +133,34 @@ func TestCrashFingerprint_NativeGroupsBySymbolsAcrossBuilds(t *testing.T) {
 		t.Fatal("the signal must take part")
 	}
 
-	// Without symbols: per build, by address.
+	// Without symbols: never keyed by address (APM-8 alerts on every new
+	// fingerprint: a new build must not turn known crashes into new issues).
+	// The same crash in two builds without symbols is one fingerprint; the
+	// site still shows the address.
 	ra := CrashFingerprint(CrashInput{CrashType: "native", Signal: "SIGSEGV", Threads: build1})
 	rb := CrashFingerprint(CrashInput{CrashType: "native", Signal: "SIGSEGV", Threads: build2})
-	if ra.Fingerprint == rb.Fingerprint || ra.Symbolicated || ra.Site != "libil2cpp.so+0x5417bc" {
-		t.Fatalf("by address: %+v %+v", ra, rb)
+	if ra.Fingerprint != rb.Fingerprint || ra.Symbolicated || ra.Site != "libil2cpp.so+0x5417bc" || rb.Site != "libil2cpp.so+0x6417bc" {
+		t.Fatalf("without symbols: %+v %+v", ra, rb)
+	}
+	if ra.Fingerprint == a.Fingerprint {
+		t.Fatal("named and unnamed frames are different keys")
+	}
+	// A third build with other addresses and another build id: still the same.
+	build3 := ParseCrashStack(strings.ReplaceAll(strings.ReplaceAll(sdkNativeStack, "000000000053ffcc", "0000000000777ffc"), "0d65a2d2978f75f06db6c72ff3cf4e5a0c6a2077", "abcdef01"))
+	if rc := CrashFingerprint(CrashInput{CrashType: "native", Signal: "SIGSEGV", Threads: build3}); rc.Fingerprint != ra.Fingerprint {
+		t.Fatalf("third build: %+v", rc)
+	}
+	// Partly named (the symbols of one build name only some frames): the
+	// named frames take part, the others count as their library.
+	partial := CrashFingerprint(CrashInput{CrashType: "native", Signal: "SIGSEGV", Threads: build1,
+		Resolve: func(f CrashFrame) string {
+			if f.PC == 0x5417bc {
+				return "ApmTestDriver.DeepC(System.Int32)"
+			}
+			return ""
+		}})
+	if partial.Fingerprint == ra.Fingerprint || partial.Fingerprint == a.Fingerprint || partial.Site != "libil2cpp.so!ApmTestDriver.DeepC" {
+		t.Fatalf("partly named: %+v", partial)
 	}
 }
 
@@ -172,12 +195,11 @@ Thread "UnityMain" tid=20
 
 func TestFrameKey(t *testing.T) {
 	addr, _ := ParseCrashFrame("#03 pc 0000000000001000 libil2cpp.so (BuildId: 0d65a2d2978f75f06db6c72ff3cf4e5a0c6a2077)")
-	if k, _ := FrameKey(addr, nil); k != "libil2cpp.so+0x1000 0d65a2d2978f75f0" {
-		t.Fatalf("address key: %q", k)
+	if k, _ := FrameKey(addr, nil); k != "libil2cpp.so!?" {
+		t.Fatalf("unnamed frame: %q", k)
 	}
-	noID, _ := ParseCrashFrame("#03 pc 0000000000001000 libil2cpp.so")
-	if k, _ := FrameKey(noID, nil); k != "libil2cpp.so+0x1000" {
-		t.Fatalf("address key without build id: %q", k)
+	if site := frameSite(addr, "libil2cpp.so!?"); site != "libil2cpp.so+0x1000" {
+		t.Fatalf("site %q", site)
 	}
 	f, _ := ParseCrashFrame("#03 pc 0000000000001000 libunity.so (_ZN5Unity4Load+4) (BuildId: aa)")
 	if k, sym := FrameKey(f, nil); k != "libunity.so!_ZN5Unity4Load" || sym {

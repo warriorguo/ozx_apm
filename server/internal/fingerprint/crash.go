@@ -45,9 +45,14 @@ import (
 //
 // A frame key is "module!function" when the function is known (resolved
 // from uploaded symbols, else as the device reported it; C# names reduced by
-// NormalizeMethod, "(args)" removed), else "module+0x<pc> <build id>" (the
-// first 16 digits, when the device reported one): without symbols a crash
-// groups per build, since the addresses change with every build.
+// NormalizeMethod, "(args)" removed), else "module!?": a frame nobody can
+// name is keyed by its library only, never by its address. Addresses change
+// with every build, and every new fingerprint is a "new crash" alert
+// (APM-8): keyed by address, a build without uploaded symbols would turn
+// every known native crash into new issues; keyed "module!?", crashes the
+// server cannot name group per (type, signal, named frames, libraries)
+// across builds, coarser but stable, until symbols name them (crash_site
+// still shows the address).
 // Java frames are keyed by their method. In-app: native frames of the app's
 // own libraries (no leading '/' or '['), Java frames outside the Android,
 // Java, Kotlin and Unity player packages.
@@ -413,28 +418,29 @@ func CrashFingerprint(in CrashInput) CrashResult {
 	typ := strings.ToLower(strings.TrimSpace(in.CrashType))
 	b.WriteString(typ + "\n")
 	var keys []string
+	var site string
 	switch typ {
 	case CrashTypeNative:
 		b.WriteString(strings.ToUpper(strings.TrimSpace(in.Signal)) + "\n")
 		if len(in.Threads) > 0 {
 			t := crashedThread(in.Threads)
-			keys = frameKeys(t.Frames, true, in.Resolve, &r.Symbolicated)
+			keys, site = frameKeys(t.Frames, true, in.Resolve, &r.Symbolicated)
 			if len(keys) == 0 {
-				keys = frameKeys(t.Frames, false, in.Resolve, &r.Symbolicated)
+				keys, site = frameKeys(t.Frames, false, in.Resolve, &r.Symbolicated)
 			}
 		}
 		b.WriteString("f:" + strings.Join(keys, "\n"))
 	case CrashTypeANR:
 		for _, t := range in.Threads {
 			if t.Name == "UnityMain" {
-				keys = frameKeys(t.Frames, true, in.Resolve, &r.Symbolicated)
+				keys, site = frameKeys(t.Frames, true, in.Resolve, &r.Symbolicated)
 				break
 			}
 		}
 		if len(keys) == 0 && len(in.Threads) > 0 {
-			keys = frameKeys(in.Threads[0].Frames, true, in.Resolve, &r.Symbolicated)
+			keys, site = frameKeys(in.Threads[0].Frames, true, in.Resolve, &r.Symbolicated)
 			if len(keys) == 0 {
-				keys = frameKeys(in.Threads[0].Frames, false, in.Resolve, &r.Symbolicated)
+				keys, site = frameKeys(in.Threads[0].Frames, false, in.Resolve, &r.Symbolicated)
 			}
 		}
 		b.WriteString("f:" + strings.Join(keys, "\n"))
@@ -443,9 +449,7 @@ func CrashFingerprint(in CrashInput) CrashResult {
 	default:
 		b.WriteString("r:" + strings.ToUpper(strings.TrimSpace(in.ExitReason)))
 	}
-	if len(keys) > 0 {
-		r.Site = siteOf(keys[0])
-	}
+	r.Site = site
 	r.Fingerprint = Hash(b.String())
 	return r
 }
@@ -459,9 +463,11 @@ func crashedThread(ts []CrashThread) CrashThread {
 	return ts[0]
 }
 
-// frameKeys returns up to crashFingerprintFrames distinct frame keys.
-func frameKeys(frames []CrashFrame, inApp bool, resolve func(CrashFrame) string, symbolicated *bool) []string {
+// frameKeys returns up to crashFingerprintFrames distinct frame keys and
+// the display site of the first one.
+func frameKeys(frames []CrashFrame, inApp bool, resolve func(CrashFrame) string, symbolicated *bool) ([]string, string) {
 	var out []string
+	site := ""
 	seen := map[string]bool{}
 	for _, f := range frames {
 		if len(out) == crashFingerprintFrames {
@@ -478,9 +484,21 @@ func frameKeys(frames []CrashFrame, inApp bool, resolve func(CrashFrame) string,
 		if sym {
 			*symbolicated = true
 		}
+		if len(out) == 0 {
+			site = frameSite(f, key)
+		}
 		out = append(out, key)
 	}
-	return out
+	return out, site
+}
+
+// frameSite is how a frame shows as crash_site: its key, or for a frame
+// keyed "module!?" its address ("libil2cpp.so+0x5417bc").
+func frameSite(f CrashFrame, key string) string {
+	if f.Native && strings.HasSuffix(key, "!?") {
+		return f.ModuleName() + "+0x" + strconv.FormatUint(f.PC, 16)
+	}
+	return key
 }
 
 // FrameKey is a frame's identity in the fingerprint; sym reports that it
@@ -501,24 +519,7 @@ func FrameKey(f CrashFrame, resolve func(CrashFrame) string) (key string, sym bo
 	if name != "" {
 		return mod + "!" + NormalizeMethod(stripArgs(name)), sym
 	}
-	key = mod + "+0x" + strconv.FormatUint(f.PC, 16)
-	if f.BuildID != "" {
-		// The same address in another build is other code.
-		id := f.BuildID
-		if len(id) > 16 {
-			id = id[:16]
-		}
-		key += " " + id
-	}
-	return key, false
-}
-
-// siteOf is a frame key without the build id of an address key.
-func siteOf(key string) string {
-	if i := strings.IndexByte(key, ' '); i > 0 && !strings.Contains(key, "!") {
-		return key[:i]
-	}
-	return key
+	return mod + "!?", false
 }
 
 // stripArgs removes a trailing argument list: "Ns.Type.Method(System.Int32)"

@@ -276,10 +276,12 @@ func TestCrashSymbols_UploadThenCrashesShowCSharpLines(t *testing.T) {
 			if len(crashes.Crashes) != 2 || crashes.Crashes[0].Count != 3 || crashes.Crashes[0].CrashSite != "libil2cpp.so!Helper.Twice" {
 				t.Errorf("version fallback: %+v", crashes.Crashes)
 			}
-			// Another ABI has no upload: by address, a group of its own.
+			// Another ABI has no upload: unnamed, it joins the group of the
+			// crash stored before the upload (unnamed frames are keyed by
+			// library, never by address: no new issue per build, APM-8).
 			e.post(t, e.crash("S5", "", pcs, map[string]interface{}{"abi": "armeabi-v7a"}))
 			getAdmin(t, e.admin, "/api/crashes", e.params, &crashes)
-			if len(crashes.Crashes) != 3 {
+			if len(crashes.Crashes) != 2 || crashes.Crashes[1].Count != 2 || crashes.Crashes[1].Fingerprint != byAddr.Fingerprint {
 				t.Errorf("other ABI: %+v", crashes.Crashes)
 			}
 

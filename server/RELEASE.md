@@ -2623,13 +2623,40 @@ serialized on Unity's Mono; the ingest test stores them.
   the UnityMain thread's in-app frames (else the main thread's); Java: the
   template of the description; kills: the exit reason. A frame is keyed by
   `module!function` when uploaded symbols (or the device) name it, else by
-  `module+0x<pc> <build id>`: **with symbols uploaded before the crash
-  arrives (the CI step), the same bug is one group across builds; without,
-  one group per build** (addresses change with every build). Crashes
-  stored before their symbols were uploaded keep their address-keyed group
-  (the list and detail still show them symbolicated). The lookups at
-  ingest have a 3 s budget per batch; after a timeout or error the batch's
-  remaining crashes are keyed by address and stored (one warning).
+  `module!?` (its library, **never its address**): with symbols uploaded
+  before the crash arrives (the CI step), the same bug is one group across
+  builds; without, crashes nobody can name group per (type, signal, named
+  frames such as libc's `abort`, libraries): coarser, but stable across
+  builds. `crash_site` and the summary still show the address
+  (`libil2cpp.so+0x5417bc`); the list and detail symbolicate it when read.
+  Crashes stored before their symbols were uploaded stay in that coarse
+  group; later ones go to their method's group. The lookups at ingest have
+  a 3 s budget per batch; after a timeout or error the batch's remaining
+  crashes are keyed like unnamed frames and stored (one warning).
+- **Interplay with APM-8 alerting.** The evaluator sends a "new crash"
+  alert for every crash fingerprint it has not seen, and regressions of
+  resolved ones. Keyed by address (the first design), every build without
+  uploaded symbols would have turned every recurring native crash into a
+  new fingerprint and a new alert, at each release. With unnamed frames
+  keyed by library: a new build without symbols makes no new crash
+  fingerprints (unit tests: three builds of one crash, ingest of two
+  builds); what remains is, once, when symbols start being uploaded for a
+  game that had none: crashes move from the coarse groups to one group per
+  method, each a "new crash" alert, which is real news (the bugs become
+  distinguishable). Avoid it by uploading symbols from the first release
+  with this SDK. The cost of the coarse group: while symbols are missing,
+  different native bugs with the same signal and libraries share a group,
+  so resolving it and seeing it again (a regression) may be another bug;
+  look at the detail's latest stack.
+- **Crash rate (APM-8).** Crash events carry the crashed session's
+  `session_id`, `app_version` and `build_type` (the journal's: `release`
+  on a release build), and the time of the crash, so the evaluator's
+  crashed sessions per version count them like any crash. A crash reaches
+  the server only at the next launch: one reported more than the rate
+  window (1 h by default) after it happened is not in the spike rule's
+  window (it still counts in the 24 h baseline that follows). New-issue
+  alerts are not affected (the evaluator's 6-hourly sweep covers late
+  uploads).
 - Duplicates (APM-19): a re-sent crash is looked up by `event_id` without
   the fingerprint filter (`EventIDLookup.AnyKey`), because its fingerprint
   can differ from the stored copy's when symbols were uploaded in between;
@@ -2799,7 +2826,9 @@ columns (its rows read the defaults), ignores the symbol tables and has no
 symbol endpoints (the tool gets 404/405: deploy the server first). A crash
 stored by the old binary has the SDK's fingerprint (version 0), one stored
 by the new one the server's: the same crash can be two groups during the
-deploy. **Rollback:** redeploy the previous binary; no schema action; the
+deploy (and, with APM-8 alerting on, two "new crash" alerts). No SDK sent
+crash events before APM-7 and the server is deployed before the SDK, so in
+practice no crash row comes from the old binary. **Rollback:** redeploy the previous binary; no schema action; the
 columns and symbol tables stay (unused; symbols expire by TTL). The SDK
 with APM-7 against an older server: crash events are stored with type,
 fingerprint, stack and breadcrumbs; the rest is ignored. To roll back the
@@ -2812,10 +2841,11 @@ To remove the tables after a permanent rollback (admin):
 
 ### Verified
 
-- Server: `go vet`, `go test ./...` (unit): the crash stack parser (SDK,
+- Server: `go vet`, `go test -race ./...` (unit): the crash stack parser (SDK,
   tombstone and ANR forms, hostile input), crash fingerprint (the same
-  methods at other addresses in two builds are one group; by address per
-  build otherwise; ANR by UnityMain; kills by reason), normalization,
+  methods at other addresses in two builds are one group; without symbols
+  too, never by address; partly named stacks; ANR by UnityMain; kills by
+  reason), normalization,
   summaries, ingest of SDK-serialized crash events (fixture from the SDK on
   Unity's Mono) with and without symbols and with a failing symbol store,
   the symbols package (ELF symbol tables and build ids for arm64 and Thumb,

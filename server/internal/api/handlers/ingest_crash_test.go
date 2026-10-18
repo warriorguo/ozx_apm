@@ -244,3 +244,22 @@ func TestIngest_CrashDuplicateLookupIgnoresTheFingerprint(t *testing.T) {
 		t.Fatalf("lookup %+v", last)
 	}
 }
+
+// APM-8 alerts on every new crash fingerprint: the same crash from two
+// builds without uploaded symbols (other addresses, other build ids) must be
+// one fingerprint, not a "new crash" per build.
+func TestIngest_CrashWithoutSymbolsKeepsItsFingerprintAcrossBuilds(t *testing.T) {
+	store := &symbolEventStore{}
+	h := newIngestHandler(store, zap.NewNop())
+	_, resp := postBatch(t, h, batchOf(
+		nativeCrashJSON("b1", "aaaaaaaa", "0000000000001010", "0000000000002010"),
+		nativeCrashJSON("b2", "bbbbbbbb", "0000000000005010", "0000000000006010"),
+	), nil)
+	if resp.Accepted != 2 {
+		t.Fatalf("response %+v", resp)
+	}
+	a, b := store.crashes[0], store.crashes[1]
+	if a.Fingerprint != b.Fingerprint || a.CrashSite != "libil2cpp.so+0x1010" || b.CrashSite != "libil2cpp.so+0x5010" {
+		t.Fatalf("%s %s / %s %s", a.Fingerprint, a.CrashSite, b.Fingerprint, b.CrashSite)
+	}
+}
