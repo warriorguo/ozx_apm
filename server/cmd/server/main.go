@@ -11,6 +11,7 @@ import (
 
 	"go.uber.org/zap"
 
+	"github.com/warriorguo/ozx_apm/server/internal/alert"
 	"github.com/warriorguo/ozx_apm/server/internal/api"
 	"github.com/warriorguo/ozx_apm/server/internal/config"
 	"github.com/warriorguo/ozx_apm/server/internal/storage"
@@ -58,6 +59,12 @@ func main() {
 	// Initialize repository
 	repo := storage.NewRepository(chClient, logger)
 
+	// Alert evaluator (APM-8): off unless OZX_ALERT_ENABLED; it reads
+	// ClickHouse and never touches the ingest path.
+	alertCtx, stopAlerts := context.WithCancel(context.Background())
+	defer stopAlerts()
+	startAlerting(alertCtx, cfg.Alert, repo, logger)
+
 	// Start SDK ingestion server if enabled
 	var sdkServer *http.Server
 	if cfg.Server.Enabled {
@@ -104,6 +111,7 @@ func main() {
 	<-quit
 
 	logger.Info("shutting down servers...")
+	stopAlerts()
 
 	// Graceful shutdown with timeout
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -122,4 +130,32 @@ func main() {
 	}
 
 	logger.Info("servers stopped")
+}
+
+// startAlerting starts the alert evaluator when enabled and configured; it
+// logs one line saying whether it runs. The webhook URL is a secret: only
+// its host is logged.
+func startAlerting(ctx context.Context, c config.AlertConfig, repo *storage.Repository, logger *zap.Logger) {
+	if !c.Enabled {
+		logger.Info("alerting disabled (OZX_ALERT_ENABLED is not true; enable it on one deployment, RELEASE.md APM-8)")
+		return
+	}
+	if c.WebhookURL == "" {
+		logger.Error("alerting not started: OZX_ALERT_ENABLED is true but OZX_ALERT_WEBHOOK_URL is empty")
+		return
+	}
+	notifier, err := alert.NewNotifier(c.WebhookURL, c.WebhookFormat, c.AdminBaseURL)
+	if err != nil {
+		logger.Error("alerting not started", zap.Error(err))
+		return
+	}
+	cfg := alert.ConfigFrom(c)
+	evaluator := alert.NewEvaluator(repo, notifier, cfg, logger)
+	logger.Info("alerting enabled",
+		zap.String("webhook_host", notifier.Host()),
+		zap.String("webhook_format", notifier.Format()),
+		zap.Bool("admin_links", c.AdminBaseURL != ""),
+		zap.Duration("interval", cfg.Interval),
+		zap.Bool("include_dev_builds", cfg.IncludeDevBuilds))
+	go evaluator.Run(ctx)
 }

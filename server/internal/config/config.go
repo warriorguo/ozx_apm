@@ -38,6 +38,11 @@ type AdminServerConfig struct {
 	// require "Authorization: Bearer <token>" and are disabled while it is
 	// empty. Environment: OZX_ADMIN_PRIVACY_TOKEN. Never logged.
 	PrivacyToken string `mapstructure:"privacy_token"`
+	// AlertToken enables POST /api/alerts/test (APM-8), which makes the
+	// alert evaluator post a test message to the webhook: "Authorization:
+	// Bearer <token>"; disabled while empty. Environment:
+	// OZX_ADMIN_ALERT_TOKEN. Never logged.
+	AlertToken string `mapstructure:"alert_token"`
 }
 
 type ClickHouseConfig struct {
@@ -62,9 +67,82 @@ type RateLimitConfig struct {
 	RequestsPerMin int  `mapstructure:"requests_per_min"`
 }
 
+// AlertConfig configures the alert evaluator (APM-8). Every key can be set
+// by an environment variable OZX_ALERT_<KEY> (e.g. OZX_ALERT_ENABLED,
+// OZX_ALERT_WEBHOOK_URL). Off by default; it must run in one process only
+// (RELEASE.md, APM-8), although two running at once send each alert once.
 type AlertConfig struct {
-	Enabled    bool   `mapstructure:"enabled"`
+	Enabled bool `mapstructure:"enabled"`
+	// WebhookURL receives the alerts (POST, JSON). A secret: never logged.
 	WebhookURL string `mapstructure:"webhook_url"`
+	// WebhookFormat: generic (the documented JSON with a "text" field),
+	// slack ({"text"}) or feishu ({"msg_type":"text","content":{"text"}}).
+	WebhookFormat string `mapstructure:"webhook_format"`
+	// AdminBaseURL is the admin UI's address, for links in alerts
+	// (e.g. https://apm-admin.local.playquota.com). Empty: no links.
+	AdminBaseURL string `mapstructure:"admin_base_url"`
+	// Interval between evaluations.
+	Interval time.Duration `mapstructure:"interval"`
+	// IncludeDevBuilds: also alert on dev and editor builds (off: release
+	// builds and events without a build type).
+	IncludeDevBuilds bool `mapstructure:"include_dev_builds"`
+
+	// New issues: at most NewIssueMaxPerCycle individual alerts per
+	// evaluation, the rest in one digest. NewIssueWindow is how far back each
+	// evaluation looks for rows (by event time); every SweepInterval the
+	// whole retention is searched instead (late uploads).
+	NewIssueMaxPerCycle int           `mapstructure:"new_issue_max_per_cycle"`
+	NewIssueWindow      time.Duration `mapstructure:"new_issue_window"`
+	SweepInterval       time.Duration `mapstructure:"sweep_interval"`
+
+	// Crash rate spike: crashed sessions / sessions of a version over
+	// CrashRateWindow, checked every CrashRateCheckInterval, against all
+	// versions over the CrashRateBaselineWindow before it.
+	CrashRateWindow         time.Duration `mapstructure:"crash_rate_window"`
+	CrashRateBaselineWindow time.Duration `mapstructure:"crash_rate_baseline_window"`
+	CrashRateCheckInterval  time.Duration `mapstructure:"crash_rate_check_interval"`
+	CrashRateMinSessions    int64         `mapstructure:"crash_rate_min_sessions"`
+	CrashRateMinCrashed     int64         `mapstructure:"crash_rate_min_crashed_sessions"`
+	CrashRateMinRate        float64       `mapstructure:"crash_rate_min_rate"`
+	CrashRateFactor         float64       `mapstructure:"crash_rate_factor"`
+	CrashRateCooldown       time.Duration `mapstructure:"crash_rate_cooldown"`
+
+	// Startup P95 regression: the newest version against the previous one,
+	// over StartupWindow, checked every StartupCheckInterval.
+	StartupEnabled       bool          `mapstructure:"startup_enabled"`
+	StartupWindow        time.Duration `mapstructure:"startup_window"`
+	StartupCheckInterval time.Duration `mapstructure:"startup_check_interval"`
+	StartupMinSamples    int64         `mapstructure:"startup_min_samples"`
+	StartupIncrease      float64       `mapstructure:"startup_increase"`
+	StartupMinDeltaMs    float64       `mapstructure:"startup_min_delta_ms"`
+}
+
+// alertDefaults are the alert.* defaults; each key is also bound to the
+// environment variable OZX_ALERT_<KEY>.
+var alertDefaults = map[string]interface{}{
+	"enabled":                         false,
+	"webhook_url":                     "",
+	"webhook_format":                  "generic",
+	"admin_base_url":                  "",
+	"interval":                        "60s",
+	"include_dev_builds":              false,
+	"new_issue_max_per_cycle":         10,
+	"new_issue_window":                "26h",
+	"sweep_interval":                  "6h",
+	"crash_rate_window":               "1h",
+	"crash_rate_baseline_window":      "24h",
+	"crash_rate_check_interval":       "5m",
+	"crash_rate_min_sessions":         50,
+	"crash_rate_min_crashed_sessions": 5,
+	"crash_rate_min_rate":             0.005,
+	"crash_rate_factor":               2.0,
+	"crash_rate_cooldown":             "6h",
+	"startup_enabled":                 true,
+	"startup_window":                  "168h",
+	"startup_check_interval":          "1h",
+	"startup_min_samples":             100,
+	"startup_increase":                0.2,
+	"startup_min_delta_ms":            100,
 }
 
 func Load() (*Config, error) {
@@ -89,6 +167,8 @@ func Load() (*Config, error) {
 	viper.SetDefault("admin_server.allowed_origins", []string{"*"})
 	viper.SetDefault("admin_server.privacy_token", "")
 	_ = viper.BindEnv("admin_server.privacy_token", "OZX_ADMIN_PRIVACY_TOKEN")
+	viper.SetDefault("admin_server.alert_token", "")
+	_ = viper.BindEnv("admin_server.alert_token", "OZX_ADMIN_ALERT_TOKEN")
 
 	viper.SetDefault("clickhouse.host", "localhost")
 	viper.SetDefault("clickhouse.port", 9000)
@@ -100,7 +180,10 @@ func Load() (*Config, error) {
 	viper.SetDefault("auth.enabled", false)
 	viper.SetDefault("ratelimit.enabled", true)
 	viper.SetDefault("ratelimit.requests_per_min", 1000)
-	viper.SetDefault("alert.enabled", false)
+	for key, value := range alertDefaults {
+		viper.SetDefault("alert."+key, value)
+		_ = viper.BindEnv("alert."+key, "OZX_ALERT_"+strings.ToUpper(key))
+	}
 
 	// Read environment variables
 	viper.AutomaticEnv()

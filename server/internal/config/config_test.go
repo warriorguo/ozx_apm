@@ -325,3 +325,38 @@ func TestLoad_PrivacyToken(t *testing.T) {
 		t.Errorf("token from env %q", cfg.AdminServer.PrivacyToken)
 	}
 }
+
+// APM-8: every alert.* key is read from OZX_ALERT_<KEY>, the test-alert
+// token from OZX_ADMIN_ALERT_TOKEN; alerting is off by default.
+func TestLoad_AlertEnvironment(t *testing.T) {
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := cfg.Alert
+	if a.Enabled || a.WebhookURL != "" || a.WebhookFormat != "generic" || a.Interval != time.Minute ||
+		a.NewIssueMaxPerCycle != 10 || a.NewIssueWindow != 26*time.Hour || a.CrashRateMinSessions != 50 ||
+		a.CrashRateMinRate != 0.005 || !a.StartupEnabled || a.StartupWindow != 7*24*time.Hour || a.IncludeDevBuilds ||
+		cfg.AdminServer.AlertToken != "" {
+		t.Fatalf("defaults %+v", a)
+	}
+	t.Setenv("OZX_ALERT_ENABLED", "true")
+	t.Setenv("OZX_ALERT_WEBHOOK_URL", "https://hooks.example.com/x")
+	t.Setenv("OZX_ALERT_WEBHOOK_FORMAT", "feishu")
+	t.Setenv("OZX_ALERT_ADMIN_BASE_URL", "https://apm-admin.example.com")
+	t.Setenv("OZX_ALERT_INTERVAL", "30s")
+	t.Setenv("OZX_ALERT_INCLUDE_DEV_BUILDS", "true")
+	t.Setenv("OZX_ALERT_CRASH_RATE_MIN_SESSIONS", "200")
+	t.Setenv("OZX_ALERT_CRASH_RATE_FACTOR", "3.5")
+	t.Setenv("OZX_ADMIN_ALERT_TOKEN", "tok")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	a = cfg.Alert
+	if !a.Enabled || a.WebhookURL != "https://hooks.example.com/x" || a.WebhookFormat != "feishu" ||
+		a.AdminBaseURL != "https://apm-admin.example.com" || a.Interval != 30*time.Second || !a.IncludeDevBuilds ||
+		a.CrashRateMinSessions != 200 || a.CrashRateFactor != 3.5 || cfg.AdminServer.AlertToken != "tok" {
+		t.Fatalf("from the environment %+v (token set: %v)", a, cfg.AdminServer.AlertToken != "")
+	}
+}
