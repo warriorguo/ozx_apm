@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"strconv"
@@ -10,18 +11,33 @@ import (
 
 	"github.com/warriorguo/ozx_apm/server/internal/models"
 	"github.com/warriorguo/ozx_apm/server/internal/storage"
+	"github.com/warriorguo/ozx_apm/server/internal/symbols"
 )
 
 type CrashHandler struct {
 	repo   *storage.Repository
 	logger *zap.Logger
+	// symbols names native frames from the uploaded symbols when a crash is
+	// read (APM-7), so symbols uploaded after a crash apply to it.
+	symbols *symbols.Symbolizer
 }
 
+// crashSymbolCacheSize: resolved addresses kept by the admin symbolizer.
+const crashSymbolCacheSize = 50000
+
+// crashSymbolTimeout bounds the symbol lookups of one request; on timeout
+// or error the frames are shown as sent (with a warning in the log).
+const crashSymbolTimeout = 5 * time.Second
+
 func NewCrashHandler(repo *storage.Repository, logger *zap.Logger) *CrashHandler {
-	return &CrashHandler{
+	h := &CrashHandler{
 		repo:   repo,
 		logger: logger,
 	}
+	if repo != nil {
+		h.symbols = symbols.NewSymbolizer(repo, crashSymbolCacheSize)
+	}
+	return h
 }
 
 func (h *CrashHandler) ListCrashes(w http.ResponseWriter, r *http.Request) {
@@ -69,6 +85,7 @@ func (h *CrashHandler) ListCrashes(w http.ResponseWriter, r *http.Request) {
 			crashes[i].IssueStatusInfo = st[crashes[i].Fingerprint]
 		}
 	}
+	h.addTopFrames(ctx, crashes)
 
 	resp := models.CrashListResponse{
 		Crashes:    crashes,
@@ -79,6 +96,24 @@ func (h *CrashHandler) ListCrashes(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
+}
+
+// addTopFrames symbolicates the top in-app frame of each group's latest crash.
+func (h *CrashHandler) addTopFrames(ctx context.Context, groups []models.CrashGroup) {
+	sctx, cancel := context.WithTimeout(ctx, crashSymbolTimeout)
+	defer cancel()
+	for i := range groups {
+		g := &groups[i]
+		if g.SampleStack == "" {
+			continue
+		}
+		threads, _, err := symbolicateStack(sctx, h.symbols, g.SampleStack, symbols.Fallback{AppVersion: g.SampleVersion, ABI: g.SampleABI})
+		if err != nil {
+			h.logger.Warn("crash list: symbol lookup failed; showing addresses", zap.Error(err))
+			threads, _, _ = symbolicateStack(sctx, nil, g.SampleStack, symbols.Fallback{})
+		}
+		g.TopFrame, g.Symbolicated = topFrame(threads, g.CrashType)
+	}
 }
 
 func (h *CrashHandler) GetCrashDetail(w http.ResponseWriter, r *http.Request) {
@@ -115,6 +150,18 @@ func (h *CrashHandler) GetCrashDetail(w http.ResponseWriter, r *http.Request) {
 	}
 	if st := issueStatuses(ctx, h.repo, models.IssueKindCrash, []string{fingerprint}, h.logger); st != nil {
 		detail.IssueStatusInfo = st[fingerprint]
+	}
+	detail.Symbols = []models.CrashSymbolStatus{}
+	if s := detail.Sample; s != nil {
+		sctx, cancel := context.WithTimeout(ctx, crashSymbolTimeout)
+		threads, status, err := symbolicateStack(sctx, h.symbols, s.Stack, symbols.Fallback{AppVersion: s.AppVersion, ABI: s.ABI})
+		cancel()
+		if err != nil {
+			h.logger.Warn("crash detail: symbol lookup failed; showing addresses", zap.Error(err), zap.String("fingerprint", fingerprint))
+			threads, status, _ = symbolicateStack(ctx, nil, s.Stack, symbols.Fallback{})
+		}
+		s.Threads = threads
+		detail.Symbols = status
 	}
 
 	w.Header().Set("Content-Type", "application/json")

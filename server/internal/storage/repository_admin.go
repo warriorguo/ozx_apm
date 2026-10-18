@@ -385,28 +385,40 @@ func (r *Repository) GetCrashGroups(ctx context.Context, f models.AdminFilter, p
 
 	// Get crash groups
 	offset := (page - 1) * pageSize
+	// The latest crash of each group gives the type, summary and the stack
+	// the handler symbolicates the top frame of (cut: the top frames are
+	// at the start).
 	query := fmt.Sprintf(`
 		SELECT
 			fingerprint,
-			any(crash_type) as crash_type,
+			argMax(crash_type, timestamp) as crash_type,
 			toInt64(count()) as cnt,
 			toInt64(uniqExact(session_id)) as session_count,
 			min(timestamp) as first_seen,
 			max(timestamp) as last_seen,
 			groupUniqArray(app_version) as versions,
-			topK(5)(device_model) as devices
+			topK(5)(device_model) as devices,
+			argMax(summary, timestamp),
+			argMax(exit_reason, timestamp),
+			argMax(signal, timestamp),
+			argMax(crash_site, timestamp),
+			toInt64(countIf(foreground = 1)),
+			argMax(substringUTF8(stack, 1, %d), timestamp),
+			argMax(app_version, timestamp),
+			argMax(abi, timestamp)
 		FROM apm_crashes
 		%s
 		GROUP BY fingerprint
 		ORDER BY cnt DESC, fingerprint
 		LIMIT %d OFFSET %d
-	`, whereClause, pageSize, offset)
+	`, maxCrashListStackChars, whereClause, pageSize, offset)
 
 	crashes := []models.CrashGroup{}
 	err := r.queryRows(ctx, query, args, func(rows driver.Rows) error {
 		var c models.CrashGroup
 		var versions, devices []string
-		if err := rows.Scan(&c.Fingerprint, &c.CrashType, &c.Count, &c.SessionCount, &c.FirstSeen, &c.LastSeen, &versions, &devices); err != nil {
+		if err := rows.Scan(&c.Fingerprint, &c.CrashType, &c.Count, &c.SessionCount, &c.FirstSeen, &c.LastSeen, &versions, &devices,
+			&c.SampleMessage, &c.ExitReason, &c.Signal, &c.CrashSite, &c.Foreground, &c.SampleStack, &c.SampleVersion, &c.SampleABI); err != nil {
 			return err
 		}
 		if versions == nil {
@@ -432,16 +444,17 @@ func (r *Repository) GetCrashDetail(ctx context.Context, fingerprint string, f m
 	whereClause += " AND fingerprint = ?"
 	detailArgs := append(args, fingerprint)
 
-	// Get basic info and sample stack
+	// Get basic info and sample stack (of the latest crash)
 	query := fmt.Sprintf(`
 		SELECT
 			fingerprint,
-			any(crash_type),
-			any(stack),
+			argMax(crash_type, timestamp),
+			argMax(stack, timestamp),
 			toInt64(count()),
 			toInt64(uniqExact(session_id)),
 			min(timestamp),
-			max(timestamp)
+			max(timestamp),
+			max(fingerprint_version)
 		FROM apm_crashes
 		%s
 		GROUP BY fingerprint
@@ -453,7 +466,7 @@ func (r *Repository) GetCrashDetail(ctx context.Context, fingerprint string, f m
 		DeviceDist:  []models.DeviceDist{},
 	}
 	row := r.client.conn.QueryRow(ctx, query, detailArgs...)
-	if err := row.Scan(&detail.Fingerprint, &detail.CrashType, &detail.Stack, &detail.Count, &detail.SessionCount, &detail.FirstSeen, &detail.LastSeen); err != nil {
+	if err := row.Scan(&detail.Fingerprint, &detail.CrashType, &detail.Stack, &detail.Count, &detail.SessionCount, &detail.FirstSeen, &detail.LastSeen, &detail.FingerprintVersion); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			// No crash with this fingerprint matches the filter: the handler
 			// answers 404 (easy to hit since the detail takes the shared
@@ -463,28 +476,42 @@ func (r *Repository) GetCrashDetail(ctx context.Context, fingerprint string, f m
 		return nil, err
 	}
 
-	// Get recent occurrences
+	// Get recent occurrences; the latest one, with its stack, is the sample.
 	occQuery := fmt.Sprintf(`
-		SELECT timestamp, app_version, platform, device_model, os_version, scene, breadcrumbs, build_type, ctx
+		SELECT %s, ''
 		FROM apm_crashes
 		%s
-		ORDER BY timestamp DESC
-		LIMIT 10
-	`, whereClause)
-
+		ORDER BY timestamp DESC, event_id
+		LIMIT 20
+	`, crashOccurrenceColumns, whereClause)
 	err := r.queryRows(ctx, occQuery, detailArgs, func(rows driver.Rows) error {
-		var occ models.CrashOccurrence
-		if err := rows.Scan(&occ.Timestamp, &occ.AppVersion, &occ.Platform, &occ.DeviceModel, &occ.OSVersion, &occ.Scene, &occ.Breadcrumbs, &occ.BuildType, &occ.Context); err != nil {
+		occ, err := scanCrashOccurrence(rows)
+		if err != nil {
 			return err
-		}
-		if occ.Context == nil {
-			occ.Context = map[string]string{}
 		}
 		detail.Occurrences = append(detail.Occurrences, occ)
 		return nil
 	})
 	if err != nil {
 		return nil, fmt.Errorf("occurrences: %w", err)
+	}
+	sampleQuery := fmt.Sprintf(`
+		SELECT %s, stack
+		FROM apm_crashes
+		%s
+		ORDER BY timestamp DESC, event_id
+		LIMIT 1
+	`, crashOccurrenceColumns, whereClause)
+	err = r.queryRows(ctx, sampleQuery, detailArgs, func(rows driver.Rows) error {
+		occ, err := scanCrashOccurrence(rows)
+		if err != nil {
+			return err
+		}
+		detail.Sample = &occ
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("sample: %w", err)
 	}
 
 	// Get version distribution
@@ -529,6 +556,34 @@ func (r *Repository) GetCrashDetail(ctx context.Context, fingerprint string, f m
 	}
 
 	return detail, nil
+}
+
+// maxCrashListStackChars: the part of the latest stack the crash list reads
+// for its top frame (the crashed thread comes first).
+const maxCrashListStackChars = 4000
+
+// crashOccurrenceColumns are the columns scanCrashOccurrence reads (then the stack).
+const crashOccurrenceColumns = `timestamp, app_version, platform, device_model, os_version, scene, breadcrumbs, build_type, ctx,
+	event_id, session_id, device_id, crash_type, summary, exit_reason, exit_status, exit_description, importance, pss_kb, rss_kb,
+	signal, signal_code, fault_addr, abort_message, abi, session_ms, foreground, details`
+
+func scanCrashOccurrence(rows driver.Rows) (models.CrashOccurrence, error) {
+	var o models.CrashOccurrence
+	var fg uint8
+	err := rows.Scan(&o.Timestamp, &o.AppVersion, &o.Platform, &o.DeviceModel, &o.OSVersion, &o.Scene, &o.Breadcrumbs, &o.BuildType, &o.Context,
+		&o.EventID, &o.SessionID, &o.DeviceID, &o.CrashType, &o.Summary, &o.ExitReason, &o.ExitStatus, &o.ExitDescription, &o.Importance,
+		&o.PssKB, &o.RssKB, &o.Signal, &o.SignalCode, &o.FaultAddr, &o.AbortMessage, &o.ABI, &o.SessionMs, &fg, &o.Details, &o.Stack)
+	o.Foreground = fg == 1
+	if o.Context == nil {
+		o.Context = map[string]string{}
+	}
+	if o.Details == nil {
+		o.Details = map[string]string{}
+	}
+	if o.Breadcrumbs == nil {
+		o.Breadcrumbs = []string{}
+	}
+	return o, err
 }
 
 // GetExceptionGroups returns grouped exception data, ordered by sort (one of

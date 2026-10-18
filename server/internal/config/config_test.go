@@ -326,6 +326,27 @@ func TestLoad_PrivacyToken(t *testing.T) {
 	}
 }
 
+// APM-7: the symbol upload token comes from OZX_SYMBOLS_UPLOAD_TOKEN; unset means disabled.
+func TestLoad_SymbolsToken(t *testing.T) {
+	os.Unsetenv("OZX_SYMBOLS_UPLOAD_TOKEN")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.AdminServer.SymbolsToken != "" {
+		t.Errorf("default token %q, want empty", cfg.AdminServer.SymbolsToken)
+	}
+	os.Setenv("OZX_SYMBOLS_UPLOAD_TOKEN", "sym-token")
+	defer os.Unsetenv("OZX_SYMBOLS_UPLOAD_TOKEN")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.AdminServer.SymbolsToken != "sym-token" || cfg.AdminServer.PrivacyToken == "sym-token" {
+		t.Errorf("token from env %q", cfg.AdminServer.SymbolsToken)
+	}
+}
+
 // APM-8: every alert.* key is read from OZX_ALERT_<KEY>, the test-alert
 // token from OZX_ADMIN_ALERT_TOKEN; alerting is off by default.
 func TestLoad_AlertEnvironment(t *testing.T) {

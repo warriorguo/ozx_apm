@@ -272,7 +272,9 @@ func (r *Repository) InsertCrashes(ctx context.Context, crashes []models.Crash) 
 		return nil
 	}
 
-	batch, err := r.newInsert(ctx, "INSERT INTO apm_crashes (timestamp, app_version, platform, device_model, os_version, session_id, device_id, scene, crash_type, fingerprint, stack, breadcrumbs, event_id, seq, build_type, gpu, ram_class, net_type, ctx)")
+	batch, err := r.newInsert(ctx, "INSERT INTO apm_crashes (timestamp, app_version, platform, device_model, os_version, session_id, device_id, scene, crash_type, fingerprint, stack, breadcrumbs, event_id, seq, build_type, gpu, ram_class, net_type, ctx, "+
+		"client_fingerprint, fingerprint_version, summary, crash_site, exit_reason, exit_status, exit_description, importance, pss_kb, rss_kb, "+
+		"signal, signal_code, fault_addr, abort_message, abi, session_ms, foreground, details)")
 	if err != nil {
 		return fmt.Errorf("prepare batch: %w", err)
 	}
@@ -290,7 +292,7 @@ func (r *Repository) InsertCrashes(ctx context.Context, crashes []models.Crash) 
 			c.CrashType,
 			c.Fingerprint,
 			c.Stack,
-			c.Breadcrumbs,
+			stringsColumn(c.Breadcrumbs),
 			c.EventID,
 			c.Seq,
 			c.BuildType,
@@ -298,6 +300,25 @@ func (r *Repository) InsertCrashes(ctx context.Context, crashes []models.Crash) 
 			c.RAMClass,
 			c.NetType,
 			contextColumn(c.Context),
+			// APM-7; bounded by processor.NormalizeCrash.
+			c.ClientFingerprint,
+			c.FingerprintVersion,
+			c.Summary,
+			c.CrashSite,
+			c.ExitReason,
+			int32(c.ExitStatus),
+			c.ExitDescription,
+			uint16(c.Importance),
+			uint64(c.PssKB),
+			uint64(c.RssKB),
+			c.Signal,
+			c.SignalCode,
+			c.FaultAddr,
+			c.AbortMessage,
+			c.ABI,
+			uint64(c.SessionMs),
+			boolColumn(bool(c.Foreground)),
+			contextColumn(c.Details),
 		)
 		if err != nil {
 			return fmt.Errorf("append to batch: %w", err)

@@ -175,6 +175,24 @@ CREATE TABLE IF NOT EXISTS apm_crashes (
     ram_class LowCardinality(String) DEFAULT '',
     net_type LowCardinality(String) DEFAULT '',
     ctx Map(LowCardinality(String), String),
+    client_fingerprint String DEFAULT '',
+    fingerprint_version UInt8 DEFAULT 0,
+    summary String DEFAULT '',
+    crash_site String DEFAULT '',
+    exit_reason LowCardinality(String) DEFAULT '',
+    exit_status Int32 DEFAULT 0,
+    exit_description String DEFAULT '',
+    importance UInt16 DEFAULT 0,
+    pss_kb UInt64 DEFAULT 0,
+    rss_kb UInt64 DEFAULT 0,
+    signal LowCardinality(String) DEFAULT '',
+    signal_code LowCardinality(String) DEFAULT '',
+    fault_addr String DEFAULT '',
+    abort_message String DEFAULT '',
+    abi LowCardinality(String) DEFAULT '',
+    session_ms UInt64 DEFAULT 0,
+    foreground UInt8 DEFAULT 0,
+    details Map(LowCardinality(String), String),
     INDEX idx_event_id event_id TYPE bloom_filter(0.001) GRANULARITY 1,
     INDEX idx_session_id session_id TYPE bloom_filter(0.01) GRANULARITY 1
 ) ENGINE = ReplacingMergeTree()
@@ -247,7 +265,8 @@ TTL toDateTime(timestamp) + INTERVAL 30 DAY;
 -- Additive column migrations for tables created by earlier releases
 -- (APM-2: event_id, seq; APM-5: build_type, gpu, ram_class, net_type, ctx;
 -- APM-4: the exception columns from client_fingerprint to breadcrumbs;
--- APM-3: error_seq, session_ms, unhandled, ctx_merged). The APM-6 tables
+-- APM-3: error_seq, session_ms, unhandled, ctx_merged; APM-7: the crash
+-- columns from client_fingerprint to details). The APM-6 tables
 -- (apm_custom_events, apm_custom_metrics) have had all their columns from
 -- the start.
 -- Metadata only (existing parts are not rewritten), idempotent.
@@ -307,6 +326,24 @@ ALTER TABLE apm_crashes ADD COLUMN IF NOT EXISTS gpu LowCardinality(String) DEFA
 ALTER TABLE apm_crashes ADD COLUMN IF NOT EXISTS ram_class LowCardinality(String) DEFAULT '';
 ALTER TABLE apm_crashes ADD COLUMN IF NOT EXISTS net_type LowCardinality(String) DEFAULT '';
 ALTER TABLE apm_crashes ADD COLUMN IF NOT EXISTS ctx Map(LowCardinality(String), String);
+ALTER TABLE apm_crashes ADD COLUMN IF NOT EXISTS client_fingerprint String DEFAULT '';
+ALTER TABLE apm_crashes ADD COLUMN IF NOT EXISTS fingerprint_version UInt8 DEFAULT 0;
+ALTER TABLE apm_crashes ADD COLUMN IF NOT EXISTS summary String DEFAULT '';
+ALTER TABLE apm_crashes ADD COLUMN IF NOT EXISTS crash_site String DEFAULT '';
+ALTER TABLE apm_crashes ADD COLUMN IF NOT EXISTS exit_reason LowCardinality(String) DEFAULT '';
+ALTER TABLE apm_crashes ADD COLUMN IF NOT EXISTS exit_status Int32 DEFAULT 0;
+ALTER TABLE apm_crashes ADD COLUMN IF NOT EXISTS exit_description String DEFAULT '';
+ALTER TABLE apm_crashes ADD COLUMN IF NOT EXISTS importance UInt16 DEFAULT 0;
+ALTER TABLE apm_crashes ADD COLUMN IF NOT EXISTS pss_kb UInt64 DEFAULT 0;
+ALTER TABLE apm_crashes ADD COLUMN IF NOT EXISTS rss_kb UInt64 DEFAULT 0;
+ALTER TABLE apm_crashes ADD COLUMN IF NOT EXISTS signal LowCardinality(String) DEFAULT '';
+ALTER TABLE apm_crashes ADD COLUMN IF NOT EXISTS signal_code LowCardinality(String) DEFAULT '';
+ALTER TABLE apm_crashes ADD COLUMN IF NOT EXISTS fault_addr String DEFAULT '';
+ALTER TABLE apm_crashes ADD COLUMN IF NOT EXISTS abort_message String DEFAULT '';
+ALTER TABLE apm_crashes ADD COLUMN IF NOT EXISTS abi LowCardinality(String) DEFAULT '';
+ALTER TABLE apm_crashes ADD COLUMN IF NOT EXISTS session_ms UInt64 DEFAULT 0;
+ALTER TABLE apm_crashes ADD COLUMN IF NOT EXISTS foreground UInt8 DEFAULT 0;
+ALTER TABLE apm_crashes ADD COLUMN IF NOT EXISTS details Map(LowCardinality(String), String);
 ALTER TABLE apm_custom_events ADD COLUMN IF NOT EXISTS event_id String DEFAULT '';
 ALTER TABLE apm_custom_events ADD COLUMN IF NOT EXISTS seq UInt64 DEFAULT 0;
 ALTER TABLE apm_custom_events ADD COLUMN IF NOT EXISTS build_type LowCardinality(String) DEFAULT '';
@@ -497,3 +534,50 @@ CREATE TABLE IF NOT EXISTS apm_alerts (
     inserted_at DateTime64(3) DEFAULT now64(3)
 ) ENGINE = MergeTree()
 ORDER BY (alert_key, at);
+
+-- APM-7: uploaded symbols (cmd/apmsym) used to symbolicate native crash
+-- stacks. See internal/storage/schema.go (symbolTables).
+
+CREATE TABLE IF NOT EXISTS apm_symbol_files (
+    build_id String,
+    upload_id String,
+    module String,
+    arch LowCardinality(String),
+    app_version String,
+    app_build String,
+    functions UInt64,
+    lines UInt64,
+    line_map UInt8,
+    method_map UInt8,
+    source String,
+    tool String,
+    uploaded_at DateTime64(3)
+) ENGINE = ReplacingMergeTree()
+PARTITION BY toYYYYMM(uploaded_at)
+ORDER BY (build_id, upload_id)
+TTL toDateTime(uploaded_at) + INTERVAL 400 DAY;
+
+CREATE TABLE IF NOT EXISTS apm_symbol_funcs (
+    build_id String,
+    upload_id String,
+    addr UInt64,
+    size UInt64,
+    name String,
+    raw_name String,
+    uploaded_at DateTime64(3)
+) ENGINE = ReplacingMergeTree()
+PARTITION BY toYYYYMM(uploaded_at)
+ORDER BY (build_id, upload_id, addr)
+TTL toDateTime(uploaded_at) + INTERVAL 400 DAY;
+
+CREATE TABLE IF NOT EXISTS apm_symbol_lines (
+    build_id String,
+    upload_id String,
+    addr UInt64,
+    file LowCardinality(String),
+    line UInt32,
+    uploaded_at DateTime64(3)
+) ENGINE = ReplacingMergeTree()
+PARTITION BY toYYYYMM(uploaded_at)
+ORDER BY (build_id, upload_id, addr)
+TTL toDateTime(uploaded_at) + INTERVAL 400 DAY;

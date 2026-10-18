@@ -110,7 +110,7 @@ var sessionSources = []sessionSource{
 			it.Context = ctxMap(ctx)
 			return nil
 		}},
-	{TableCrashes.Name, models.TimelineCrash, fmt.Sprintf("scene, fingerprint, crash_type, substringUTF8(stack, 1, %d), ctx, breadcrumbs", maxCrashStackChars), SessionRowsPerType,
+	{TableCrashes.Name, models.TimelineCrash, fmt.Sprintf("scene, fingerprint, crash_type, if(summary != '', summary, substringUTF8(stack, 1, %d)), ctx, breadcrumbs", maxCrashStackChars), SessionRowsPerType,
 		func(rows driver.Rows, it *models.TimelineItem, crumbs *[]string) error {
 			var ctx map[string]string
 			if err := rows.Scan(&it.Time, &it.EventID, &it.Seq, &it.Scene, &it.Fingerprint, &it.CrashType, &it.Message, &ctx, crumbs); err != nil {

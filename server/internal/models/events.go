@@ -262,7 +262,10 @@ type ExceptionDetails struct {
 	CallSite           string   `json:"-"`
 }
 
-// Crash represents a fatal crash event
+// Crash represents a fatal crash event. Since APM-7 the SDK reports the
+// crash of the previous process on the next launch: the event carries that
+// session's id, version, scene, context and breadcrumbs, and the timestamp of
+// the crash.
 type Crash struct {
 	Timestamp   time.Time `json:"-" ch:"timestamp"`
 	EventID     string    `json:"event_id" ch:"event_id"`
@@ -279,4 +282,43 @@ type Crash struct {
 	Stack       string    `json:"stack" ch:"stack"`
 	Breadcrumbs []string  `json:"breadcrumbs" ch:"breadcrumbs"`
 	EventContext
+	CrashDetails
+}
+
+// CrashDetails is what APM-7 added to crashes; zero/empty from older SDKs.
+// processor.NormalizeCrash bounds it before storage; numbers and flags are
+// decoded leniently (a wrong JSON type never rejects the event).
+//
+// From the SDK: Android's ApplicationExitInfo of the process (reason name
+// such as "CRASH_NATIVE", "ANR", "LOW_MEMORY"; exit status or signal number;
+// description; importance; PSS/RSS in KB at death), the native crash's
+// signal, code, fault address and abort message (from the tombstone), the
+// device ABI, the milliseconds the session had run, whether the game was in
+// the foreground, and further details ("details": string key/value pairs,
+// validated like the game context).
+//
+// Computed by the server (processor.ApplyCrashFingerprint), never read from
+// the request: Fingerprint is replaced by the server's, what the SDK sent is
+// kept as ClientFingerprint; Summary and CrashSite.
+type CrashDetails struct {
+	ExitReason      string          `json:"exit_reason"`
+	ExitStatus      LenientInt      `json:"exit_status"`
+	ExitDescription string          `json:"exit_description"`
+	Importance      LenientInt      `json:"importance"`
+	PssKB           LenientInt      `json:"pss_kb"`
+	RssKB           LenientInt      `json:"rss_kb"`
+	Signal          string          `json:"signal"`
+	SignalCode      string          `json:"signal_code"`
+	FaultAddr       string          `json:"fault_addr"`
+	AbortMessage    string          `json:"abort_message"`
+	ABI             string          `json:"abi"`
+	SessionMs       LenientInt      `json:"session_ms"`
+	Foreground      LenientBool     `json:"foreground"`
+	RawDetails      json.RawMessage `json:"details"`
+
+	Details            map[string]string `json:"-"`
+	ClientFingerprint  string            `json:"-"`
+	FingerprintVersion uint8             `json:"-"`
+	Summary            string            `json:"-"`
+	CrashSite          string            `json:"-"`
 }

@@ -68,8 +68,10 @@ type DistributionResponse struct {
 // Crash types
 
 type CrashGroup struct {
-	Fingerprint      string    `json:"fingerprint"`
-	CrashType        string    `json:"crash_type"`
+	Fingerprint string `json:"fingerprint"`
+	CrashType   string `json:"crash_type"`
+	// SampleMessage is the summary of the group's latest crash (APM-7), with
+	// the top in-app frame symbolicated now when it was stored by address.
 	SampleMessage    string    `json:"sample_message"`
 	Count            int64     `json:"count"`
 	SessionCount     int64     `json:"session_count"`
@@ -79,6 +81,18 @@ type CrashGroup struct {
 	TopDevices       []string  `json:"top_devices"`
 	// APM-8: the issue's state (status, resolved_in_version, ...).
 	IssueStatusInfo
+	// APM-7 (empty for rows of older SDKs).
+	ExitReason   string `json:"exit_reason"`
+	Signal       string `json:"signal"`
+	CrashSite    string `json:"crash_site"`
+	TopFrame     string `json:"top_frame"`    // "Method (File.cs:12)" of the latest crash's first in-app frame
+	Foreground   int64  `json:"foreground"`   // crashes in the foreground
+	Symbolicated bool   `json:"symbolicated"` // the top frame was named from uploaded symbols
+
+	// The latest crash's stack, version and ABI, for the top frame.
+	SampleStack   string `json:"-"`
+	SampleVersion string `json:"-"`
+	SampleABI     string `json:"-"`
 }
 
 type CrashListResponse struct {
@@ -102,6 +116,11 @@ type CrashDetail struct {
 	OSDist       []OSDist          `json:"os_distribution"`
 	// APM-8: the issue's state.
 	IssueStatusInfo
+	// APM-7: the latest crash with its stack symbolicated now (nil when the
+	// group has none in the filter), and the symbols of its libraries.
+	Sample             *CrashOccurrence    `json:"sample"`
+	FingerprintVersion uint8               `json:"fingerprint_version"`
+	Symbols            []CrashSymbolStatus `json:"symbols"`
 }
 
 type CrashOccurrence struct {
@@ -115,6 +134,69 @@ type CrashOccurrence struct {
 	// APM-5: build type and the game context when the crash happened.
 	BuildType string            `json:"build_type"`
 	Context   map[string]string `json:"context"`
+	// APM-7: the session and device (links to the session time line), what
+	// Android said about the exit, the signal, and the details.
+	EventID         string            `json:"event_id"`
+	SessionID       string            `json:"session_id"`
+	DeviceID        string            `json:"device_id"`
+	CrashType       string            `json:"crash_type"`
+	Summary         string            `json:"summary"`
+	ExitReason      string            `json:"exit_reason"`
+	ExitStatus      int32             `json:"exit_status"`
+	ExitDescription string            `json:"exit_description"`
+	Importance      uint16            `json:"importance"`
+	PssKB           uint64            `json:"pss_kb"`
+	RssKB           uint64            `json:"rss_kb"`
+	Signal          string            `json:"signal"`
+	SignalCode      string            `json:"signal_code"`
+	FaultAddr       string            `json:"fault_addr"`
+	AbortMessage    string            `json:"abort_message"`
+	ABI             string            `json:"abi"`
+	SessionMs       uint64            `json:"session_ms"`
+	Foreground      bool              `json:"foreground"`
+	Details         map[string]string `json:"details"`
+	// Sample only: the raw stack and its threads, symbolicated.
+	Stack   string            `json:"stack,omitempty"`
+	Threads []CrashThreadView `json:"threads,omitempty"`
+}
+
+// CrashThreadView is one thread of a crash stack as the admin shows it.
+type CrashThreadView struct {
+	Name    string           `json:"name"`
+	Tid     int              `json:"tid"`
+	Crashed bool             `json:"crashed"`
+	Frames  []CrashFrameView `json:"frames"`
+	Omitted int              `json:"omitted"`
+}
+
+// CrashFrameView is one frame: Function is the C# method (or C++ function)
+// from the uploaded symbols when Symbolicated, else what the device reported
+// (a system library's symbol, a Java method), else empty (an address only).
+type CrashFrameView struct {
+	Index        int    `json:"index"`
+	Native       bool   `json:"native"`
+	PC           string `json:"pc,omitempty"` // "0x5417bc"
+	Module       string `json:"module,omitempty"`
+	BuildID      string `json:"build_id,omitempty"`
+	Function     string `json:"function,omitempty"`
+	Offset       uint64 `json:"offset,omitempty"`
+	File         string `json:"file,omitempty"`
+	Line         int    `json:"line,omitempty"`
+	InApp        bool   `json:"in_app"`
+	Symbolicated bool   `json:"symbolicated"`
+	SymbolsBy    string `json:"symbols_by,omitempty"` // "build_id" or "app_version"
+	Raw          string `json:"raw"`
+}
+
+// CrashSymbolStatus says whether symbols are uploaded for a library of the sample.
+type CrashSymbolStatus struct {
+	Module     string    `json:"module"`
+	BuildID    string    `json:"build_id"`
+	Found      bool      `json:"found"`
+	UploadID   string    `json:"upload_id,omitempty"`
+	UploadedAt time.Time `json:"uploaded_at,omitempty"`
+	LineMap    bool      `json:"line_map"`
+	MethodMap  bool      `json:"method_map"`
 }
 
 type VersionDist struct {

@@ -43,6 +43,10 @@ type AdminServerConfig struct {
 	// Bearer <token>"; disabled while empty. Environment:
 	// OZX_ADMIN_ALERT_TOKEN. Never logged.
 	AlertToken string `mapstructure:"alert_token"`
+	// SymbolsToken enables the symbol upload endpoints (APM-7, cmd/apmsym):
+	// they require "Authorization: Bearer <token>" and are disabled while it
+	// is empty. Environment: OZX_SYMBOLS_UPLOAD_TOKEN. Never logged.
+	SymbolsToken string `mapstructure:"symbols_token"`
 }
 
 type ClickHouseConfig struct {
@@ -172,6 +176,8 @@ func Load() (*Config, error) {
 	_ = viper.BindEnv("admin_server.privacy_token", "OZX_ADMIN_PRIVACY_TOKEN")
 	viper.SetDefault("admin_server.alert_token", "")
 	_ = viper.BindEnv("admin_server.alert_token", "OZX_ADMIN_ALERT_TOKEN")
+	viper.SetDefault("admin_server.symbols_token", "")
+	_ = viper.BindEnv("admin_server.symbols_token", "OZX_SYMBOLS_UPLOAD_TOKEN")
 
 	viper.SetDefault("clickhouse.host", "localhost")
 	viper.SetDefault("clickhouse.port", 9000)

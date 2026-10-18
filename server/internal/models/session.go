@@ -64,7 +64,7 @@ type TimelineItem struct {
 
 	// exception, crash
 	Fingerprint   string `json:"fingerprint,omitempty"`
-	Message       string `json:"message,omitempty"` // exception: the log message; crash: the first line of the stack
+	Message       string `json:"message,omitempty"` // exception: the log message; crash: its summary (APM-7), else the start of the stack
 	ExceptionType string `json:"exception_type,omitempty"`
 	LogType       string `json:"log_type,omitempty"`
 	ThrowSite     string `json:"throw_site,omitempty"`

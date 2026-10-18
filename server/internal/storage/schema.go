@@ -13,10 +13,11 @@ import (
 // when the two differ), so a database set up either way ends up the same:
 // the event tables with TTL, the event_id skip index and the apm_*_daily
 // materialized views (APM-17), and the privacy deletion audit table (APM-14,
-// privacy.go), and the issue state and alert outbox tables (APM-8,
-// repository_alerts.go). APM-6 added two event tables (apm_custom_events,
-// apm_custom_metrics) and their daily views; new tables are created by
-// CREATE TABLE IF NOT EXISTS, which the service account may run.
+// privacy.go), the issue state and alert outbox tables (APM-8,
+// repository_alerts.go), and the symbol tables (APM-7). APM-6 added two
+// event tables (apm_custom_events, apm_custom_metrics) and their daily
+// views, APM-7 the crash columns; new tables are created by CREATE TABLE IF
+// NOT EXISTS, which the service account may run.
 //
 // The event tables are ReplacingMergeTree with event_id appended to the sort
 // key (APM-19 phase B): a re-sent event has the same timestamp, app_version
@@ -69,6 +70,39 @@ type eventTableSchema struct {
 // order they were added; CREATE TABLE puts them last, as the ALTERs do.
 var addedColumns = map[string][]string{
 	TableExceptions.Name: append(append([]string{}, exceptionColumnsAPM4...), exceptionColumnsAPM3...),
+	TableCrashes.Name:    crashColumnsAPM7,
+}
+
+// crashColumnsAPM7 describe a crash of the previous process that the SDK
+// reports on the next launch (models.CrashDetails): fingerprint is computed
+// by the server (fingerprint.CrashFingerprint, version fingerprint_version;
+// 0 on older rows, whose fingerprint is the SDK's) and client_fingerprint is
+// what the SDK sent; summary is a one-line description and crash_site the
+// first frame key used by the fingerprint; then what Android said about the
+// exit (ApplicationExitInfo: reason, status, description, importance, memory
+// at death), the signal of a native crash, the abort message, the ABI, how
+// long the session had run, whether the game was in the foreground, and
+// details: further key/value pairs (last performance figures, process
+// uptime, how the crash was detected).
+var crashColumnsAPM7 = []string{
+	"client_fingerprint String DEFAULT ''",
+	"fingerprint_version UInt8 DEFAULT 0",
+	"summary String DEFAULT ''",
+	"crash_site String DEFAULT ''",
+	"exit_reason LowCardinality(String) DEFAULT ''",
+	"exit_status Int32 DEFAULT 0",
+	"exit_description String DEFAULT ''",
+	"importance UInt16 DEFAULT 0",
+	"pss_kb UInt64 DEFAULT 0",
+	"rss_kb UInt64 DEFAULT 0",
+	"signal LowCardinality(String) DEFAULT ''",
+	"signal_code LowCardinality(String) DEFAULT ''",
+	"fault_addr String DEFAULT ''",
+	"abort_message String DEFAULT ''",
+	"abi LowCardinality(String) DEFAULT ''",
+	"session_ms UInt64 DEFAULT 0",
+	"foreground UInt8 DEFAULT 0",
+	"details Map(LowCardinality(String), String)",
 }
 
 // exceptionColumnsAPM3 describe the occurrence(s) an exception row reports
@@ -547,7 +581,87 @@ func (c *ClickHouseClient) Migrate(ctx context.Context) error {
 	c.checkEventTTL(tables)
 	c.migratePrivacyAudit(ctx)
 	c.migrateAlertTables(ctx)
+	c.migrateSymbolTables(ctx)
 	return nil
+}
+
+// SymbolRetention is how long uploaded symbols are kept (TTL on the upload
+// time): a build can crash for as long as players run it, which is longer
+// than the 30 days crash rows are kept. Uploading a build's symbols again
+// starts a new period.
+const SymbolRetention = "toDateTime(uploaded_at) + INTERVAL 400 DAY"
+
+// symbolTables are the tables of uploaded symbols (APM-7, internal/symbols):
+// one row per committed upload in apm_symbol_files, and the functions and
+// line ranges of each upload. Build artifacts, no player data: no device_id
+// (privacy deletion does not look at them). Rows of the same upload and
+// address are one row (ReplacingMergeTree), so a part the tool sends again
+// after a timeout does not count twice; the sort keys make a lookup of one
+// address read a granule or two.
+var symbolTables = []struct{ Name, DDL string }{
+	{"apm_symbol_files", `CREATE TABLE IF NOT EXISTS apm_symbol_files (
+    build_id String,
+    upload_id String,
+    module String,
+    arch LowCardinality(String),
+    app_version String,
+    app_build String,
+    functions UInt64,
+    lines UInt64,
+    line_map UInt8,
+    method_map UInt8,
+    source String,
+    tool String,
+    uploaded_at DateTime64(3)
+) ENGINE = ReplacingMergeTree()
+PARTITION BY toYYYYMM(uploaded_at)
+ORDER BY (build_id, upload_id)
+TTL ` + SymbolRetention},
+	{"apm_symbol_funcs", `CREATE TABLE IF NOT EXISTS apm_symbol_funcs (
+    build_id String,
+    upload_id String,
+    addr UInt64,
+    size UInt64,
+    name String,
+    raw_name String,
+    uploaded_at DateTime64(3)
+) ENGINE = ReplacingMergeTree()
+PARTITION BY toYYYYMM(uploaded_at)
+ORDER BY (build_id, upload_id, addr)
+TTL ` + SymbolRetention},
+	{"apm_symbol_lines", `CREATE TABLE IF NOT EXISTS apm_symbol_lines (
+    build_id String,
+    upload_id String,
+    addr UInt64,
+    file LowCardinality(String),
+    line UInt32,
+    uploaded_at DateTime64(3)
+) ENGINE = ReplacingMergeTree()
+PARTITION BY toYYYYMM(uploaded_at)
+ORDER BY (build_id, upload_id, addr)
+TTL ` + SymbolRetention},
+}
+
+// SymbolTableNames lists the symbol tables Migrate creates.
+func SymbolTableNames() []string {
+	names := make([]string, len(symbolTables))
+	for i, t := range symbolTables {
+		names[i] = t.Name
+	}
+	return names
+}
+
+// migrateSymbolTables creates the symbol tables (CREATE TABLE, which the
+// service account may run). A failure is logged and startup continues:
+// only symbol uploads and symbolication depend on them (crashes are then
+// shown with addresses).
+func (c *ClickHouseClient) migrateSymbolTables(ctx context.Context) {
+	for _, t := range symbolTables {
+		if err := c.conn.Exec(ctx, t.DDL); err != nil {
+			c.logger.Warn("could not create a symbol table; symbol uploads fail and crashes show addresses until it exists (RELEASE.md, APM-7)",
+				zap.String("table", t.Name), zap.Error(err))
+		}
+	}
 }
 
 // SchemaSQL renders the schema as a ClickHouse script. scripts/migrate.sql
@@ -577,7 +691,8 @@ func SchemaSQL() string {
 -- Additive column migrations for tables created by earlier releases
 -- (APM-2: event_id, seq; APM-5: build_type, gpu, ram_class, net_type, ctx;
 -- APM-4: the exception columns from client_fingerprint to breadcrumbs;
--- APM-3: error_seq, session_ms, unhandled, ctx_merged). The APM-6 tables
+-- APM-3: error_seq, session_ms, unhandled, ctx_merged; APM-7: the crash
+-- columns from client_fingerprint to details). The APM-6 tables
 -- (apm_custom_events, apm_custom_metrics) have had all their columns from
 -- the start.
 -- Metadata only (existing parts are not rewritten), idempotent.
@@ -630,5 +745,12 @@ func SchemaSQL() string {
 `)
 	sb.WriteString("\n" + issueStatesTableDDL + ";\n")
 	sb.WriteString("\n" + alertsTableDDL + ";\n")
+	sb.WriteString(`
+-- APM-7: uploaded symbols (cmd/apmsym) used to symbolicate native crash
+-- stacks. See internal/storage/schema.go (symbolTables).
+`)
+	for _, t := range symbolTables {
+		sb.WriteString("\n" + t.DDL + ";\n")
+	}
 	return sb.String()
 }

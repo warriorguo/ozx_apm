@@ -11,9 +11,11 @@ import (
 
 	"go.uber.org/zap"
 
+	"github.com/warriorguo/ozx_apm/server/internal/fingerprint"
 	"github.com/warriorguo/ozx_apm/server/internal/models"
 	"github.com/warriorguo/ozx_apm/server/internal/processor"
 	"github.com/warriorguo/ozx_apm/server/internal/storage"
+	"github.com/warriorguo/ozx_apm/server/internal/symbols"
 )
 
 const (
@@ -60,6 +62,9 @@ type IngestHandler struct {
 	validator *processor.Validator
 	enricher  *processor.Enricher
 	logger    *zap.Logger
+	// symbols names the native frames of crashes from uploaded symbols for
+	// the fingerprint (APM-7); nil when the store has no symbol tables.
+	symbols *symbols.Symbolizer
 }
 
 func NewIngestHandler(repo *storage.Repository, logger *zap.Logger) *IngestHandler {
@@ -67,11 +72,73 @@ func NewIngestHandler(repo *storage.Repository, logger *zap.Logger) *IngestHandl
 }
 
 func newIngestHandler(repo EventStore, logger *zap.Logger) *IngestHandler {
-	return &IngestHandler{
+	h := &IngestHandler{
 		repo:      repo,
 		validator: processor.NewValidator(),
 		enricher:  processor.NewEnricher(),
 		logger:    logger,
+	}
+	if st, ok := repo.(symbols.Store); ok {
+		h.symbols = symbols.NewSymbolizer(st, crashSymbolCacheSize)
+	}
+	return h
+}
+
+// crashSymbolCacheSize: resolved addresses kept by the ingest symbolizer.
+const crashSymbolCacheSize = 20000
+
+// crashSymbolTimeout bounds the symbol lookups of one batch's crashes: on
+// timeout or error the crash is fingerprinted by address (it groups per
+// build) and stored anyway.
+const crashSymbolTimeout = 3 * time.Second
+
+// maxResolvedFramesPerThread: native in-app frames per thread looked up at
+// ingest (the fingerprint uses the first 3 distinct ones).
+const maxResolvedFramesPerThread = 16
+
+// crashResolver looks up the in-app native frames of a crash in the
+// uploaded symbols and returns the resolver for its fingerprint.
+func (h *IngestHandler) crashResolver(ctx context.Context, c *models.Crash, threads []fingerprint.CrashThread) processor.CrashResolver {
+	if h.symbols == nil {
+		return nil
+	}
+	type key struct {
+		module, buildID string
+		pc              uint64
+		ret             bool
+	}
+	var frames []symbols.Frame
+	var keys []key
+	for _, t := range threads {
+		n := 0
+		for _, f := range t.Frames {
+			if !f.Native || !f.InApp || n == maxResolvedFramesPerThread {
+				continue
+			}
+			n++
+			k := key{f.ModuleName(), f.BuildID, f.PC, f.Index > 0}
+			keys = append(keys, k)
+			frames = append(frames, symbols.Frame{Module: k.module, BuildID: k.buildID, PC: k.pc, ReturnAddress: k.ret})
+		}
+	}
+	if len(frames) == 0 {
+		return nil
+	}
+	lctx, cancel := context.WithTimeout(ctx, crashSymbolTimeout)
+	defer cancel()
+	got, err := h.symbols.Resolve(lctx, frames, symbols.Fallback{AppVersion: c.AppVersion, ABI: c.ABI})
+	if err != nil {
+		h.logger.Warn("crash symbol lookup failed; fingerprinting by address", zap.Error(err))
+	}
+	names := map[key]string{}
+	for i, r := range got {
+		names[keys[i]] = r.Name
+	}
+	if len(names) == 0 {
+		return nil
+	}
+	return func(f fingerprint.CrashFrame) string {
+		return names[key{f.ModuleName(), f.BuildID, f.PC, f.Index > 0}]
 	}
 }
 
@@ -172,6 +239,7 @@ func (h *IngestHandler) IngestEvents(w http.ResponseWriter, r *http.Request) {
 		hasEventIDs bool
 		ctxStats    processor.ContextStats
 		propStats   processor.ContextStats
+		detailStats processor.ContextStats
 		rejTypes    map[string]int
 		moreErrors  int
 		addError    = func(msg string) {
@@ -312,6 +380,12 @@ func (h *IngestHandler) IngestEvents(w http.ResponseWriter, r *http.Request) {
 				reject(i, err.Error())
 				continue
 			}
+			// APM-7: bounds, then the server's fingerprint (with the
+			// uploaded symbols, when there are any), before the duplicate
+			// lookup, which matches on the stored fingerprint.
+			detailStats.Add(processor.NormalizeCrash(&event))
+			threads := fingerprint.ParseCrashStack(event.Stack)
+			processor.ApplyCrashFingerprint(&event, threads, h.crashResolver(r.Context(), &event, threads))
 			crashes = append(crashes, event)
 
 		case models.EventTypeCustomEvent:
@@ -348,7 +422,7 @@ func (h *IngestHandler) IngestEvents(w http.ResponseWriter, r *http.Request) {
 			metricRows = append(metricRows, event)
 
 		case models.EventTypeAssetLoad, models.EventTypeHTTP:
-			// Planned (asset loads: APM-7, HTTP timings: APM-8), not stored yet:
+			// Planned (asset loads, HTTP timings: APM-8), not stored yet:
 			// rejected with a reason, never silently dropped.
 			rejectType(i, wrapper.Type, "type "+strconv.Quote(wrapper.Type)+" is not supported yet")
 
@@ -366,6 +440,10 @@ func (h *IngestHandler) IngestEvents(w http.ResponseWriter, r *http.Request) {
 		// The events are kept; only the offending context entries are not.
 		addError("context: " + strconv.Itoa(ctxStats.Dropped) + " entries dropped, " +
 			strconv.Itoa(ctxStats.Truncated) + " values truncated (limits: 64 keys of [A-Za-z0-9_.-]{1,64}, values up to 256 characters)")
+	}
+	if detailStats.Dropped > 0 || detailStats.Truncated > 0 {
+		addError("crash details: " + strconv.Itoa(detailStats.Dropped) + " entries dropped, " +
+			strconv.Itoa(detailStats.Truncated) + " values truncated (the context's limits)")
 	}
 	if propStats.Dropped > 0 || propStats.Truncated > 0 {
 		addError("props: " + strconv.Itoa(propStats.Dropped) + " entries dropped, " +

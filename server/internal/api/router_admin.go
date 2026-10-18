@@ -99,6 +99,20 @@ func NewAdminRouter(cfg *config.Config, repo *storage.Repository, logger *zap.Lo
 		}
 		r.Get("/alerts", alertHandler.List)
 		r.Post("/alerts/test", alertHandler.Test)
+
+		// Symbol upload (APM-7, cmd/apmsym): the POSTs need the bearer
+		// token OZX_SYMBOLS_UPLOAD_TOKEN and are disabled (403) without one.
+		var symbolStore admin.SymbolStore
+		if repo != nil {
+			symbolStore = repo
+		}
+		symbolHandler := admin.NewSymbolHandler(symbolStore, logger, cfg.AdminServer.SymbolsToken)
+		if !symbolHandler.Enabled() {
+			logger.Info("symbol upload disabled: no token configured")
+		}
+		r.Post("/symbols/part", symbolHandler.Part)
+		r.Post("/symbols/commit", symbolHandler.Commit)
+		r.Get("/symbols", symbolHandler.List)
 	})
 
 	// Serve static files for admin UI (if exists)

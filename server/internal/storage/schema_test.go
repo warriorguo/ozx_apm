@@ -116,8 +116,66 @@ func TestSchemaStatements_ExceptionColumnsAPM4AndAPM3(t *testing.T) {
 	}
 	for _, stmt := range schemaStatements {
 		if strings.HasPrefix(stmt, "CREATE TABLE IF NOT EXISTS apm_crashes ") &&
-			(strings.Contains(stmt, "client_fingerprint") || strings.Contains(stmt, "error_seq")) {
+			(strings.Contains(stmt, "exception_type") || strings.Contains(stmt, "error_seq")) {
 			t.Error("exception columns on apm_crashes")
+		}
+	}
+}
+
+// APM-7: the crash columns come last in CREATE TABLE apm_crashes and are
+// added in the same order after the APM-5 columns.
+func TestSchemaStatements_CrashColumnsAPM7(t *testing.T) {
+	var create string
+	var alters []string
+	for _, stmt := range schemaStatements {
+		if strings.HasPrefix(stmt, "CREATE TABLE IF NOT EXISTS apm_crashes ") {
+			create = stmt
+		}
+		if strings.HasPrefix(stmt, "ALTER TABLE apm_crashes ADD COLUMN") {
+			alters = append(alters, strings.TrimPrefix(stmt, "ALTER TABLE apm_crashes ADD COLUMN IF NOT EXISTS "))
+		}
+	}
+	want := "    ctx Map(LowCardinality(String), String),\n    " + strings.Join(crashColumnsAPM7, ",\n    ") + ",\n    INDEX "
+	if !strings.Contains(create, want) {
+		t.Errorf("CREATE TABLE apm_crashes: APM-7 columns missing or out of order:\n%s", create)
+	}
+	tail := alters[len(alters)-len(crashColumnsAPM7):]
+	for i, col := range crashColumnsAPM7 {
+		if tail[i] != col {
+			t.Errorf("migration %d: %q, want %q", i, tail[i], col)
+		}
+		// Additive and cheap: every new column has a default or is a Map.
+		if !strings.Contains(col, " DEFAULT ") && !strings.Contains(col, " Map(") {
+			t.Errorf("column without a default: %s", col)
+		}
+	}
+}
+
+// APM-7: the symbol tables are created by Migrate (warning on failure) and
+// are in migrate.sql; they have a TTL and no device_id (privacy deletion
+// looks for that column; symbols are build artifacts).
+func TestSchema_SymbolTables(t *testing.T) {
+	sql := SchemaSQL()
+	if got := strings.Join(SymbolTableNames(), ","); got != "apm_symbol_files,apm_symbol_funcs,apm_symbol_lines" {
+		t.Fatalf("symbol tables %s", got)
+	}
+	for _, tb := range symbolTables {
+		if !strings.HasPrefix(tb.DDL, "CREATE TABLE IF NOT EXISTS "+tb.Name+" (") {
+			t.Errorf("%s: %q", tb.Name, tb.DDL)
+		}
+		if !strings.HasSuffix(tb.DDL, "\nTTL toDateTime(uploaded_at) + INTERVAL 400 DAY") {
+			t.Errorf("%s has no TTL", tb.Name)
+		}
+		if strings.Contains(tb.DDL, "device_id") || strings.Contains(tb.DDL, "INDEX ") {
+			t.Errorf("%s: no device data, no skip index (the service account may not add one)", tb.Name)
+		}
+		if !strings.Contains(sql, tb.DDL+";\n") {
+			t.Errorf("migrate.sql lacks %s", tb.Name)
+		}
+		for _, stmt := range schemaStatements {
+			if strings.Contains(stmt, tb.Name) {
+				t.Errorf("%s must not be a statement that has to succeed", tb.Name)
+			}
 		}
 	}
 }
