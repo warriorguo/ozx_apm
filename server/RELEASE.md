@@ -2072,3 +2072,394 @@ table.
   rows only.
 - The admin pages were tested with vitest (jsdom) and through their API on
   the test environment, not opened in a browser.
+
+## APM-8: alerting (new issue, regression, crash rate spike, startup P95) and issue state (additive schema change)
+
+Deploy order: **server (app 36 and app 38), then admin UI; then turn
+alerting on for app 36 only.** No SDK change. Two new tables, created by
+`Migrate` with the `CREATE TABLE` grant the `apm` account has; nothing
+needs ALTER UPDATE, MODIFY or ADD INDEX. Alerting is **off** by default: the
+server logs one info line, `alerting disabled (OZX_ALERT_ENABLED is not
+true; ...)`, and does nothing else.
+
+### Design
+
+- The evaluator (`internal/alert`) reads **ClickHouse**, never ingest's
+  memory, once per `interval` (60 s), starting 15 s after startup. A restart
+  neither loses nor repeats alerts; the old in-memory `Aggregator` (never
+  started, per-process counts) is removed. It runs its queries one at a
+  time (at most one of the 10 pooled connections, which ingest shares),
+  each bounded by `LIMIT`; each step's error is logged and the next step
+  still runs.
+- **Outbox** `apm_alerts` (MergeTree, append-only, no TTL): every alert has
+  a deterministic key, e.g. `new_issue:exception:<fp>`,
+  `regression:crash:<fp>:<state version>`,
+  `crash_rate_spike:<version>:<5-min bucket>`,
+  `startup_p95_regression:<new>:<previous>`, `test:<ms>:<random>`. Its rows:
+  `pending` (detected, with the payload JSON), `claimed` / `sent` / `failed`
+  per attempt (with `attempt`, `instance`, `error`), `abandoned`, `known`
+  (a fingerprint recorded without an alert).
+  - Detection skips keys that have any row, so an alert is detected once,
+    whichever process or restart finds it.
+  - Sending: an instance writes a `claimed` row for attempt N, waits 2 s,
+    reads the claims of N back, and sends only if its claim is the first
+    (earliest `inserted_at`, set by ClickHouse, so pod clocks do not
+    matter; then instance name). Two instances (app 36 scaled to 2
+    replicas, or alerting enabled on both apps by mistake) therefore send
+    each alert once. A claim without an outcome counts as failed after
+    6 min (longer than an evaluation can last), and an instance never sends
+    its own claim once it is older than 6 min - 10 s, so a slow webhook does
+    not let another instance overtake it. The remaining window: an instance
+    stops after the webhook accepted the message but before writing `sent`;
+    after 6 min another instance retries it (one duplicate message).
+  - Retries: a failed attempt (non-2xx, timeout 10 s, connection error;
+    Feishu's 200 with `code != 0`; a 3xx, since a redirected POST arrives
+    as a GET without the message) is retried after 1, 2, 4, 8, 16 min;
+    after 6 attempts the alert is `abandoned` (logged as an error). At most
+    20 webhook requests per evaluation; alerts detected more than 24 h ago
+    are no longer sent.
+- **Issue state** `apm_issue_states` (ReplacingMergeTree(`version`),
+  `ORDER BY (kind, fingerprint)`): each change is a new row with
+  `version` = time in ms (above the previous row's); reads use `FINAL`.
+  No row = unresolved. Merges keep only the latest row per issue (no
+  history beyond `resolved_*` / `regressed_*` of the latest row).
+
+Rules (release builds only: `build_type IN ('release', '')`; dev and editor
+builds are ignored unless `include_dev_builds`):
+
+- **New issue** (exception or crash fingerprint). "New" = not known to the
+  alerting: no `apm_alerts` row of type `new_issue` for it. Known are:
+  - every fingerprint in the retained rows when alerting first runs (the
+    **baseline**, once per kind, marker key `baseline:<kind>`; one
+    `INSERT ... SELECT` in ClickHouse, no limit): turning alerting on does
+    not report the existing issues;
+  - every fingerprint alerted (or suppressed) since. These rows never
+    expire, so an issue that stops for more than the 30-day event retention
+    and returns is **not** new (if it was resolved, it is a regression).
+  Each evaluation looks at rows of the last `new_issue_window` (26 h) by
+  event time; every `sweep_interval` (6 h, and at each start) at the whole
+  retention, so events uploaded late from the offline queue (APM-2) are
+  found within 6 h. A fingerprint first seen in a dev build is new when it
+  first appears in a release build. **Storm limits**: at most
+  `new_issue_max_per_cycle` (10) individual alerts per evaluation and
+  `new_issue_max_per_hour` (30) per hour (counted in the outbox: across
+  evaluations, restarts and replicas); the rest are recorded as known and
+  summarised in one `new_issue_digest` alert per kind per 15 min (key by
+  time bucket); beyond that they are only recorded (visible in the admin
+  lists). A fingerprint algorithm change or a broken build therefore costs
+  at most ~34 messages in its first hour per kind.
+- **Regression**: an issue marked resolved that has rows after the
+  resolution in its fix version or newer (`resolved_in_version`,
+  inclusive), or, when the admin gave no fix version, in a version newer
+  than `last_seen_version` (the newest version that had it when it was
+  resolved). Old clients still running an affected version after the
+  resolution are not a regression. One alert per resolution (key includes
+  the state version); the issue is reopened (`unresolved`,
+  `regressed_in_version`, `regressed_at`, `updated_by: alert`).
+- **Version order**: a name is prefix (text before the first digit,
+  lower-cased; `v` = none) + dot-separated numbers + optional pre-release
+  (`-beta.1`, or any text after the numbers; `+build` ignored). Names with
+  the same prefix compare like semantic versions (`1.10.0 > 1.9.9`,
+  `1.4 = 1.4.0`, `2.0.0-beta.2 < 2.0.0-beta.10 < 2.0.0`,
+  `apmtest-2.0.0 > apmtest-1.9.0`). Names that cannot be compared (no
+  digits, different prefixes: `apmtest-2.0.0` vs `2.0.0`) fall back to
+  time: the version whose first startup (in the retained `apm_startups`)
+  is later is newer; a version without one counts as first seen when its
+  rows were (the threshold version: at the resolution). Text after the
+  numbers counts as a pre-release, so `1.4.2-hotfix < 1.4.2`.
+- **Crash rate spike** (every `crash_rate_check_interval`, 5 min): per
+  version, crashed sessions (`uniqExact(session_id)` of `apm_crashes`) /
+  sessions (`uniq(session_id)` of perf samples, startups and crashes) over
+  the last `crash_rate_window` (1 h). Fires when the version has at least
+  `crash_rate_min_sessions` (50) sessions and `crash_rate_min_crashed_sessions`
+  (5) crashed ones, and the rate is at least `crash_rate_min_rate` (0.5%)
+  and `crash_rate_factor` (2) times the baseline: all versions over the
+  `crash_rate_baseline_window` (24 h) before the window (refreshed hourly;
+  ignored when it has fewer sessions than the minimum). Then quiet for that
+  version for `crash_rate_cooldown` (6 h). Sessions are only counted from
+  rows they sent: with perf sampling off a session is seen through its
+  startup or crash only.
+- **Startup P95 regression** (hourly): over `startup_window` (7 days),
+  versions with at least `startup_min_samples` (100) startups; the newest
+  (version order above) against the previous one: P95 of
+  `phase1 + phase2 + tti` (the dashboard's startup) at least
+  `startup_increase` (20%) and `startup_min_delta_ms` (100 ms) higher. Once
+  per version pair.
+- Jank and exception rate rules of the old evaluator are not carried over
+  (not in the ticket; the new-issue and crash rules replace them).
+
+### Webhook
+
+`POST` to `webhook_url`, `Content-Type: application/json`, `User-Agent:
+ozx-apm-alert/1`, 10 s timeout. `webhook_format`:
+
+- `generic` (default):
+  ```json
+  {
+    "schema": "ozx-apm-alert/1",
+    "alert_key": "new_issue:exception:5b0c1d...",
+    "type": "new_issue",        // new_issue | new_issue_digest | regression | crash_rate_spike | startup_p95_regression | test
+    "severity": "warning",      // info | warning | critical (crashes, regressions, crash rate)
+    "title": "New exception: System.NullReferenceException at Ozx.Enemies.EnemySpawner.Spawn ...",
+    "kind": "exception",        // exception | crash (issue alerts only)
+    "fingerprint": "5b0c1d...",
+    "app_version": "2.0.0",
+    "facts": [{"label": "First seen", "value": "2026-10-18 09:12 UTC in 2.0.0"}, ...],
+    "metrics": {"count": 2, "sessions": 2},
+    "admin_path": "/exceptions/detail?fingerprint=5b0c1d...",
+    "detected_at": "2026-10-18T09:13:05Z",
+    "url": "https://apm-admin.local.playquota.com/exceptions/detail?fingerprint=5b0c1d...",
+    "text": "[OZX APM] New exception: ...\nFirst seen: ...\n...\nhttps://apm-admin.local.playquota.com/exceptions/detail?fingerprint=5b0c1d..."
+  }
+  ```
+  `metrics` per type: new issue `count`, `sessions`; regression `count`,
+  `sessions` (since the resolution, in the version); crash rate `rate`,
+  `threshold`, `baseline`, `sessions`, `crashed_sessions`, `crashes`;
+  startup `p95_ms`, `previous_p95_ms`, `increase`, `samples`,
+  `previous_samples`. `url` only when `admin_base_url` is set.
+- `slack`: `{"text": "<text>"}`; `feishu`: `{"msg_type": "text",
+  "content": {"text": "<text>"}}` (Feishu/Lark custom bot; a reply with a
+  non-zero `code` counts as a failure).
+- Game text (types, messages, throw sites, stack lines, versions,
+  fingerprints) in `title`, `facts` and `text` is made inert and bounded
+  (`alert.CleanText`): one line, `@` followed by a zero-width space (no
+  `@all` / `@here` / `@channel`), `<` `>` `&` replaced by look-alikes (no
+  Slack `<!channel>` / `<url|text>`, no Feishu `<at>`), Markdown characters
+  (`` ` `` `*` `~` `[` `]` `|`) replaced, `://` broken so URLs are not
+  linked, at most 120-300 characters. Bodies are JSON-encoded, never
+  templated.
+- The URL is a secret: never logged, stored or returned; logs and stored
+  errors name only its host (`webhook_host` in the startup line).
+
+### Configuration
+
+Every key is `alert.<key>` in `config.yaml` and the environment variable
+`OZX_ALERT_<KEY>`:
+
+| Key | Default | |
+|---|---|---|
+| `enabled` | false | `OZX_ALERT_ENABLED=true` starts the evaluator |
+| `webhook_url` | "" | **secret**; required when enabled (else one error line, not started) |
+| `webhook_format` | generic | generic, slack, feishu |
+| `admin_base_url` | "" | e.g. `https://apm-admin.local.playquota.com`; links in alerts |
+| `interval` | 60s | at least 10 s |
+| `include_dev_builds` | false | |
+| `new_issue_max_per_cycle` / `new_issue_max_per_hour` / `new_issue_window` / `sweep_interval` | 10 / 30 / 26h / 6h | |
+| `crash_rate_window` / `_baseline_window` / `_check_interval` | 1h / 24h / 5m | |
+| `crash_rate_min_sessions` / `_min_crashed_sessions` / `_min_rate` / `_factor` / `_cooldown` | 50 / 5 / 0.005 / 2 / 6h | |
+| `startup_enabled` / `startup_window` / `_check_interval` / `_min_samples` / `_increase` / `_min_delta_ms` | true / 168h / 1h / 100 / 0.2 / 100 | |
+
+Plus `OZX_ADMIN_ALERT_TOKEN` (`admin_server.alert_token`, **secret**):
+enables `POST /api/alerts/test` (below); disabled (403) without it, one
+info line `alert test API disabled: no token configured`.
+
+**Found while doing this (not changed):** `config.Load` binds environment
+variables only where `BindEnv` is called (privacy token, now the alert
+keys); `viper.AutomaticEnv` without a key replacer never maps
+`OZX_SERVER_ENABLED` to `server.enabled`. So `Dockerfile.admin`'s
+`OZX_SERVER_ENABLED=false`, `OZX_ADMIN_SERVER_HOST`, `..._PORT` have no
+effect (verified by a unit test run: `server.enabled` stays true): app 38
+also runs the ingest listener on 8080 inside its container (not exposed),
+and its admin server listens on 0.0.0.0:8081 (the default, which is why
+nginx still reaches it). Harmless today; alerting does not depend on it
+(it is enabled explicitly). Fixing it (a key replacer) would start honouring
+every `OZX_*` variable set on both apps, so check their environments
+first.
+
+### Admin API
+
+- `GET /api/issues/state?kind=exception|crash&fingerprint=F` -> the state:
+  `{kind, fingerprint, status, resolved_in_version, last_seen_version,
+  resolved_at, regressed_in_version, regressed_at, updated_at, updated_by,
+  comment}` (`status: unresolved` and nothing else for an issue never
+  changed).
+- `POST /api/issues/state` with headers `Content-Type: application/json`
+  and **`X-Apm-Admin: 1`**, body `{"kind","fingerprint","status":
+  "resolved"|"unresolved","resolved_in_version" (optional, the version
+  with the fix),"comment" (optional, 500 chars)}` -> 200 with the new
+  state; 404 when the issue has no row in the retained data; 400 for a bad
+  body or a missing header; 415 without JSON. Resolving records
+  `last_seen_version` (newest version, release builds) and `resolved_at`;
+  reopening keeps them. `X-Apm-Admin` is not in the CORS allow-list, so a
+  page of another origin cannot send it; like the rest of the admin API
+  this has no login (APM-14 "open risk").
+- `GET /api/exceptions` adds `status=resolved|unresolved|all` (default all;
+  a bound `fingerprint [NOT] IN (SELECT ... FINAL)` subquery); exception and
+  crash lists and details carry `status`, `resolved_in_version`,
+  `resolved_at`, `regressed_in_version` (`status` absent when the states
+  cannot be read: the list is still served).
+- `GET /api/alerts[?limit=N]` (default 50, at most 200) -> `{alerts:
+  [{alert_key, type, kind, fingerprint, app_version, created_at, status,
+  updated_at, attempts, error, title}]}`: the latest detected alerts and
+  their delivery state.
+- `POST /api/alerts/test` with `Authorization: Bearer <OZX_ADMIN_ALERT_TOKEN>`
+  -> 202 `{alert_key, note}`: queues a `test` alert in the outbox; the
+  evaluator (app 36) posts it at its next evaluation, so it works from app
+  38 too and exercises the real path. 401 for a missing/wrong token (logged
+  with the remote address, never the token), 403 without a configured
+  token, 429 for a second request within 10 s. It never makes an outbound
+  request itself.
+
+### Admin UI
+
+Exceptions: a Status column (Unresolved, Resolved in X, Regressed in X) and
+a status filter. Exception detail and the crash panel: the state with "Mark
+resolved" (optional "Fixed in version", suggested from the known versions;
+empty = the next version) or "Reopen". The crash page opens the group of
+`/crashes?fingerprint=F` (the link of a crash alert). All values render as
+text; an older server (no `status`) shows no control.
+
+### Schema
+
+```sql
+CREATE TABLE IF NOT EXISTS apm_issue_states (... ) ENGINE = ReplacingMergeTree(version) ORDER BY (kind, fingerprint);
+CREATE TABLE IF NOT EXISTS apm_alerts (... ) ENGINE = MergeTree() ORDER BY (alert_key, at);
+```
+
+(full statements in `scripts/migrate.sql`, generated from `schema.go`).
+`Migrate` creates them at startup with the `apm` account's `CREATE TABLE`
+grant; if that fails it logs `could not create an alerting table; ...`
+and the server still starts (ingest and pages unaffected; state endpoints
+and the evaluator then fail). No TTL: a few rows per alert and one per
+fingerprint (thousands), kept as the record of known fingerprints. No
+change to the event tables.
+
+### Cost (estimated, not measured)
+
+Per evaluation (60 s), sequentially, one connection:
+
+- new issues: one query per kind over the last 26 h of `apm_exceptions` /
+  `apm_crashes` (`timestamp`, `fingerprint`, `build_type`, filtered by
+  `fingerprint NOT IN (known)`, so the other columns are only read for new
+  fingerprints' granules), `LIMIT 200`. At the APM-11 scratch volume
+  (3 M exception rows a week) that is ~0.45 M rows a minute. The 6-hourly
+  sweep reads 30 days (~13 M rows) once.
+- regressions: only when resolved issues exist (at most 1000): one query
+  per 200 of them, over the rows since the earliest resolution (at most 26 h; 30 days at the
+  sweep) with `fingerprint IN (resolved)`.
+- crash rate, every 5 min: `session_id` of the last hour of perf samples,
+  startups and crashes; hourly the same over 24 h (at the scratch volume
+  ~1.4 M perf rows).
+- startup: hourly, 7 days of `apm_startups` (small).
+- outbox: one query on `apm_alerts` (small); claims and outcomes are a few
+  inserts per alert.
+
+Measure on the test environment (`system.query_log`, user `apm`, queries
+from the evaluator) before relying on these numbers.
+
+### Deploy (CI/CD) and rollback
+
+1. Deploy the server to **app 36 and app 38** (both run `Migrate`; the two
+   new tables appear; no new warning). Then the admin UI (app 38 image
+   holds both).
+2. **App 38 (admin only): never set `OZX_ALERT_ENABLED`.** Set
+   `OZX_ADMIN_ALERT_TOKEN` (secret, e.g. `openssl rand -hex 32`) to allow
+   test alerts.
+3. **App 36**: set as environment variables (secrets in the CI/CD secret
+   store): `OZX_ALERT_ENABLED=true`, `OZX_ALERT_WEBHOOK_URL=<incoming
+   webhook>` (secret), `OZX_ALERT_WEBHOOK_FORMAT=feishu|slack|generic`,
+   `OZX_ALERT_ADMIN_BASE_URL=https://apm-admin.local.playquota.com`;
+   redeploy (read at startup). Expect the log line `alerting enabled`
+   with `webhook_host`, `webhook_format`, `admin_links: true`, and on the
+   first evaluation `alert: baseline recorded; ...` once per kind.
+   Scaling app 36 to 2 replicas is safe (each alert sent once, see above);
+   so is enabling it on both apps by mistake, but do not.
+4. Check: `POST /api/alerts/test` (below) arrives in the channel within
+   about a minute; `GET /api/alerts` shows it `sent`.
+
+**Rollback:** to stop alerts at once, set `OZX_ALERT_ENABLED=false` (or
+remove it) on app 36 and redeploy. To roll back the release: redeploy the
+previous server and admin UI; the old binary ignores the two tables
+(keep them: dropping `apm_alerts` would make the next enable re-baseline,
+which is harmless, but lose the record of what was sent; dropping
+`apm_issue_states` loses the resolved marks). Pending alerts of the outbox
+older than 24 h are not sent after a re-enable.
+
+### Verification without a chat webhook
+
+Locally:
+
+```sh
+cd server
+go run ./cmd/alertsink -addr 127.0.0.1:9099          # prints every POST; -fail 2 answers 500 twice, -feishu answers {"code":0}
+OZX_ALERT_ENABLED=true OZX_ALERT_WEBHOOK_URL=http://127.0.0.1:9099/hook \
+OZX_ALERT_INTERVAL=10s OZX_ALERT_ADMIN_BASE_URL=http://localhost:3000 \
+OZX_ADMIN_ALERT_TOKEN=dev-token go run ./cmd/server
+curl -sS -X POST http://localhost:8081/api/alerts/test -H 'Authorization: Bearer dev-token'
+curl -sS http://localhost:8081/api/alerts | jq
+```
+
+On a host the cluster can reach, without Go:
+
+```sh
+python3 -c 'import http.server as h
+class H(h.BaseHTTPRequestHandler):
+    def do_POST(s):
+        print(s.rfile.read(int(s.headers.get("Content-Length", 0))).decode(), flush=True)
+        s.send_response(200); s.end_headers()
+h.HTTPServer(("0.0.0.0", 9099), H).serve_forever()'
+```
+
+Acceptance (APM-1 item 8) on the test environment: after step 3, build
+the test game with a new `app_version` that throws an exception the old
+one does not (e.g. a button raising `InvalidOperationException` in a new
+method), release build; within `interval` (+ upload time) a `new_issue`
+alert for that version arrives; `GET /api/alerts` shows it `sent`, and it
+is not sent again. Then mark it resolved with a fix version from the
+exception page, build that version still throwing it: a `regression`
+alert arrives and the page shows "Regressed in <version>".
+
+```sh
+TOKEN=...   # OZX_ADMIN_ALERT_TOKEN, from the secret store
+curl -sS -X POST https://apm-admin.local.playquota.com/api/alerts/test -H "Authorization: Bearer $TOKEN"
+curl -sS https://apm-admin.local.playquota.com/api/alerts | jq '.alerts[:5]'
+curl -sS -X POST https://apm-admin.local.playquota.com/api/issues/state -H 'Content-Type: application/json' -H 'X-Apm-Admin: 1' \
+  -d '{"kind":"exception","fingerprint":"<fp>","status":"resolved","resolved_in_version":"<fix version>"}'
+```
+
+### Verified
+
+- Unit tests (`go vet ./...`, `go test -race` on the changed packages):
+  version order (semver, prefixes, pre-releases, fallback to first seen);
+  inert text (mentions, Slack/Feishu markup, Markdown, URLs, bidi and
+  control characters, invalid UTF-8, bounds); the three body formats, the
+  admin link, Feishu's `code`, errors and timeouts never showing the URL;
+  the evaluator on an in-memory store with the SQL's semantics: baseline,
+  a new fingerprint sent once across more evaluations, a restart and a
+  second instance, dev builds ignored until a release build has the
+  fingerprint, the storm digest, the sweep finding a late upload, two
+  instances claiming at once sending once, retry with
+  backoff and abandon after 6 attempts, a stale claim retried, regressions
+  (old version after the resolution not one, fix version and newer one,
+  reopened, sent once, a second regression after resolving again, time
+  fallback for `apmtest-` names, reopening retried when it failed), crash
+  rate thresholds and cooldown, startup P95, a failing step not stopping
+  the others, at most 20 sends per evaluation; the handlers (resolve,
+  reopen, last seen version with incomparable names, 400/404/415, missing
+  header, state annotation and the status filter, a failing state read
+  still serving the list, the test endpoint's 403/401/202/429, the alert
+  list); after a code review (another agent): the storm caps across
+  evaluations (10, 30 per hour, one digest per 15 min), a slow instance not
+  sending a claim that may count as stale, a redirect being a failure, the
+  generic `alert_key` made inert; the configuration from `OZX_ALERT_*` and `OZX_ADMIN_ALERT_TOKEN`;
+  the `status` subquery.
+- Admin UI: `tsc`, vitest (141 tests, 14 new: badge and control, resolve
+  with and without a version, reopen, errors as text, `<img onerror>` in
+  versions rendered as text, the status filter, the crash page's
+  `?fingerprint=`), `vite build`.
+
+### Not verified
+
+- **Nothing here ran against ClickHouse**: the author's sandbox could not
+  reach a local ClickHouse. `tests/integration/alert_test.go` (APM-1
+  acceptance 8 through the ingest router, resolve and regression with the
+  status filter, crash rate spike and new crash, startup P95, two
+  evaluators at once, the test endpoint and a failing webhook, the `apm`
+  service account's grants, the schema from `Migrate` and `migrate.sql`)
+  compiles and is vetted but has not been run on 26.1, 24.1 or 23.8; the
+  SQL of `repository_alerts.go` is unverified on every version.
+- A real Slack or Feishu webhook; the deploy on apps 36/38; n192 (the
+  `apm` account creating the tables); query cost at any volume.
+- Crash alerts from real crashes: the SDK sends none until APM-7.
+- Two replicas of app 36 in a real deployment (only simulated).
+- The admin pages in a browser (vitest/jsdom only).

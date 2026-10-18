@@ -47,6 +47,31 @@ ratelimit:
   enabled: true
   requests_per_min: 1000
 
+# Alerting (APM-8, RELEASE.md). Every key can also be set as OZX_ALERT_<KEY>
+# (OZX_ALERT_ENABLED, OZX_ALERT_WEBHOOK_URL, ...). Enable it on ONE deployment.
+# The webhook URL is a secret: prefer the environment variable.
 alert:
   enabled: false
   webhook_url: ""
+  webhook_format: generic          # generic | slack | feishu
+  admin_base_url: ""               # e.g. https://apm-admin.local.playquota.com (links in alerts)
+  interval: 60s
+  include_dev_builds: false
+  new_issue_max_per_cycle: 10
+  new_issue_max_per_hour: 30
+  new_issue_window: 26h
+  sweep_interval: 6h
+  crash_rate_window: 1h
+  crash_rate_baseline_window: 24h
+  crash_rate_check_interval: 5m
+  crash_rate_min_sessions: 50
+  crash_rate_min_crashed_sessions: 5
+  crash_rate_min_rate: 0.005
+  crash_rate_factor: 2.0
+  crash_rate_cooldown: 6h
+  startup_enabled: true
+  startup_window: 168h
+  startup_check_interval: 1h
+  startup_min_samples: 100
+  startup_increase: 0.2
+  startup_min_delta_ms: 100

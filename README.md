@@ -270,6 +270,32 @@ curl -X POST http://localhost:8081/api/privacy/verify -H "Authorization: Bearer 
   -H "Content-Type: application/json" -d "{\"id_type\":\"device_id\",\"id\":\"$DEVICE_ID\"}"
 ```
 
+### Alerting and issue state (admin server)
+
+Alerts (new exception/crash fingerprint, regression of a resolved issue,
+crash rate spike, startup P95 regression) are evaluated from ClickHouse and
+posted to one webhook (generic JSON with a `text` field, Slack or Feishu).
+Off by default; enable on **one** deployment with `OZX_ALERT_ENABLED=true`
+and `OZX_ALERT_WEBHOOK_URL` (a secret), plus `OZX_ALERT_WEBHOOK_FORMAT` and
+`OZX_ALERT_ADMIN_BASE_URL` for links. Rules, payload schema, deployment and
+verification: `server/RELEASE.md` (APM-8). `go run ./cmd/alertsink` prints
+what a webhook would receive.
+
+**POST /api/issues/state** - Mark an exception or crash group resolved (with
+the version that has the fix) or unresolved; `GET` reads it.
+```bash
+curl -X POST http://localhost:8081/api/issues/state -H "Content-Type: application/json" -H "X-Apm-Admin: 1" \
+  -d '{"kind":"exception","fingerprint":"<fp>","status":"resolved","resolved_in_version":"1.5.0"}'
+```
+
+**GET /api/alerts** - Recent alerts and their delivery status.
+
+**POST /api/alerts/test** - Queue a test alert (sent by the evaluator at its
+next evaluation). Disabled until `OZX_ADMIN_ALERT_TOKEN` is set.
+```bash
+curl -X POST http://localhost:8081/api/alerts/test -H "Authorization: Bearer $ALERT_TOKEN"
+```
+
 ## Event Types
 
 | Type | Description |
