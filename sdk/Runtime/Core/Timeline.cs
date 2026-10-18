@@ -450,12 +450,35 @@ namespace OzxApm.Core
                     int end = j + 1;
                     while (end < sb.Length && !EndsUrl(sb[end]))
                         end++;
-                    sb.Remove(j, end - j);
-                    sb.Insert(j, "?...");
+                    ReplaceInPlace(sb, j, end, "?...");
                     j += 4;
                 }
                 i = j;
             }
+        }
+
+        // Replaces sb[start..end) with s by moving the characters after it:
+        // no allocation while the builder has the capacity (StringBuilder's
+        // Remove + Insert allocate on Mono; the crash journal formats the
+        // time line several times a second, APM-7).
+        private static void ReplaceInPlace(StringBuilder sb, int start, int end, string s)
+        {
+            int removed = end - start, delta = s.Length - removed, len = sb.Length;
+            if (delta < 0)
+            {
+                for (int k = end; k < len; k++)
+                    sb[k + delta] = sb[k];
+                sb.Length = len + delta;
+            }
+            else if (delta > 0)
+            {
+                for (int k = 0; k < delta; k++)
+                    sb.Append('\0');
+                for (int k = len - 1; k >= end; k--)
+                    sb[k + delta] = sb[k];
+            }
+            for (int k = 0; k < s.Length; k++)
+                sb[start + k] = s[k];
         }
 
         private static bool StartsWith(StringBuilder sb, int at, string s)

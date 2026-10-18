@@ -121,11 +121,14 @@ namespace OzxApm.Tests
         {
             _t.OnLog("Request failed: https://api.ozx.example/v1/save?token=SECRET&uid=42 (500)", "", LogType.Warning, true);
             _t.RecordText("Loaded http://cdn.ozx.example/a.bundle#frag and HTTPS://x.example/p?k=v");
+            // A query shorter than "?..." (the text grows) and one at the very end (APM-7: replaced in place).
+            _t.RecordText("Short http://h/p? and http://h/q?a then http://h/r#");
             var lines = All().Select(Body).ToList();
             CollectionAssert.AreEqual(new[]
             {
                 "Warning: Request failed: https://api.ozx.example/v1/save?... (500)",
-                "Loaded http://cdn.ozx.example/a.bundle?... and HTTPS://x.example/p?..."
+                "Loaded http://cdn.ozx.example/a.bundle?... and HTTPS://x.example/p?...",
+                "Short http://h/p?... and http://h/q?... then http://h/r?..."
             }, lines);
         }
 
