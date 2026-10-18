@@ -196,12 +196,21 @@ namespace OzxApm.Tests
             j.Start(true);
             try
             {
-                CrashJournal.NotifyChanged();
-                Assert.That(() => { CrashJournal.NotifyChanged(); }, Is.Not.AllocatingGCMemory());
-                _timeline.OnLog("warming up", "", LogType.Warning, true);
-                // A statement lambda: OnLog returns a value, and an expression lambda
-                // would be an ActualValueDelegate, which the constraint refuses.
-                Assert.That(() => { _timeline.OnLog("Pool empty for enemy 12", "", LogType.Warning, true); }, Is.Not.AllocatingGCMemory());
+                TestDelegate notify = () => { CrashJournal.NotifyChanged(); };
+                notify();
+                Assert.That(notify, Is.Not.AllocatingGCMemory());
+
+                // What APM-7 adds to the per-log path: a repeated line plus the journal hook.
+                // The message is a captured local and the delegate runs once before it is
+                // measured: a string literal Mono has not created yet allocates once (168 B),
+                // with or without the journal and on main's SDK too, so it is not a per-log
+                // cost. A new distinct line is covered by TimelineTests.OnLog_DoesNotAllocate.
+                // Statement lambdas: OnLog returns a value, and an expression lambda would be
+                // an ActualValueDelegate, which the constraint refuses.
+                string message = "Pool empty for enemy 12";
+                TestDelegate repeat = () => { _timeline.OnLog(message, "", LogType.Warning, true); };
+                repeat();
+                Assert.That(repeat, Is.Not.AllocatingGCMemory(), "a repeated log line + NotifyChanged");
             }
             finally
             {
