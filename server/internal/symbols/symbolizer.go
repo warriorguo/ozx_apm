@@ -161,6 +161,9 @@ func (s *Symbolizer) UploadFor(ctx context.Context, f Frame, fb Fallback) (Uploa
 		return UploadRef{}, "", false, nil
 	}
 	arch := ArchOfABI(fb.ABI)
+	if arch == "" {
+		return UploadRef{}, "", false, nil // another ABI's symbols would name the wrong code
+	}
 	key := "v:" + fb.AppVersion + "|" + f.Module + "|" + arch
 	if e, ok := s.cachedUpload(key); ok {
 		return e.ref, "app_version", e.found, nil
@@ -171,7 +174,7 @@ func (s *Symbolizer) UploadFor(ctx context.Context, f Frame, fb Fallback) (Uploa
 	}
 	var e uploadEntry
 	for _, r := range refs {
-		if arch == "" || r.Arch == arch {
+		if r.Arch == arch {
 			e = uploadEntry{ref: r, found: true}
 			break
 		}

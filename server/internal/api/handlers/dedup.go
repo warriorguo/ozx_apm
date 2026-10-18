@@ -156,7 +156,9 @@ func dedupe[T any](ctx context.Context, store EventStore, logger *zap.Logger, ta
 // lookupFor builds the lookup for keys[idx...]: the distinct app versions and
 // key-column values, and the timestamp range of exactly those events.
 func lookupFor(table storage.EventTable, keys []eventKey, idx []int) storage.EventIDLookup {
-	q := storage.EventIDLookup{Table: table, EventIDs: make([]string, 0, len(idx))}
+	q := storage.EventIDLookup{Table: table, EventIDs: make([]string, 0, len(idx)),
+		// APM-7: a re-sent crash may have another fingerprint (symbols uploaded meanwhile).
+		AnyKey: table == storage.TableCrashes}
 	versions := map[string]struct{}{}
 	values := map[string]struct{}{}
 	for n, i := range idx {

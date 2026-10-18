@@ -148,9 +148,13 @@ func TestSymbolizer_FallbackByVersionAndABI(t *testing.T) {
 	if len(got) != 0 {
 		t.Fatalf("other ABI must not match: %+v", got)
 	}
-	got, _ = s.Resolve(context.Background(), frames, Fallback{AppVersion: "9.9"})
+	got, _ = s.Resolve(context.Background(), frames, Fallback{AppVersion: "9.9", ABI: "arm64-v8a"})
 	if len(got) != 0 {
 		t.Fatalf("other version: %+v", got)
+	}
+	got, _ = s.Resolve(context.Background(), frames, Fallback{AppVersion: "1.2.0"})
+	if len(got) != 0 {
+		t.Fatalf("unknown ABI: no fallback: %+v", got)
 	}
 }
 

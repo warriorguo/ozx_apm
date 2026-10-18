@@ -385,9 +385,9 @@ func (r *Repository) GetCrashGroups(ctx context.Context, f models.AdminFilter, p
 
 	// Get crash groups
 	offset := (page - 1) * pageSize
-	// The latest crash of each group gives the type, summary and the stack
-	// the handler symbolicates the top frame of (cut: the top frames are
-	// at the start).
+	// The latest crash of each group gives the type and summary; its stack
+	// (whose top frame the handler symbolicates) is read afterwards for the
+	// page's groups only, by event id: the stack column is the large one.
 	query := fmt.Sprintf(`
 		SELECT
 			fingerprint,
@@ -403,7 +403,7 @@ func (r *Repository) GetCrashGroups(ctx context.Context, f models.AdminFilter, p
 			argMax(signal, timestamp),
 			argMax(crash_site, timestamp),
 			toInt64(countIf(foreground = 1)),
-			argMax(substringUTF8(stack, 1, %d), timestamp),
+			argMax(event_id, timestamp),
 			argMax(app_version, timestamp),
 			argMax(abi, timestamp)
 		FROM apm_crashes
@@ -411,14 +411,14 @@ func (r *Repository) GetCrashGroups(ctx context.Context, f models.AdminFilter, p
 		GROUP BY fingerprint
 		ORDER BY cnt DESC, fingerprint
 		LIMIT %d OFFSET %d
-	`, maxCrashListStackChars, whereClause, pageSize, offset)
+	`, whereClause, pageSize, offset)
 
 	crashes := []models.CrashGroup{}
 	err := r.queryRows(ctx, query, args, func(rows driver.Rows) error {
 		var c models.CrashGroup
 		var versions, devices []string
 		if err := rows.Scan(&c.Fingerprint, &c.CrashType, &c.Count, &c.SessionCount, &c.FirstSeen, &c.LastSeen, &versions, &devices,
-			&c.SampleMessage, &c.ExitReason, &c.Signal, &c.CrashSite, &c.Foreground, &c.SampleStack, &c.SampleVersion, &c.SampleABI); err != nil {
+			&c.SampleMessage, &c.ExitReason, &c.Signal, &c.CrashSite, &c.Foreground, &c.SampleEventID, &c.SampleVersion, &c.SampleABI); err != nil {
 			return err
 		}
 		if versions == nil {
@@ -434,6 +434,9 @@ func (r *Repository) GetCrashGroups(ctx context.Context, f models.AdminFilter, p
 	})
 	if err != nil {
 		return nil, 0, err
+	}
+	if err := r.crashSampleStacks(ctx, f, crashes); err != nil {
+		return nil, 0, fmt.Errorf("crash sample stacks: %w", err)
 	}
 	return crashes, totalCount, nil
 }
@@ -561,6 +564,39 @@ func (r *Repository) GetCrashDetail(ctx context.Context, fingerprint string, f m
 // maxCrashListStackChars: the part of the latest stack the crash list reads
 // for its top frame (the crashed thread comes first).
 const maxCrashListStackChars = 4000
+
+// crashSampleStacks reads the start of the latest stack of each group by its
+// event id (one query for the page).
+func (r *Repository) crashSampleStacks(ctx context.Context, f models.AdminFilter, groups []models.CrashGroup) error {
+	var ids []string
+	byID := map[string][]int{}
+	for i, g := range groups {
+		if g.SampleEventID == "" {
+			continue
+		}
+		if _, ok := byID[g.SampleEventID]; !ok {
+			ids = append(ids, g.SampleEventID)
+		}
+		byID[g.SampleEventID] = append(byID[g.SampleEventID], i)
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	where, args := adminWhere(f)
+	query := fmt.Sprintf(`SELECT event_id, substringUTF8(stack, 1, %d) FROM apm_crashes %s AND event_id IN ? LIMIT 1 BY event_id`,
+		maxCrashListStackChars, where)
+	args = append(args, groupSet(ids))
+	return r.queryRows(ctx, query, args, func(rows driver.Rows) error {
+		var id, stack string
+		if err := rows.Scan(&id, &stack); err != nil {
+			return err
+		}
+		for _, i := range byID[id] {
+			groups[i].SampleStack = stack
+		}
+		return nil
+	})
+}
 
 // crashOccurrenceColumns are the columns scanCrashOccurrence reads (then the stack).
 const crashOccurrenceColumns = `timestamp, app_version, platform, device_model, os_version, scene, breadcrumbs, build_type, ctx,

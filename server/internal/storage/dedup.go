@@ -46,9 +46,14 @@ type EventIDLookup struct {
 	Table       EventTable
 	AppVersions []string
 	Keys        []string
-	MinTime     time.Time
-	MaxTime     time.Time
-	EventIDs    []string
+	// AnyKey: do not filter on KeyColumn (Keys may be empty). Crashes (APM-7):
+	// their fingerprint depends on the symbols available when a copy was
+	// stored, so a re-sent crash can have another one; crashes are few, the
+	// app_version and time filters and the event_id index still bound the read.
+	AnyKey   bool
+	MinTime  time.Time
+	MaxTime  time.Time
+	EventIDs []string
 }
 
 func groupSet(values []string) clickhouse.GroupSet {
@@ -66,22 +71,21 @@ func buildEventIDLookup(q EventIDLookup) (string, []any, error) {
 	if q.Table.Name == "" || q.Table.KeyColumn == "" {
 		return "", nil, fmt.Errorf("event id lookup: unknown table %+v", q.Table)
 	}
-	if len(q.EventIDs) == 0 || len(q.AppVersions) == 0 || len(q.Keys) == 0 {
+	if len(q.EventIDs) == 0 || len(q.AppVersions) == 0 || (len(q.Keys) == 0 && !q.AnyKey) {
 		return "", nil, fmt.Errorf("event id lookup on %s: empty filter", q.Table.Name)
 	}
 	var sb strings.Builder
 	sb.WriteString("SELECT DISTINCT event_id FROM ")
 	sb.WriteString(q.Table.Name)
 	sb.WriteString(" WHERE app_version IN ? AND ")
-	sb.WriteString(q.Table.KeyColumn)
-	sb.WriteString(" IN ? AND timestamp >= fromUnixTimestamp64Milli(toInt64(?)) AND timestamp <= fromUnixTimestamp64Milli(toInt64(?)) AND event_id IN ?")
-	args := []any{
-		groupSet(q.AppVersions),
-		groupSet(q.Keys),
-		q.MinTime.UnixMilli(),
-		q.MaxTime.UnixMilli(),
-		groupSet(q.EventIDs),
+	args := []any{groupSet(q.AppVersions)}
+	if !q.AnyKey {
+		sb.WriteString(q.Table.KeyColumn)
+		sb.WriteString(" IN ? AND ")
+		args = append(args, groupSet(q.Keys))
 	}
+	sb.WriteString("timestamp >= fromUnixTimestamp64Milli(toInt64(?)) AND timestamp <= fromUnixTimestamp64Milli(toInt64(?)) AND event_id IN ?")
+	args = append(args, q.MinTime.UnixMilli(), q.MaxTime.UnixMilli(), groupSet(q.EventIDs))
 	return sb.String(), args, nil
 }
 

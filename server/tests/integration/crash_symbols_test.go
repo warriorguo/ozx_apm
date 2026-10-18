@@ -151,7 +151,7 @@ func TestCrashSymbols_UploadThenCrashesShowCSharpLines(t *testing.T) {
 	for _, async := range []bool{false, true} {
 		t.Run(fmt.Sprintf("async_insert=%v", async), func(t *testing.T) {
 			e := setupCrashEnv(t, async)
-			load71 := e.lineAddr(t, "RoomLoader.cs", 71)  // the call into Helper.Twice
+			load71 := e.lineAddr(t, "RoomLoader.cs", 71)   // the call into Helper.Twice
 			start500 := e.lineAddr(t, "ApmClient.cs", 500) // the lambda calling LoadTemplate
 			helper12 := e.lineAddr(t, "Helper.cs", 12)
 			// The top frame faulted in Helper.Twice; the callers' pcs are return addresses.

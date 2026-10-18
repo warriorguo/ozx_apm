@@ -23,9 +23,11 @@ type symbolEventStore struct {
 	uploads map[string]symbols.UploadRef
 	funcs   map[uint64]symbols.Func // by address, of every upload
 	fail    error
+	calls   int
 }
 
 func (s *symbolEventStore) LatestSymbolUpload(_ context.Context, buildID string) (symbols.UploadRef, bool, error) {
+	s.calls++
 	if s.fail != nil {
 		return symbols.UploadRef{}, false, s.fail
 	}
@@ -108,7 +110,7 @@ func TestIngest_NativeCrashFingerprintUsesUploadedSymbols(t *testing.T) {
 		c1.Summary != "SIGSEGV (SEGV_MAPERR) at 0x0000000000000008 in Game.Rooms.RoomLoader.LoadTemplate (libil2cpp.so)" {
 		t.Errorf("site %q summary %q", c1.CrashSite, c1.Summary)
 	}
-	if c1.ClientFingerprint != "sdk-c1" || c1.FingerprintVersion != fingerprint.Version {
+	if c1.ClientFingerprint != "sdk-c1" || c1.FingerprintVersion != fingerprint.CrashVersion {
 		t.Errorf("client fingerprint %q version %d", c1.ClientFingerprint, c1.FingerprintVersion)
 	}
 	if c1.ExitReason != "CRASH_NATIVE" || c1.ExitStatus != 11 || c1.PssKB != 512000 || !bool(c1.Foreground) ||
@@ -209,5 +211,36 @@ func TestIngest_CrashEventsFromTheSDK(t *testing.T) {
 	}
 	if unknown.CrashType != "unknown" || unknown.ExitReason != "" || unknown.Details["detected_by"] != "journal" {
 		t.Errorf("unknown %+v", unknown.CrashDetails)
+	}
+}
+
+// A failing symbol store is asked once per batch, not once per crash; the
+// crashes are stored keyed by address.
+func TestIngest_CrashSymbolFailureStopsLookupsForTheBatch(t *testing.T) {
+	store := &symbolEventStore{fail: errors.New("clickhouse down")}
+	h := newIngestHandler(store, zap.NewNop())
+	_, resp := postBatch(t, h, batchOf(
+		nativeCrashJSON("c1", "aaaaaaaa", "0000000000001010"),
+		nativeCrashJSON("c2", "bbbbbbbb", "0000000000002010"),
+		nativeCrashJSON("c3", "cccccccc", "0000000000003010"),
+	), nil)
+	if resp.Accepted != 3 || store.calls != 1 {
+		t.Fatalf("accepted %d, symbol store asked %d times", resp.Accepted, store.calls)
+	}
+}
+
+// A re-sent crash is looked up by event_id without the fingerprint (which
+// depends on the symbols present when each copy arrived).
+func TestIngest_CrashDuplicateLookupIgnoresTheFingerprint(t *testing.T) {
+	store := &fakeEventStore{}
+	h := newIngestHandler(store, zap.NewNop())
+	postBatch(t, h, batchOf(nativeCrashJSON("c1", "aaaaaaaa", "0000000000001010")), nil)
+	_, resp := postBatch(t, h, batchOf(nativeCrashJSON("c1", "aaaaaaaa", "0000000000001010")), nil)
+	if resp.Duplicates != 1 || len(store.crashes) != 1 {
+		t.Fatalf("response %+v, stored %d", resp, len(store.crashes))
+	}
+	last := store.lookups[len(store.lookups)-1]
+	if !last.AnyKey || last.Table.Name != "apm_crashes" {
+		t.Fatalf("lookup %+v", last)
 	}
 }

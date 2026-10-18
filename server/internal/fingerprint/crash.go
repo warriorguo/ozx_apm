@@ -401,11 +401,15 @@ type CrashResult struct {
 	Symbolicated bool
 }
 
+// CrashVersion is the version of the crash fingerprint (stored as
+// fingerprint_version of apm_crashes), independent of the exceptions' Version.
+const CrashVersion = 1
+
 // CrashFingerprint computes the crash fingerprint (version 1, section comment).
 func CrashFingerprint(in CrashInput) CrashResult {
-	r := CrashResult{Version: Version}
+	r := CrashResult{Version: CrashVersion}
 	var b strings.Builder
-	b.WriteString("v" + strconv.Itoa(Version) + "\ncrash\n")
+	b.WriteString("v" + strconv.Itoa(CrashVersion) + "\ncrash\n")
 	typ := strings.ToLower(strings.TrimSpace(in.CrashType))
 	b.WriteString(typ + "\n")
 	var keys []string

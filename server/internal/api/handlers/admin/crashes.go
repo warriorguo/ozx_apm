@@ -102,17 +102,19 @@ func (h *CrashHandler) ListCrashes(w http.ResponseWriter, r *http.Request) {
 func (h *CrashHandler) addTopFrames(ctx context.Context, groups []models.CrashGroup) {
 	sctx, cancel := context.WithTimeout(ctx, crashSymbolTimeout)
 	defer cancel()
+	s := h.symbols
 	for i := range groups {
 		g := &groups[i]
 		if g.SampleStack == "" {
 			continue
 		}
-		threads, _, err := symbolicateStack(sctx, h.symbols, g.SampleStack, symbols.Fallback{AppVersion: g.SampleVersion, ABI: g.SampleABI})
+		top, sym, err := resolveTopFrame(sctx, s, g.SampleStack, g.CrashType, symbols.Fallback{AppVersion: g.SampleVersion, ABI: g.SampleABI})
 		if err != nil {
+			// Once: the remaining groups show addresses.
 			h.logger.Warn("crash list: symbol lookup failed; showing addresses", zap.Error(err))
-			threads, _, _ = symbolicateStack(sctx, nil, g.SampleStack, symbols.Fallback{})
+			s = nil
 		}
-		g.TopFrame, g.Symbolicated = topFrame(threads, g.CrashType)
+		g.TopFrame, g.Symbolicated = top, sym
 	}
 }
 

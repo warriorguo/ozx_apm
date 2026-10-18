@@ -344,6 +344,15 @@ func TestBuildEventIDLookup(t *testing.T) {
 	if ids := args[4].(clickhouse.GroupSet).Value; len(ids) != 2 || ids[1] != "b'c" {
 		t.Fatalf("ids %#v", ids)
 	}
+	// Crashes: no fingerprint filter (APM-7).
+	query, args, err = buildEventIDLookup(EventIDLookup{
+		Table: TableCrashes, AppVersions: []string{"1.0"}, AnyKey: true,
+		MinTime: ts, MaxTime: ts.Add(time.Second), EventIDs: []string{"a"},
+	})
+	if err != nil || query != "SELECT DISTINCT event_id FROM apm_crashes WHERE app_version IN ? AND "+
+		"timestamp >= fromUnixTimestamp64Milli(toInt64(?)) AND timestamp <= fromUnixTimestamp64Milli(toInt64(?)) AND event_id IN ?" || len(args) != 4 {
+		t.Fatalf("any key: %v %s %#v", err, query, args)
+	}
 	for _, bad := range []EventIDLookup{
 		{Table: TableExceptions, AppVersions: []string{"1"}, Keys: []string{"k"}},
 		{AppVersions: []string{"1"}, Keys: []string{"k"}, EventIDs: []string{"a"}},

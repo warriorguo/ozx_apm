@@ -87,10 +87,23 @@ func newIngestHandler(repo EventStore, logger *zap.Logger) *IngestHandler {
 // crashSymbolCacheSize: resolved addresses kept by the ingest symbolizer.
 const crashSymbolCacheSize = 20000
 
-// crashSymbolTimeout bounds the symbol lookups of one batch's crashes: on
-// timeout or error the crash is fingerprinted by address (it groups per
-// build) and stored anyway.
+// crashSymbolTimeout bounds the symbol lookups of one batch's crashes
+// (together): on timeout or error the remaining crashes of the batch are
+// fingerprinted by address (they group per build) and stored anyway.
 const crashSymbolTimeout = 3 * time.Second
+
+// crashSymbols is the symbol budget of one batch.
+type crashSymbols struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+	failed bool
+}
+
+func (c *crashSymbols) close() {
+	if c.cancel != nil {
+		c.cancel()
+	}
+}
 
 // maxResolvedFramesPerThread: native in-app frames per thread looked up at
 // ingest (the fingerprint uses the first 3 distinct ones).
@@ -98,9 +111,12 @@ const maxResolvedFramesPerThread = 16
 
 // crashResolver looks up the in-app native frames of a crash in the
 // uploaded symbols and returns the resolver for its fingerprint.
-func (h *IngestHandler) crashResolver(ctx context.Context, c *models.Crash, threads []fingerprint.CrashThread) processor.CrashResolver {
-	if h.symbols == nil {
+func (h *IngestHandler) crashResolver(parent context.Context, budget *crashSymbols, c *models.Crash, threads []fingerprint.CrashThread) processor.CrashResolver {
+	if h.symbols == nil || budget.failed {
 		return nil
+	}
+	if budget.ctx == nil {
+		budget.ctx, budget.cancel = context.WithTimeout(parent, crashSymbolTimeout)
 	}
 	type key struct {
 		module, buildID string
@@ -124,11 +140,10 @@ func (h *IngestHandler) crashResolver(ctx context.Context, c *models.Crash, thre
 	if len(frames) == 0 {
 		return nil
 	}
-	lctx, cancel := context.WithTimeout(ctx, crashSymbolTimeout)
-	defer cancel()
-	got, err := h.symbols.Resolve(lctx, frames, symbols.Fallback{AppVersion: c.AppVersion, ABI: c.ABI})
+	got, err := h.symbols.Resolve(budget.ctx, frames, symbols.Fallback{AppVersion: c.AppVersion, ABI: c.ABI})
 	if err != nil {
-		h.logger.Warn("crash symbol lookup failed; fingerprinting by address", zap.Error(err))
+		budget.failed = true
+		h.logger.Warn("crash symbol lookup failed; fingerprinting the batch's remaining crashes by address", zap.Error(err))
 	}
 	names := map[key]string{}
 	for i, r := range got {
@@ -240,6 +255,7 @@ func (h *IngestHandler) IngestEvents(w http.ResponseWriter, r *http.Request) {
 		ctxStats    processor.ContextStats
 		propStats   processor.ContextStats
 		detailStats processor.ContextStats
+		symBudget   crashSymbols
 		rejTypes    map[string]int
 		moreErrors  int
 		addError    = func(msg string) {
@@ -262,6 +278,7 @@ func (h *IngestHandler) IngestEvents(w http.ResponseWriter, r *http.Request) {
 		sdkVersion = r.Header.Get(SDKVersionHeader)
 		clientIP   = r.RemoteAddr // In production, extract from X-Forwarded-For
 	)
+	defer symBudget.close()
 	if salvaged {
 		addError("batch was not valid JSON; salvaged the well-formed events")
 	}
@@ -385,7 +402,7 @@ func (h *IngestHandler) IngestEvents(w http.ResponseWriter, r *http.Request) {
 			// lookup, which matches on the stored fingerprint.
 			detailStats.Add(processor.NormalizeCrash(&event))
 			threads := fingerprint.ParseCrashStack(event.Stack)
-			processor.ApplyCrashFingerprint(&event, threads, h.crashResolver(r.Context(), &event, threads))
+			processor.ApplyCrashFingerprint(&event, threads, h.crashResolver(r.Context(), &symBudget, &event, threads))
 			crashes = append(crashes, event)
 
 		case models.EventTypeCustomEvent:

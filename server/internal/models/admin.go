@@ -89,7 +89,8 @@ type CrashGroup struct {
 	Foreground   int64  `json:"foreground"`   // crashes in the foreground
 	Symbolicated bool   `json:"symbolicated"` // the top frame was named from uploaded symbols
 
-	// The latest crash's stack, version and ABI, for the top frame.
+	// The latest crash's id, stack, version and ABI, for the top frame.
+	SampleEventID string `json:"-"`
 	SampleStack   string `json:"-"`
 	SampleVersion string `json:"-"`
 	SampleABI     string `json:"-"`

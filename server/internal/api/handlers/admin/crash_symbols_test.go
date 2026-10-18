@@ -96,3 +96,17 @@ func TestSymbolicateStack(t *testing.T) {
 		t.Errorf("%+v", threads[0].Frames[0])
 	}
 }
+
+// The crash list resolves only the top frame.
+func TestResolveTopFrame(t *testing.T) {
+	store := &stubSymbolStore{ref: symbols.UploadRef{BuildID: "0d65a2d2978f75f06db6c72ff3cf4e5a0c6a2077", UploadID: "u1", Module: "libil2cpp.so"}}
+	top, sym, err := resolveTopFrame(context.Background(), symbols.NewSymbolizer(store, 10), adminCrashStack, "native", symbols.Fallback{})
+	if err != nil || !sym || top != "ApmTestDriver.DeepC(System.Int32) (Assets/Scripts/ApmTestDriver.cs:812)" {
+		t.Fatalf("%q %v %v", top, sym, err)
+	}
+	store.fail = errors.New("down")
+	top, sym, err = resolveTopFrame(context.Background(), symbols.NewSymbolizer(store, 10), adminCrashStack, "native", symbols.Fallback{})
+	if err == nil || sym || top != "libil2cpp.so+0x5417bc" {
+		t.Fatalf("on error: %q %v %v", top, sym, err)
+	}
+}

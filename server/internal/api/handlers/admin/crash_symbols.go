@@ -3,6 +3,7 @@ package admin
 import (
 	"context"
 	"strconv"
+	"strings"
 
 	"github.com/warriorguo/ozx_apm/server/internal/fingerprint"
 	"github.com/warriorguo/ozx_apm/server/internal/models"
@@ -98,6 +99,58 @@ func symbolStatus(ctx context.Context, s *symbols.Symbolizer, frames []symbols.F
 		out = append(out, st)
 	}
 	return out, nil
+}
+
+// resolveTopFrame symbolicates only the top frame of a stack (the crash
+// list): one address per group instead of the whole stack.
+func resolveTopFrame(ctx context.Context, s *symbols.Symbolizer, stack, crashType string, fb symbols.Fallback) (string, bool, error) {
+	threads, _, _ := symbolicateStack(ctx, nil, stack, fb)
+	f := topFrameOf(threads, crashType)
+	if f == nil {
+		return "", false, nil
+	}
+	if s != nil && f.Native && f.InApp {
+		pc, err := strconv.ParseUint(strings.TrimPrefix(f.PC, "0x"), 16, 64)
+		if err == nil {
+			got, err := s.Resolve(ctx, []symbols.Frame{{Module: fingerprint.ModuleBaseName(f.Module), BuildID: f.BuildID, PC: pc, ReturnAddress: f.Index > 0}}, fb)
+			if err != nil {
+				return FormatCrashFrame(*f), false, err
+			}
+			if r, ok := got[0]; ok {
+				f.Function, f.Offset, f.File, f.Line, f.Symbolicated, f.SymbolsBy = r.Name, r.Offset, r.File, int(r.Line), true, r.By
+			}
+		}
+	}
+	return FormatCrashFrame(*f), f.Symbolicated, nil
+}
+
+// topFrameOf returns the first in-app frame of the thread that matters
+// (as topFrame), nil without one.
+func topFrameOf(threads []models.CrashThreadView, crashType string) *models.CrashFrameView {
+	pick := func(t *models.CrashThreadView) *models.CrashFrameView {
+		for i := range t.Frames {
+			if t.Frames[i].InApp {
+				return &t.Frames[i]
+			}
+		}
+		return nil
+	}
+	if crashType == fingerprint.CrashTypeANR {
+		for i := range threads {
+			if threads[i].Name == "UnityMain" {
+				if f := pick(&threads[i]); f != nil {
+					return f
+				}
+				break
+			}
+		}
+	}
+	for i := range threads {
+		if threads[i].Crashed {
+			return pick(&threads[i])
+		}
+	}
+	return nil
 }
 
 // topFrame describes the first in-app frame of the thread that matters

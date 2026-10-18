@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
@@ -77,10 +78,16 @@ func bearerReason(header string, token []byte) string {
 		return "missing Authorization header"
 	case !strings.HasPrefix(header, prefix):
 		return "Authorization is not a bearer token"
-	case subtle.ConstantTimeCompare([]byte(strings.TrimPrefix(header, prefix)), token) != 1:
+	case !tokenEqual(strings.TrimPrefix(header, prefix), token):
 		return "wrong token"
 	}
 	return ""
+}
+
+// tokenEqual compares SHA-256 digests in constant time (no length leak).
+func tokenEqual(got string, token []byte) bool {
+	a, b := sha256.Sum256([]byte(got)), sha256.Sum256(token)
+	return subtle.ConstantTimeCompare(a[:], b[:]) == 1
 }
 
 var errTooLarge = errors.New("too large")
@@ -133,6 +140,14 @@ func (h *SymbolHandler) Part(w http.ResponseWriter, r *http.Request) {
 		writePrivacyError(w, http.StatusInternalServerError, "repository not configured")
 		return
 	}
+	// The slot first: the decoded part (up to 16 MB of JSON) is what costs memory.
+	select {
+	case h.slots <- struct{}{}:
+		defer func() { <-h.slots }()
+	case <-r.Context().Done():
+		writePrivacyError(w, http.StatusServiceUnavailable, "busy")
+		return
+	}
 	body, err := readBody(r, symbols.MaxPartBodyBytes, symbols.MaxPartDecodedBytes)
 	if err != nil {
 		h.badBody(w, err)
@@ -146,13 +161,6 @@ func (h *SymbolHandler) Part(w http.ResponseWriter, r *http.Request) {
 	funcs, lines, err := p.Decode()
 	if err != nil {
 		writePrivacyError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	select {
-	case h.slots <- struct{}{}:
-		defer func() { <-h.slots }()
-	case <-r.Context().Done():
-		writePrivacyError(w, http.StatusServiceUnavailable, "busy")
 		return
 	}
 	if err := h.store.InsertSymbolRows(r.Context(), p.BuildID, p.UploadID, funcs, lines); err != nil {
