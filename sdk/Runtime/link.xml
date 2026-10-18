@@ -1,0 +1,14 @@
+<!--
+  OZX APM: keep the whole SDK under managed code stripping (APM-7).
+
+  The SDK reaches some of its code only indirectly (event types serialized
+  by type tests, the UnityEngine log callback, AndroidJavaObject calls into
+  the Android framework), and a stripped SDK fails silently in a release
+  build. Unity does not read link.xml files inside packages on every
+  version, so OzxApm.Editor.LinkXmlProvider also hands this content to the
+  linker (IUnityLinkerProcessor); a copy in the game's Assets folder is not
+  needed. Cost: the SDK's own code is kept whole (about 100 KB of IL).
+-->
+<linker>
+  <assembly fullname="OzxApm" preserve="all"/>
+</linker>
