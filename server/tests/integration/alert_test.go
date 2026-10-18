@@ -79,7 +79,7 @@ type alertEnv struct {
 func alertConfig() alert.Config {
 	cfg := config.AlertConfig{}
 	// The defaults of config.Load.
-	cfg.Interval, cfg.NewIssueMaxPerCycle, cfg.NewIssueWindow, cfg.SweepInterval = time.Minute, 10, 26*time.Hour, 6*time.Hour
+	cfg.Interval, cfg.NewIssueMaxPerCycle, cfg.NewIssueMaxPerHour, cfg.NewIssueWindow, cfg.SweepInterval = time.Minute, 10, 30, 26*time.Hour, 6*time.Hour
 	cfg.CrashRateWindow, cfg.CrashRateBaselineWindow, cfg.CrashRateCheckInterval = time.Hour, 24*time.Hour, 5*time.Minute
 	cfg.CrashRateMinSessions, cfg.CrashRateMinCrashed, cfg.CrashRateMinRate, cfg.CrashRateFactor, cfg.CrashRateCooldown = 50, 5, 0.005, 2, 6*time.Hour
 	cfg.StartupEnabled, cfg.StartupWindow, cfg.StartupCheckInterval = true, 7*24*time.Hour, time.Hour

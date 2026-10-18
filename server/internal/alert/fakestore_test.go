@@ -126,17 +126,36 @@ func (s *fakeStore) candidates(kind string, from time.Time, includeDev bool, ski
 	return out
 }
 
-func (s *fakeStore) AllIssueFingerprints(ctx context.Context, kind string, includeDev bool, limit int) ([]models.IssueCandidate, error) {
+func (s *fakeStore) RecordBaseline(ctx context.Context, kind string, includeDev bool, instance string) (uint64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := s.err("AllIssueFingerprints"); err != nil {
-		return nil, err
+	if err := s.err("RecordBaseline"); err != nil {
+		return 0, err
 	}
-	c := s.candidates(kind, time.Time{}, includeDev, false)
-	if len(c) > limit {
-		c = c[:limit]
+	for _, c := range s.candidates(kind, time.Time{}, includeDev, false) {
+		s.alerts = append(s.alerts, models.AlertRecord{AlertKey: newIssueKey(kind, c.Fingerprint), At: time.Now(),
+			Status: models.AlertKnown, Instance: instance, Type: TypeNewIssue, Kind: kind, Fingerprint: c.Fingerprint,
+			AppVersion: c.FirstVersion, Error: "baseline"})
 	}
-	return c, nil
+	n := uint64(0)
+	for _, a := range s.alerts {
+		if a.Type == TypeNewIssue && a.Kind == kind && a.Error == "baseline" {
+			n++
+		}
+	}
+	return n, nil
+}
+
+func (s *fakeStore) CountRecentAlerts(ctx context.Context, alertType, kind string, since time.Time) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	keys := map[string]bool{}
+	for _, a := range s.alerts {
+		if a.Type == alertType && a.Kind == kind && a.Status == models.AlertPending && !a.At.Before(since) {
+			keys[a.AlertKey] = true
+		}
+	}
+	return len(keys), nil
 }
 
 func (s *fakeStore) NewIssueCandidates(ctx context.Context, kind string, from time.Time, includeDev bool, limit int) ([]models.IssueCandidate, error) {

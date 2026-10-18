@@ -22,6 +22,7 @@ func ConfigFrom(c config.AlertConfig) Config {
 		Interval:                atLeast(c.Interval, MinInterval),
 		IncludeDevBuilds:        c.IncludeDevBuilds,
 		NewIssueMaxPerCycle:     c.NewIssueMaxPerCycle,
+		NewIssueMaxPerHour:      c.NewIssueMaxPerHour,
 		NewIssueWindow:          atLeast(c.NewIssueWindow, time.Hour),
 		SweepInterval:           atLeast(c.SweepInterval, 10*time.Minute),
 		CrashRateWindow:         atLeast(c.CrashRateWindow, 5*time.Minute),
@@ -41,6 +42,9 @@ func ConfigFrom(c config.AlertConfig) Config {
 	}
 	if cfg.NewIssueMaxPerCycle < 1 {
 		cfg.NewIssueMaxPerCycle = 1
+	}
+	if cfg.NewIssueMaxPerHour < cfg.NewIssueMaxPerCycle {
+		cfg.NewIssueMaxPerHour = cfg.NewIssueMaxPerCycle
 	}
 	if cfg.CrashRateMinSessions < 1 {
 		cfg.CrashRateMinSessions = 1

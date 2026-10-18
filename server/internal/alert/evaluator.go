@@ -46,7 +46,8 @@ import (
 // Store is what the evaluator needs from ClickHouse (*storage.Repository).
 type Store interface {
 	AlertBaselineDone(ctx context.Context, key string) (bool, error)
-	AllIssueFingerprints(ctx context.Context, kind string, includeDev bool, limit int) ([]models.IssueCandidate, error)
+	RecordBaseline(ctx context.Context, kind string, includeDev bool, instance string) (uint64, error)
+	CountRecentAlerts(ctx context.Context, alertType, kind string, since time.Time) (int, error)
 	NewIssueCandidates(ctx context.Context, kind string, from time.Time, includeDev bool, limit int) ([]models.IssueCandidate, error)
 	ResolvedIssues(ctx context.Context, kind string, limit int) ([]models.IssueState, error)
 	IssueHits(ctx context.Context, kind string, fingerprints []string, from time.Time, includeDev bool) ([]models.IssueVersionHit, error)
@@ -68,6 +69,7 @@ type Config struct {
 	IncludeDevBuilds bool
 
 	NewIssueMaxPerCycle int
+	NewIssueMaxPerHour  int
 	NewIssueWindow      time.Duration
 	SweepInterval       time.Duration
 
@@ -93,8 +95,11 @@ const (
 	retention = 31 * 24 * time.Hour
 	// maxCandidates bounds the new issues read per kind and evaluation.
 	maxCandidates = 200
-	// maxBaseline bounds the fingerprints recorded by a baseline.
-	maxBaseline = 200000
+	// digestInterval: at most one new-issue digest per kind this often.
+	digestInterval = 15 * time.Minute
+	// resolvedBatch: resolved issues checked per regression query (bounds
+	// the query size: crash fingerprints come from the client).
+	resolvedBatch = 200
 	// maxResolved bounds the resolved issues checked for regressions.
 	maxResolved = 1000
 	// maxSendsPerCycle bounds the webhook requests per evaluation.
@@ -104,8 +109,10 @@ const (
 	// sendWindow: pending alerts older than this are no longer sent.
 	sendWindow = 24 * time.Hour
 	// claimStale: a claim without an outcome after this long is a failed
-	// attempt (its instance stopped while sending).
-	claimStale = 2 * time.Minute
+	// attempt (its instance stopped while sending). Longer than an
+	// evaluation can last, so a slow but live instance is never overtaken;
+	// that instance also skips claims older than claimStale - WebhookTimeout.
+	claimStale = cycleTimeout + time.Minute
 	// claimSettle: the wait between writing claims and reading them back, so
 	// that a concurrent instance's claims are visible (inserts are
 	// synchronous; this only covers clock skew and in-flight inserts).
@@ -256,34 +263,20 @@ func (e *Evaluator) ensureBaseline(ctx context.Context, kind string) error {
 		e.baselineDone[kind] = true
 		return nil
 	}
-	fps, err := e.store.AllIssueFingerprints(ctx, kind, e.cfg.IncludeDevBuilds, maxBaseline)
+	// One INSERT ... SELECT in ClickHouse, every fingerprint, no limit. The
+	// marker last: if this fails, the next evaluation repeats the baseline
+	// (duplicate known rows are harmless).
+	n, err := e.store.RecordBaseline(ctx, kind, e.cfg.IncludeDevBuilds, e.instance)
 	if err != nil {
 		return err
 	}
-	now := e.now()
-	recs := make([]models.AlertRecord, 0, len(fps)+1)
-	for _, c := range fps {
-		recs = append(recs, models.AlertRecord{AlertKey: newIssueKey(kind, c.Fingerprint), At: now, Status: models.AlertKnown,
-			Instance: e.instance, Type: TypeNewIssue, Kind: kind, Fingerprint: c.Fingerprint, AppVersion: c.FirstVersion, Error: "baseline"})
-	}
-	// The marker last: if an insert fails, the next evaluation repeats the
-	// baseline (duplicate known rows are harmless).
-	for start := 0; start < len(recs); start += 10000 {
-		end := start + 10000
-		if end > len(recs) {
-			end = len(recs)
-		}
-		if err := e.store.InsertAlertRecords(ctx, recs[start:end]); err != nil {
-			return err
-		}
-	}
-	if err := e.store.InsertAlertRecords(ctx, []models.AlertRecord{{AlertKey: key, At: now, Status: models.AlertKnown,
-		Instance: e.instance, Type: typeBaselineMarker, Kind: kind, Error: fmt.Sprintf("%d fingerprints", len(fps))}}); err != nil {
+	if err := e.store.InsertAlertRecords(ctx, []models.AlertRecord{{AlertKey: key, At: e.now(), Status: models.AlertKnown,
+		Instance: e.instance, Type: typeBaselineMarker, Kind: kind, Error: fmt.Sprintf("%d fingerprints", n)}}); err != nil {
 		return err
 	}
 	e.baselineDone[kind] = true
 	e.logger.Info("alert: baseline recorded; existing issues are not reported as new",
-		zap.String("kind", kind), zap.Int("fingerprints", len(fps)))
+		zap.String("kind", kind), zap.Uint64("fingerprints", n))
 	return nil
 }
 
@@ -296,15 +289,41 @@ func (e *Evaluator) detectNewIssues(ctx context.Context, kind string, now time.T
 	if err != nil || len(cands) == 0 {
 		return err
 	}
-	max := e.cfg.NewIssueMaxPerCycle
-	if max < 1 {
-		max = 1
+	// Individual alerts: at most NewIssueMaxPerCycle now and
+	// NewIssueMaxPerHour in the last hour (across evaluations, restarts and
+	// instances: counted in the outbox).
+	individual := e.cfg.NewIssueMaxPerCycle
+	recent, err := e.store.CountRecentAlerts(ctx, TypeNewIssue, kind, now.Add(-time.Hour))
+	if err != nil {
+		return err
+	}
+	if left := e.cfg.NewIssueMaxPerHour - recent; left < individual {
+		individual = left
+	}
+	if individual < 0 {
+		individual = 0
+	}
+	if individual > len(cands) {
+		individual = len(cands)
+	}
+	rest := cands[individual:]
+	// The rest: one digest per kind per digestInterval; beyond that they are
+	// only recorded (the digest already sent says a flood is on).
+	digest := false
+	dkey := digestKey(kind, now)
+	if len(rest) > 0 {
+		recentDigests, err := e.store.CountRecentAlerts(ctx, TypeNewIssueDigest, kind, now.Add(-digestInterval))
+		if err != nil {
+			return err
+		}
+		digest = recentDigests == 0
 	}
 	var recs []models.AlertRecord
 	for i, c := range cands {
 		rec := models.AlertRecord{AlertKey: newIssueKey(kind, c.Fingerprint), At: now, Instance: e.instance,
 			Type: TypeNewIssue, Kind: kind, Fingerprint: c.Fingerprint, AppVersion: c.FirstVersion}
-		if i < max {
+		switch {
+		case i < individual:
 			a := newIssueAlert(c, now)
 			a.Key = rec.AlertKey
 			payload, err := json.Marshal(a)
@@ -312,30 +331,35 @@ func (e *Evaluator) detectNewIssues(ctx context.Context, kind string, now time.T
 				return err
 			}
 			rec.Status, rec.Payload = models.AlertPending, string(payload)
-		} else {
-			rec.Status, rec.Error = models.AlertKnown, "suppressed: in the digest of "+digestKey(kind, cands[max:])
+		case digest:
+			rec.Status, rec.Error = models.AlertKnown, "suppressed: in "+dkey
+		default:
+			rec.Status, rec.Error = models.AlertKnown, "suppressed: a digest was sent less than "+digestInterval.String()+" ago"
 		}
 		recs = append(recs, rec)
 	}
-	if len(cands) > max {
-		a := digestAlert(kind, cands[max:], now)
+	if digest {
+		a := digestAlert(kind, rest, len(cands) == maxCandidates, now)
+		a.Key = dkey
 		payload, err := json.Marshal(a)
 		if err != nil {
 			return err
 		}
-		recs = append(recs, models.AlertRecord{AlertKey: a.Key, At: now, Status: models.AlertPending, Instance: e.instance,
+		recs = append(recs, models.AlertRecord{AlertKey: dkey, At: now, Status: models.AlertPending, Instance: e.instance,
 			Type: TypeNewIssueDigest, Kind: kind, Payload: string(payload)})
 	}
 	if err := e.store.InsertAlertRecords(ctx, recs); err != nil {
 		return err
 	}
 	e.logger.Info("alert: new issues detected", zap.String("kind", kind), zap.Int("count", len(cands)),
-		zap.Int("individual", min(len(cands), max)))
+		zap.Int("individual", individual), zap.Bool("digest", digest))
 	return nil
 }
 
-func digestKey(kind string, rest []models.IssueCandidate) string {
-	return TypeNewIssueDigest + ":" + kind + ":" + rest[0].Fingerprint
+// digestKey: one digest per kind and digestInterval bucket, the same for
+// every instance evaluating in that bucket.
+func digestKey(kind string, now time.Time) string {
+	return fmt.Sprintf("%s:%s:%d", TypeNewIssueDigest, kind, now.Truncate(digestInterval).Unix())
 }
 
 func newIssueAlert(c models.IssueCandidate, now time.Time) Alert {
@@ -376,7 +400,7 @@ func newIssueAlert(c models.IssueCandidate, now time.Time) Alert {
 	}
 }
 
-func digestAlert(kind string, rest []models.IssueCandidate, now time.Time) Alert {
+func digestAlert(kind string, rest []models.IssueCandidate, more bool, now time.Time) Alert {
 	var examples []string
 	for i, c := range rest {
 		if i == 5 {
@@ -388,13 +412,18 @@ func digestAlert(kind string, rest []models.IssueCandidate, now time.Time) Alert
 	if kind == models.IssueKindCrash {
 		path = "/crashes"
 	}
+	count := fmt.Sprintf("%d", len(rest))
+	if more {
+		count = "At least " + count
+	}
 	return Alert{
-		Key: digestKey(kind, rest), Type: TypeNewIssueDigest, Severity: SeverityWarning,
-		Title: fmt.Sprintf("%d more new %ss (not reported one by one)", len(rest), kindLabel(kind)),
+		Type: TypeNewIssueDigest, Severity: SeverityWarning,
+		Title: fmt.Sprintf("%s more new %ss (not reported one by one)", count, kindLabel(kind)),
 		Kind:  kind,
 		Facts: []Fact{
 			{"Examples", strings.Join(examples, "; ")},
-			{"Why", fmt.Sprintf("more new %ss than the per-evaluation limit; often a new fingerprint algorithm or a broken build", kindLabel(kind))},
+			{"Why", fmt.Sprintf("more new %ss than the alert limits (per evaluation, per hour); often a new fingerprint algorithm or a broken build. "+
+				"Further ones in the next %s are only recorded; see the list in the admin", kindLabel(kind), digestInterval)},
 		},
 		Metrics:   map[string]float64{"count": float64(len(rest))},
 		AdminPath: path, DetectedAt: now.UTC(),
@@ -476,9 +505,20 @@ func (e *Evaluator) detectRegressions(ctx context.Context, kind string, now time
 	if earliest.After(from) {
 		from = earliest
 	}
-	hits, err := e.store.IssueHits(ctx, kind, fps, from, e.cfg.IncludeDevBuilds)
-	if err != nil || len(hits) == 0 {
-		return err
+	var hits []models.IssueVersionHit
+	for start := 0; start < len(fps); start += resolvedBatch {
+		end := start + resolvedBatch
+		if end > len(fps) {
+			end = len(fps)
+		}
+		batch, err := e.store.IssueHits(ctx, kind, fps[start:end], from, e.cfg.IncludeDevBuilds)
+		if err != nil {
+			return err
+		}
+		hits = append(hits, batch...)
+	}
+	if len(hits) == 0 {
+		return nil
 	}
 	order := VersionOrder{FirstSeen: map[string]time.Time{}}
 	if needsTimeOrder(states, hits) {
@@ -817,6 +857,12 @@ func (e *Evaluator) send(ctx context.Context) error {
 	if len(claims) == 0 {
 		return nil
 	}
+	// Stamped right before the insert; the winner is decided by the time
+	// ClickHouse stored each claim (inserted_at), not by these clocks.
+	claimAt := e.now()
+	for i := range claims {
+		claims[i].At = claimAt
+	}
 	if err := e.store.InsertAlertRecords(ctx, claims); err != nil {
 		return err
 	}
@@ -839,6 +885,11 @@ func (e *Evaluator) send(ctx context.Context) error {
 		}
 		if ctx.Err() != nil {
 			return ctx.Err()
+		}
+		if e.now().Sub(claimAt) > claimStale-WebhookTimeout {
+			// Another instance may soon take this claim as stale: leave it.
+			e.logger.Warn("alert: claim too old to send, left for a later attempt", zap.String("key", key))
+			continue
 		}
 		o := byKey[key]
 		rec := models.AlertRecord{AlertKey: key, Attempt: uint16(attempts[key]), Instance: e.instance, Type: o.Type}

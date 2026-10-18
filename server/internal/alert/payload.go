@@ -120,6 +120,8 @@ func (a Alert) Body(format, adminBaseURL string) ([]byte, error) {
 			"content":  map[string]string{"text": text},
 		})
 	default:
+		// The key contains a fingerprint and a version (game data).
+		a.Key = CleanText(a.Key, 400)
 		return json.Marshal(Payload{Schema: PayloadSchema, Alert: a, URL: link, Text: text})
 	}
 }

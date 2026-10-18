@@ -129,7 +129,7 @@ export function Crashes() {
                   </span>
                 </div>
 
-                <IssueStatusControl kind="crash" fingerprint={crashDetail.fingerprint} info={crashDetail} />
+                <IssueStatusControl key={crashDetail.fingerprint} kind="crash" fingerprint={crashDetail.fingerprint} info={crashDetail} />
 
                 <div>
                   <p className="text-xs text-gray-500 mb-1">Count</p>

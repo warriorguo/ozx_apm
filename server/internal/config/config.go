@@ -88,10 +88,12 @@ type AlertConfig struct {
 	IncludeDevBuilds bool `mapstructure:"include_dev_builds"`
 
 	// New issues: at most NewIssueMaxPerCycle individual alerts per
-	// evaluation, the rest in one digest. NewIssueWindow is how far back each
+	// evaluation and NewIssueMaxPerHour per hour, the rest in one digest per
+	// 15 minutes. NewIssueWindow is how far back each
 	// evaluation looks for rows (by event time); every SweepInterval the
 	// whole retention is searched instead (late uploads).
 	NewIssueMaxPerCycle int           `mapstructure:"new_issue_max_per_cycle"`
+	NewIssueMaxPerHour  int           `mapstructure:"new_issue_max_per_hour"`
 	NewIssueWindow      time.Duration `mapstructure:"new_issue_window"`
 	SweepInterval       time.Duration `mapstructure:"sweep_interval"`
 
@@ -127,6 +129,7 @@ var alertDefaults = map[string]interface{}{
 	"interval":                        "60s",
 	"include_dev_builds":              false,
 	"new_issue_max_per_cycle":         10,
+	"new_issue_max_per_hour":          30,
 	"new_issue_window":                "26h",
 	"sweep_interval":                  "6h",
 	"crash_rate_window":               "1h",

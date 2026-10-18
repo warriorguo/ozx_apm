@@ -493,6 +493,7 @@ CREATE TABLE IF NOT EXISTS apm_alerts (
     fingerprint String,
     app_version String,
     payload String,
-    error String
+    error String,
+    inserted_at DateTime64(3) DEFAULT now64(3)
 ) ENGINE = MergeTree()
 ORDER BY (alert_key, at);

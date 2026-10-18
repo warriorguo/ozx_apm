@@ -136,7 +136,7 @@ function Summary({ detail: d }: { detail: Detail }) {
         <Stat label="Last seen" value={`${formatDateTime(d.last_seen)}${d.last_version ? ` · ${d.last_version}` : ''}`} />
       </div>
       <div className="mt-4">
-        <IssueStatusControl kind="exception" fingerprint={d.fingerprint} info={d} />
+        <IssueStatusControl key={d.fingerprint} kind="exception" fingerprint={d.fingerprint} info={d} />
       </div>
     </div>
   )

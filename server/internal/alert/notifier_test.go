@@ -148,3 +148,31 @@ func TestAdminURL(t *testing.T) {
 		t.Errorf("crash path %q", got)
 	}
 }
+
+// A redirect is not a delivery.
+func TestNotifier_RedirectIsAFailure(t *testing.T) {
+	n, _ := NewNotifier(secretURL, FormatGeneric, "")
+	calls := 0
+	n.client.Transport = roundTrip(func(r *http.Request) (*http.Response, error) {
+		calls++
+		if calls > 1 {
+			return respond(200, ""), nil
+		}
+		resp := respond(302, "")
+		resp.Header.Set("Location", "https://elsewhere.example.com/")
+		return resp, nil
+	})
+	if err := n.Send(context.Background(), testAlert()); err == nil || !strings.Contains(err.Error(), "302") || calls != 1 {
+		t.Fatalf("redirect: %v after %d requests", err, calls)
+	}
+}
+
+// The generic body's alert_key carries game data (fingerprint, version).
+func TestBody_KeyIsInert(t *testing.T) {
+	a := testAlert()
+	a.Key = "crash_rate_spike:<!channel> @all:1"
+	b, _ := a.Body(FormatGeneric, "")
+	if strings.Contains(string(b), "@all") || strings.Contains(string(b), "<!channel>") || strings.Contains(string(b), `<!channel`) {
+		t.Fatalf("body %s", b)
+	}
+}

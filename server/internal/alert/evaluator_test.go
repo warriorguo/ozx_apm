@@ -19,7 +19,7 @@ var t0 = time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC)
 
 func testConfig() Config {
 	return Config{
-		Interval: time.Minute, NewIssueMaxPerCycle: 10, NewIssueWindow: 26 * time.Hour, SweepInterval: 6 * time.Hour,
+		Interval: time.Minute, NewIssueMaxPerCycle: 10, NewIssueMaxPerHour: 30, NewIssueWindow: 26 * time.Hour, SweepInterval: 6 * time.Hour,
 		CrashRateWindow: time.Hour, CrashRateBaselineWindow: 24 * time.Hour, CrashRateCheckInterval: 5 * time.Minute,
 		CrashRateMinSessions: 50, CrashRateMinCrashed: 5, CrashRateMinRate: 0.005, CrashRateFactor: 2, CrashRateCooldown: 6 * time.Hour,
 		StartupEnabled: true, StartupWindow: 7 * 24 * time.Hour, StartupCheckInterval: time.Hour,
@@ -164,6 +164,55 @@ func TestNewIssue_StormDigest(t *testing.T) {
 }
 
 // A late upload: rows older than the fast window are found by the sweep.
+// A sustained flood across evaluations: individual alerts are capped per
+// hour, digests to one per 15 minutes; every fingerprint is recorded.
+func TestNewIssue_StormAcrossEvaluations(t *testing.T) {
+	store := newFakeStore()
+	c := &clock{t0}
+	sender := &fakeSender{}
+	e := newTestEvaluator(store, sender, c, "a")
+	e.Cycle(context.Background())
+	n := 0
+	flood := func(at time.Time) {
+		for i := 0; i < 15; i++ {
+			n++
+			store.add(models.IssueKindException, occ{fp: fmt.Sprintf("f%03d", n), version: "9.0.0", session: "s", at: at, title: "E"})
+		}
+	}
+	want := []int{11, 10, 10, 0, 1} // 10 + digest, 10, 10, hour cap reached, a digest 15+ min after the first
+	for i, minute := range []int{1, 2, 3, 4, 20} {
+		c.t = t0.Add(time.Duration(minute) * time.Minute)
+		flood(c.t)
+		before := sender.count()
+		e.Cycle(context.Background())
+		if got := sender.count() - before; got != want[i] {
+			t.Fatalf("evaluation at +%d min sent %d, want %d (%v)", minute, got, want[i], sentTypes(sender))
+		}
+	}
+	if known := len(store.known(models.IssueKindException)); known != n {
+		t.Errorf("known fingerprints %d, want %d", known, n)
+	}
+}
+
+// A slow instance does not send a claim that another instance may already
+// treat as stale.
+func TestSend_SkipsClaimsTooOldToSend(t *testing.T) {
+	store := newFakeStore()
+	c := &clock{t0}
+	sender := &fakeSender{}
+	e := newTestEvaluator(store, sender, c, "a")
+	rec, _ := NewTestAlertRecord("x", t0)
+	store.InsertAlertRecords(context.Background(), []models.AlertRecord{rec})
+	e.sleep = func(context.Context, time.Duration) error { // the settle wait took very long
+		c.t = c.t.Add(claimStale)
+		return nil
+	}
+	e.send(context.Background())
+	if sender.count() != 0 {
+		t.Fatalf("sent a claim older than claimStale - WebhookTimeout")
+	}
+}
+
 func TestNewIssue_SweepFindsLateUploads(t *testing.T) {
 	store := newFakeStore()
 	c := &clock{t0}
@@ -522,7 +571,7 @@ func TestStartupP95Regression(t *testing.T) {
 // is retried.
 func TestCycle_ErrorsAreContained(t *testing.T) {
 	store := newFakeStore()
-	store.failOn["AllIssueFingerprints"] = errors.New("boom")
+	store.failOn["RecordBaseline"] = errors.New("boom")
 	sender := &fakeSender{}
 	c := &clock{t0}
 	e := newTestEvaluator(store, sender, c, "a")
@@ -532,7 +581,7 @@ func TestCycle_ErrorsAreContained(t *testing.T) {
 	if sender.count() != 1 {
 		t.Fatalf("the test alert was not sent despite the failing baseline")
 	}
-	delete(store.failOn, "AllIssueFingerprints")
+	delete(store.failOn, "RecordBaseline")
 	c.t = t0.Add(time.Minute)
 	e.Cycle(context.Background())
 	if len(store.records(models.AlertKnown)) != 2 {
@@ -550,10 +599,10 @@ func TestNextAttempt(t *testing.T) {
 	}{
 		{"new", models.AlertOutboxEntry{}, 1, false},
 		{"claimed, fresh", models.AlertOutboxEntry{LastClaim: 1, LastClaimAt: now.Add(-time.Minute)}, 0, false},
-		{"claimed, just stale", models.AlertOutboxEntry{LastClaim: 1, LastClaimAt: now.Add(-150 * time.Second)}, 2, false},
-		{"claimed, stale after failures, in backoff", models.AlertOutboxEntry{LastClaim: 3, LastDone: 2, Failed: 2,
-			LastFailedAt: now.Add(-10 * time.Minute), LastClaimAt: now.Add(-3 * time.Minute)}, 0, false},
-		{"claimed, stale", models.AlertOutboxEntry{LastClaim: 1, LastClaimAt: now.Add(-4 * time.Minute)}, 2, false},
+		{"claimed, slow instance still sending", models.AlertOutboxEntry{LastClaim: 1, LastClaimAt: now.Add(-5 * time.Minute)}, 0, false},
+		{"claimed, stale", models.AlertOutboxEntry{LastClaim: 1, LastClaimAt: now.Add(-7 * time.Minute)}, 2, false},
+		{"claimed, stale after failures, in backoff", models.AlertOutboxEntry{LastClaim: 5, LastDone: 4, Failed: 4,
+			LastFailedAt: now.Add(-20 * time.Minute), LastClaimAt: now.Add(-7 * time.Minute)}, 0, false},
 		{"failed once, in backoff", models.AlertOutboxEntry{LastClaim: 1, LastDone: 1, Failed: 1, LastFailedAt: now.Add(-30 * time.Second)}, 0, false},
 		{"failed once", models.AlertOutboxEntry{LastClaim: 1, LastDone: 1, Failed: 1, LastFailedAt: now.Add(-61 * time.Second)}, 2, false},
 		{"failed 3, 3 min ago", models.AlertOutboxEntry{LastClaim: 3, LastDone: 3, Failed: 3, LastFailedAt: now.Add(-3 * time.Minute)}, 0, false},

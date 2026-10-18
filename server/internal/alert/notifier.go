@@ -49,7 +49,12 @@ func NewNotifier(webhookURL, format, adminBaseURL string) (*Notifier, error) {
 		host:         u.Host,
 		format:       format,
 		adminBaseURL: adminBaseURL,
-		client:       &http.Client{Timeout: WebhookTimeout},
+		client: &http.Client{
+			Timeout: WebhookTimeout,
+			// A redirect would turn the POST into a GET without the message
+			// and its 2xx would count as delivered: a 3xx is a failure.
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+		},
 	}, nil
 }
 

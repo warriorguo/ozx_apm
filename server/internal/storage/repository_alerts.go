@@ -63,7 +63,8 @@ const alertsTableDDL = `CREATE TABLE IF NOT EXISTS ` + AlertsTable + ` (
     fingerprint String,
     app_version String,
     payload String,
-    error String
+    error String,
+    inserted_at DateTime64(3) DEFAULT now64(3)
 ) ENGINE = MergeTree()
 ORDER BY (alert_key, at)`
 
@@ -299,7 +300,7 @@ func (r *Repository) IssueHits(ctx context.Context, kind string, fingerprints []
 		WHERE timestamp >= fromUnixTimestamp64Milli(toInt64(?)) AND fingerprint IN ? AND %s
 		GROUP BY fingerprint, app_version
 		ORDER BY fingerprint, app_version
-		LIMIT 10000`, issueCountExpr(kind), table, BuildClause(includeDev))
+		LIMIT 100000`, issueCountExpr(kind), table, BuildClause(includeDev))
 	var hits []models.IssueVersionHit
 	err = r.queryRows(ctx, query, []interface{}{msArg(from), fingerprints}, func(rows driver.Rows) error {
 		var h models.IssueVersionHit
@@ -344,33 +345,45 @@ func (r *Repository) IssueHitSince(ctx context.Context, kind, fingerprint, versi
 	return h, nil
 }
 
-// AllIssueFingerprints returns every fingerprint of the kind in the
-// retained rows (the alerting's baseline), at most limit.
-func (r *Repository) AllIssueFingerprints(ctx context.Context, kind string, includeDev bool, limit int) ([]models.IssueCandidate, error) {
+// RecordBaseline records every fingerprint of the kind in the retained rows
+// as known to the alerting (status known, error "baseline"), in one
+// INSERT ... SELECT run by ClickHouse (no row passes through the server, no
+// limit), and returns how many baseline rows of the kind exist.
+func (r *Repository) RecordBaseline(ctx context.Context, kind string, includeDev bool, instance string) (uint64, error) {
 	table, err := issueTable(kind)
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
 	query := fmt.Sprintf(`
-		SELECT fingerprint, min(timestamp) AS first_seen, argMin(app_version, timestamp)
+		INSERT INTO %s (alert_key, at, status, attempt, instance, type, kind, fingerprint, app_version, payload, error)
+		SELECT concat('new_issue:', ?, ':', fingerprint), now64(3), 'known', 0, ?, 'new_issue', ?, fingerprint,
+			argMin(app_version, timestamp), '', 'baseline'
 		FROM %s
 		WHERE fingerprint != '' AND %s
-		GROUP BY fingerprint
-		ORDER BY first_seen, fingerprint
-		LIMIT ?`, table, BuildClause(includeDev))
-	var out []models.IssueCandidate
-	err = r.queryRows(ctx, query, []interface{}{limit}, func(rows driver.Rows) error {
-		c := models.IssueCandidate{Kind: kind}
-		if err := rows.Scan(&c.Fingerprint, &c.FirstSeen, &c.FirstVersion); err != nil {
-			return err
-		}
-		out = append(out, c)
-		return nil
-	})
-	if err != nil {
-		return nil, fmt.Errorf("%s baseline: %w", kind, err)
+		GROUP BY fingerprint`, AlertsTable, table, BuildClause(includeDev))
+	if err := r.client.conn.Exec(ctx, query, kind, instance, kind); err != nil {
+		return 0, fmt.Errorf("%s baseline: %w", kind, err)
 	}
-	return out, nil
+	var n uint64
+	if err := r.client.conn.QueryRow(ctx, "SELECT count() FROM "+AlertsTable+
+		" WHERE type = 'new_issue' AND kind = ? AND status = 'known' AND error = 'baseline'", kind).Scan(&n); err != nil {
+		return 0, fmt.Errorf("%s baseline count: %w", kind, err)
+	}
+	return n, nil
+}
+
+// CountRecentAlerts counts the alerts of a type and kind detected (a pending
+// row) since the given time: the hourly cap of new-issue alerts and the
+// digest interval.
+func (r *Repository) CountRecentAlerts(ctx context.Context, alertType, kind string, since time.Time) (int, error) {
+	var n uint64
+	err := r.client.conn.QueryRow(ctx, "SELECT uniqExact(alert_key) FROM "+AlertsTable+
+		" WHERE type = ? AND kind = ? AND status = 'pending' AND at >= fromUnixTimestamp64Milli(toInt64(?))",
+		alertType, kind, msArg(since)).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("recent alerts: %w", err)
+	}
+	return int(n), nil
 }
 
 // VersionFirstSeen returns the earliest startup per version in the retained
@@ -578,8 +591,9 @@ func (r *Repository) AlertClaims(ctx context.Context, keys []string) ([]models.A
 		return nil, nil
 	}
 	var out []models.AlertClaim
-	err := r.queryRows(ctx, "SELECT alert_key, toInt64(attempt), at, instance FROM "+AlertsTable+
-		" WHERE alert_key IN ? AND status = 'claimed' ORDER BY alert_key, at, instance", []interface{}{keys},
+	// At is when ClickHouse stored the claim (one clock for every instance).
+	err := r.queryRows(ctx, "SELECT alert_key, toInt64(attempt), inserted_at, instance FROM "+AlertsTable+
+		" WHERE alert_key IN ? AND status = 'claimed' ORDER BY alert_key, inserted_at, instance", []interface{}{keys},
 		func(rows driver.Rows) error {
 			var c models.AlertClaim
 			var attempt int64
@@ -618,7 +632,8 @@ type AlertSummaryRow struct {
 // row), newest first, with their latest status.
 func (r *Repository) ListAlerts(ctx context.Context, limit int) ([]AlertSummaryRow, error) {
 	query := `
-		SELECT alert_key, any(type), any(kind), any(fingerprint), any(app_version),
+		SELECT alert_key, any(type), anyIf(kind, status = 'pending'), anyIf(fingerprint, status = 'pending'),
+			anyIf(app_version, status = 'pending'),
 			minIf(at, status = 'pending') AS created,
 			argMax(status, (at, attempt)), max(at),
 			toInt64(countIf(status IN ('sent', 'failed'))),
