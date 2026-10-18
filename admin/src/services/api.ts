@@ -5,6 +5,7 @@ import type {
   DistributionResponse,
   CrashListResponse,
   CrashDetail,
+  CrashOccurrence,
   ExceptionListResponse,
   FilterParams,
   PaginationParams,
@@ -127,14 +128,23 @@ export async function getCrashDetail(
   }
   return {
     ...data,
-    occurrences: (data.occurrences || []).map((o) => ({
-      ...o,
-      breadcrumbs: o.breadcrumbs || [],
-      context: o.context || {},
-    })),
+    occurrences: (data.occurrences || []).map(normalizeCrashOccurrence),
     version_distribution: data.version_distribution || [],
     device_distribution: data.device_distribution || [],
     os_distribution: data.os_distribution || [],
+    sample: data.sample ? normalizeCrashOccurrence(data.sample) : null,
+    symbols: data.symbols || [],
+  }
+}
+
+// Missing lists and maps (older servers, empty Go slices) read as empty.
+export function normalizeCrashOccurrence(o: CrashOccurrence): CrashOccurrence {
+  return {
+    ...o,
+    breadcrumbs: o.breadcrumbs || [],
+    context: o.context || {},
+    details: o.details || {},
+    threads: (o.threads || []).map((t) => ({ ...t, frames: t.frames || [] })),
   }
 }
 

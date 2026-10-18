@@ -86,6 +86,7 @@ export interface IssueState {
 export interface CrashGroup extends IssueStatusInfo {
   fingerprint: string
   crash_type: string
+  // The latest crash's summary (APM-7), e.g. "SIGSEGV (SEGV_MAPERR) at 0x8 in Game.Load (libil2cpp.so)"
   sample_message: string
   count: number
   session_count: number
@@ -93,6 +94,14 @@ export interface CrashGroup extends IssueStatusInfo {
   last_seen: string
   affected_versions: string[]
   top_devices: string[]
+  // APM-7; absent in responses from servers before it
+  exit_reason?: string
+  signal?: string
+  crash_site?: string
+  // The latest crash's first in-app frame, symbolicated when it is read: "Method (File.cs:12)"
+  top_frame?: string
+  foreground?: number
+  symbolicated?: boolean
 }
 
 export interface CrashListResponse {
@@ -113,6 +122,66 @@ export interface CrashOccurrence {
   // APM-5; absent in responses from servers before it
   build_type?: string
   context?: Record<string, string>
+  // APM-7; absent in responses from servers before it
+  event_id?: string
+  session_id?: string
+  device_id?: string
+  crash_type?: string
+  summary?: string
+  exit_reason?: string
+  exit_status?: number
+  exit_description?: string
+  importance?: number
+  pss_kb?: number
+  rss_kb?: number
+  signal?: string
+  signal_code?: string
+  fault_addr?: string
+  abort_message?: string
+  abi?: string
+  session_ms?: number
+  foreground?: boolean
+  details?: Record<string, string>
+  // The sample only: the stack as sent and its threads, symbolicated
+  stack?: string
+  threads?: CrashThread[]
+}
+
+// A crash stack's thread (APM-7): the crashed one first, then UnityMain and main.
+export interface CrashThread {
+  name: string
+  tid: number
+  crashed: boolean
+  frames: CrashFrame[]
+  omitted: number
+}
+
+// function: the C# method (or C++ function) from the uploaded symbols when
+// symbolicated, else what the device reported; empty: an address only.
+export interface CrashFrame {
+  index: number
+  native: boolean
+  pc?: string
+  module?: string
+  build_id?: string
+  function?: string
+  offset?: number
+  file?: string
+  line?: number
+  in_app: boolean
+  symbolicated: boolean
+  symbols_by?: string
+  raw: string
+}
+
+export interface CrashSymbolStatus {
+  module: string
+  build_id: string
+  found: boolean
+  upload_id?: string
+  uploaded_at?: string
+  line_map: boolean
+  method_map: boolean
 }
 
 export interface VersionDist {
@@ -142,6 +211,10 @@ export interface CrashDetail extends IssueStatusInfo {
   version_distribution: VersionDist[]
   device_distribution: DeviceDist[]
   os_distribution: OSDist[]
+  // APM-7: the latest crash with its stack symbolicated; null without one or from older servers
+  sample?: CrashOccurrence | null
+  fingerprint_version?: number
+  symbols?: CrashSymbolStatus[]
 }
 
 // Exception types

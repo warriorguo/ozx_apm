@@ -156,7 +156,25 @@ describe('API Service', () => {
         version_distribution: [],
         device_distribution: [],
         os_distribution: [],
+        // APM-7: absent from older servers
+        sample: null,
+        symbols: [],
       })
+    })
+
+    it('normalizes the APM-7 sample (threads, frames, details)', async () => {
+      mockGet.mockResolvedValue({
+        data: {
+          fingerprint: 'c',
+          sample: { timestamp: 't', threads: [{ name: 'UnityMain', tid: 1, crashed: true, omitted: 0, frames: null }], details: null },
+          symbols: null,
+        },
+      })
+      const result = await getCrashDetail('c', {})
+      expect(result.sample?.threads?.[0].frames).toEqual([])
+      expect(result.sample?.details).toEqual({})
+      expect(result.sample?.breadcrumbs).toEqual([])
+      expect(result.symbols).toEqual([])
     })
 
     it('normalizes occurrences without context (servers before APM-5)', async () => {

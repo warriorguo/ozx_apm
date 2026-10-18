@@ -2,9 +2,9 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, screen, fireEvent, waitFor } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { MemoryRouter, Route, Routes } from 'react-router-dom'
-import type { ReactNode } from 'react'
 import { FiltersProvider } from '../hooks/useFilters'
 import { Crashes } from './Crashes'
+import { CrashDetail } from './CrashDetail'
 
 const { api } = vi.hoisted(() => ({
   api: {
@@ -21,23 +21,23 @@ vi.mock('../services/api', () => api)
 
 function renderAt(path: string) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-  const wrapper = ({ children }: { children: ReactNode }) => (
+  return render(
     <QueryClientProvider client={client}>
       <MemoryRouter initialEntries={[path]}>
         <FiltersProvider>
           <Routes>
-            <Route path="/crashes" element={children} />
+            <Route path="/crashes" element={<Crashes />} />
+            <Route path="/crashes/detail" element={<CrashDetail />} />
           </Routes>
         </FiltersProvider>
       </MemoryRouter>
-    </QueryClientProvider>
+    </QueryClientProvider>,
   )
-  return render(<Crashes />, { wrapper })
 }
 
 const crash = {
   fingerprint: 'crash-fp',
-  crash_type: 'native_signal',
+  crash_type: 'native',
   sample_message: '',
   count: 12,
   session_count: 12,
@@ -55,9 +55,12 @@ const detail = {
   version_distribution: [],
   device_distribution: [],
   os_distribution: [],
+  sample: null,
+  symbols: [],
 }
 
-// APM-8: crash group state, and the alert's link /crashes?fingerprint=F.
+// APM-8: crash group state, and the alert's link /crashes?fingerprint=F,
+// which opens the group's detail page (APM-7).
 describe('Crashes page (APM-8)', () => {
   beforeEach(() => {
     vi.clearAllMocks()
@@ -81,13 +84,13 @@ describe('Crashes page (APM-8)', () => {
         expect.objectContaining({ kind: 'crash', fingerprint: 'crash-fp', status: 'resolved', resolved_in_version: '3.0.1' })
       )
     )
-    // The list and the detail are reloaded.
-    await waitFor(() => expect(api.getCrashes.mock.calls.length).toBeGreaterThan(1))
+    // The detail is reloaded.
+    await waitFor(() => expect(api.getCrashDetail.mock.calls.length).toBeGreaterThan(1))
   })
 
-  it('selects nothing without a fingerprint', async () => {
+  it('lists the groups with their state without a fingerprint', async () => {
     renderAt('/crashes')
-    expect(await screen.findByText('Select a crash to view details')).toBeInTheDocument()
+    expect(await screen.findByText('Unresolved')).toBeInTheDocument()
     expect(api.getCrashDetail).not.toHaveBeenCalled()
   })
 })

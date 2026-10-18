@@ -157,6 +157,7 @@ describe('Exception detail page (APM-11)', () => {
     expect(screen.getByText(/caught and logged with an error message/)).toBeInTheDocument()
     expect(screen.getAllByText('Ozx.Core.GameEventBus.Publish (at Assets/Scripts/Core/GameEventBus.cs:52)').length).toBeGreaterThan(0)
     expect(screen.getByText('Inner exception:')).toBeInTheDocument()
+    expect(screen.queryByTestId('no-file-line')).toBeNull()
     expect(screen.getByText('67% (2 of 3)')).toBeInTheDocument()
     expect(screen.getByText(/Oct 17, 2026 \d\d:00 · 2\.2/)).toBeInTheDocument()
     expect(api.getExceptionDetail).toHaveBeenCalledWith('fad75585e1523085', expect.objectContaining({ build_type: 'release' }))
@@ -251,6 +252,25 @@ describe('Exception detail page (APM-11)', () => {
     api.getExceptionDistribution.mockResolvedValue({ fingerprint: '', group_by: '', total: 0, merged: 0, truncated: false, rows: [] })
     renderAt('/exceptions/detail?fingerprint=gone')
     expect(await screen.findByText(/No occurrence of this group matches the current filters/)).toBeInTheDocument()
+  })
+
+  it('says how to get file and line when an IL2CPP stack has none (APM-7)', async () => {
+    const noLines = {
+      ...detail,
+      sample: {
+        ...detail.sample,
+        parsed: {
+          ...detail.sample.parsed,
+          chain: [{ type: 'System.NullReferenceException', message: 'x', frames: [{ method: 'Ozx.Rooms.RoomBuilder.Build', in_app: true, raw: 'Ozx.Rooms.RoomBuilder:Build(String)' }] }],
+          log_frames: [{ method: 'Ozx.Core.GameEventBus.Publish', in_app: true, raw: 'x' }],
+        },
+      },
+    }
+    api.getExceptionDetail.mockResolvedValue(noLines)
+    api.getExceptionOccurrences.mockResolvedValue({ fingerprint: '', occurrences: [], total_count: 0, page: 1, page_size: 10 })
+    api.getExceptionDistribution.mockResolvedValue({ fingerprint: '', group_by: '', total: 0, merged: 0, truncated: false, rows: [] })
+    renderAt('/exceptions/detail?fingerprint=fad75585e1523085')
+    expect(await screen.findByTestId('no-file-line')).toHaveTextContent('Method Name, File Name, and Line Number')
   })
 
   it('asks for a fingerprint', () => {

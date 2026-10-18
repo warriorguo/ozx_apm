@@ -213,6 +213,12 @@ function StackSection({ detail: d }: { detail: Detail }) {
           <FrameList frames={p.log_frames} />
         </details>
       )}
+      {noFileLines(p) && (
+        <p className="text-xs text-gray-500 mt-3" data-testid="no-file-line">
+          No file or line in this stack: an IL2CPP build reports them only when built with IL2CPP Stacktrace Information
+          &quot;Method Name, File Name, and Line Number&quot; (Player Settings; RELEASE.md, APM-7).
+        </p>
+      )}
       {s.inner_exceptions.length > 0 && (
         <p className="text-xs text-gray-500 mt-3">
           Inner exceptions: <span className="font-mono">{s.inner_exceptions.join(' → ')}</span>
@@ -228,6 +234,13 @@ function StackSection({ detail: d }: { detail: Detail }) {
       </details>
     </div>
   )
+}
+
+// True when the stack has in-app frames and none of them has a file: a
+// release IL2CPP build without line information.
+function noFileLines(p: Detail['sample']['parsed']): boolean {
+  const frames = [...p.chain.flatMap((e) => e.frames), ...p.log_frames].filter((f) => f.in_app)
+  return frames.length > 0 && frames.every((f) => !f.file)
 }
 
 function RawBlock({ label, text }: { label: string; text: string }) {

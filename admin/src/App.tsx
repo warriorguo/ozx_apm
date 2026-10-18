@@ -3,6 +3,7 @@ import { Layout } from './components/Layout'
 import { Dashboard } from './pages/Dashboard'
 import { Performance } from './pages/Performance'
 import { Crashes } from './pages/Crashes'
+import { CrashDetail } from './pages/CrashDetail'
 import { Exceptions } from './pages/Exceptions'
 import { Context } from './pages/Context'
 import { Custom } from './pages/Custom'
@@ -19,6 +20,7 @@ function App() {
             <Route index element={<Dashboard />} />
             <Route path="performance" element={<Performance />} />
             <Route path="crashes" element={<Crashes />} />
+            <Route path="crashes/detail" element={<CrashDetail />} />
             <Route path="exceptions" element={<Exceptions />} />
             <Route path="exceptions/detail" element={<ExceptionDetail />} />
             <Route path="sessions" element={<Sessions />} />
