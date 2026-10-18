@@ -26,6 +26,7 @@ type ExceptionStore interface {
 // page's endpoints (APM-11). All take the common filter (parseAdminFilter).
 type ExceptionHandler struct {
 	repo   ExceptionStore
+	states IssueStateReader // APM-8; nil: groups are served without a state
 	logger *zap.Logger
 }
 
@@ -33,6 +34,7 @@ func NewExceptionHandler(repo *storage.Repository, logger *zap.Logger) *Exceptio
 	h := &ExceptionHandler{logger: logger}
 	if repo != nil {
 		h.repo = repo
+		h.states = repo
 	}
 	return h
 }
@@ -59,7 +61,8 @@ func pageParams(q url.Values, def, max int) (int, int) {
 }
 
 // ListExceptions: GET /api/exceptions[?sort=count|sessions|first_seen|last_seen]
-// -> one page of groups (default sort: count).
+// [&status=resolved|unresolved] -> one page of groups (default sort: count),
+// each with its issue state (APM-8).
 func (h *ExceptionHandler) ListExceptions(w http.ResponseWriter, r *http.Request) {
 	if h.repo == nil {
 		http.Error(w, "repository not configured", http.StatusInternalServerError)
@@ -76,12 +79,29 @@ func (h *ExceptionHandler) ListExceptions(w http.ResponseWriter, r *http.Request
 		http.Error(w, "sort must be one of count, sessions, first_seen, last_seen", http.StatusBadRequest)
 		return
 	}
+	switch status := q.Get("status"); status {
+	case "", "all":
+	case models.IssueResolved, models.IssueUnresolved:
+		f.IssueStatus = status
+	default:
+		http.Error(w, "status must be resolved, unresolved or all", http.StatusBadRequest)
+		return
+	}
 	page, pageSize := pageParams(q, 20, 100)
 	exceptions, totalCount, err := h.repo.GetExceptionGroups(r.Context(), f, sort, page, pageSize)
 	if err != nil {
 		h.logger.Error("failed to get exception groups", zap.Error(err))
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
+	}
+	fps := make([]string, len(exceptions))
+	for i := range exceptions {
+		fps[i] = exceptions[i].Fingerprint
+	}
+	if st := issueStatuses(r.Context(), h.states, models.IssueKindException, fps, h.logger); st != nil {
+		for i := range exceptions {
+			exceptions[i].IssueStatusInfo = st[exceptions[i].Fingerprint]
+		}
 	}
 	writeJSON(w, models.ExceptionListResponse{
 		Exceptions: exceptions,
@@ -128,6 +148,9 @@ func (h *ExceptionHandler) GetExceptionDetail(w http.ResponseWriter, r *http.Req
 	if detail == nil {
 		http.Error(w, "exception not found", http.StatusNotFound)
 		return
+	}
+	if st := issueStatuses(r.Context(), h.states, models.IssueKindException, []string{fp}, h.logger); st != nil {
+		detail.IssueStatusInfo = st[fp]
 	}
 	writeJSON(w, detail)
 }

@@ -85,6 +85,20 @@ func NewAdminRouter(cfg *config.Config, repo *storage.Repository, logger *zap.Lo
 		}
 		r.Post("/privacy/delete", privacyHandler.Delete)
 		r.Post("/privacy/verify", privacyHandler.Verify)
+
+		// Issue state and alerts (APM-8). Changing a state needs the
+		// X-Apm-Admin header (not sendable cross-origin); queueing a test
+		// alert, which makes the evaluator post to the webhook, needs a
+		// bearer token and is disabled (403) without one.
+		issueHandler := admin.NewIssueHandler(repo, logger, cfg.Alert.IncludeDevBuilds)
+		r.Get("/issues/state", issueHandler.Get)
+		r.Post("/issues/state", issueHandler.Set)
+		alertHandler := admin.NewAlertHandler(repo, logger, cfg.AdminServer.AlertToken)
+		if !alertHandler.TestEnabled() {
+			logger.Info("alert test API disabled: no token configured")
+		}
+		r.Get("/alerts", alertHandler.List)
+		r.Post("/alerts/test", alertHandler.Test)
 	})
 
 	// Serve static files for admin UI (if exists)

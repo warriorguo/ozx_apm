@@ -59,6 +59,16 @@ func (h *CrashHandler) ListCrashes(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
+	// APM-8: each group's issue state.
+	fps := make([]string, len(crashes))
+	for i := range crashes {
+		fps[i] = crashes[i].Fingerprint
+	}
+	if st := issueStatuses(ctx, h.repo, models.IssueKindCrash, fps, h.logger); st != nil {
+		for i := range crashes {
+			crashes[i].IssueStatusInfo = st[crashes[i].Fingerprint]
+		}
+	}
 
 	resp := models.CrashListResponse{
 		Crashes:    crashes,
@@ -102,6 +112,9 @@ func (h *CrashHandler) GetCrashDetail(w http.ResponseWriter, r *http.Request) {
 	if detail == nil {
 		http.Error(w, "crash not found", http.StatusNotFound)
 		return
+	}
+	if st := issueStatuses(ctx, h.repo, models.IssueKindCrash, []string{fingerprint}, h.logger); st != nil {
+		detail.IssueStatusInfo = st[fingerprint]
 	}
 
 	w.Header().Set("Content-Type", "application/json")
