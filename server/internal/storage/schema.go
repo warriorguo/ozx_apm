@@ -13,7 +13,8 @@ import (
 // when the two differ), so a database set up either way ends up the same:
 // the event tables with TTL, the event_id skip index and the apm_*_daily
 // materialized views (APM-17), and the privacy deletion audit table (APM-14,
-// privacy.go). APM-6 added two event tables (apm_custom_events,
+// privacy.go), and the issue state and alert outbox tables (APM-8,
+// repository_alerts.go). APM-6 added two event tables (apm_custom_events,
 // apm_custom_metrics) and their daily views; new tables are created by
 // CREATE TABLE IF NOT EXISTS, which the service account may run.
 //
@@ -545,6 +546,7 @@ func (c *ClickHouseClient) Migrate(ctx context.Context) error {
 	c.migrateMaterializedViews(ctx, tables)
 	c.checkEventTTL(tables)
 	c.migratePrivacyAudit(ctx)
+	c.migrateAlertTables(ctx)
 	return nil
 }
 
@@ -620,5 +622,13 @@ func SchemaSQL() string {
 -- as a SHA-256 hash only). See internal/storage/privacy.go.
 `)
 	sb.WriteString("\n" + privacyAuditTableDDL + ";\n")
+	sb.WriteString(`
+-- APM-8: issue state (resolved / unresolved, ReplacingMergeTree: the latest
+-- row per issue wins, read with FINAL) and the alert outbox (append-only; the
+-- rows of an alert key make alerting idempotent across restarts and
+-- replicas). See internal/storage/repository_alerts.go.
+`)
+	sb.WriteString("\n" + issueStatesTableDDL + ";\n")
+	sb.WriteString("\n" + alertsTableDDL + ";\n")
 	return sb.String()
 }

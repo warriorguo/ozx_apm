@@ -460,3 +460,39 @@ CREATE TABLE IF NOT EXISTS apm_privacy_deletions (
     requested_by String
 ) ENGINE = MergeTree()
 ORDER BY (id_hash, at);
+
+-- APM-8: issue state (resolved / unresolved, ReplacingMergeTree: the latest
+-- row per issue wins, read with FINAL) and the alert outbox (append-only; the
+-- rows of an alert key make alerting idempotent across restarts and
+-- replicas). See internal/storage/repository_alerts.go.
+
+CREATE TABLE IF NOT EXISTS apm_issue_states (
+    kind LowCardinality(String),
+    fingerprint String,
+    status LowCardinality(String),
+    resolved_in_version String,
+    last_seen_version String,
+    resolved_at DateTime64(3),
+    regressed_in_version String,
+    regressed_at DateTime64(3),
+    updated_at DateTime64(3),
+    updated_by LowCardinality(String),
+    comment String,
+    version UInt64
+) ENGINE = ReplacingMergeTree(version)
+ORDER BY (kind, fingerprint);
+
+CREATE TABLE IF NOT EXISTS apm_alerts (
+    alert_key String,
+    at DateTime64(3),
+    status LowCardinality(String),
+    attempt UInt16,
+    instance String,
+    type LowCardinality(String),
+    kind LowCardinality(String),
+    fingerprint String,
+    app_version String,
+    payload String,
+    error String
+) ENGINE = MergeTree()
+ORDER BY (alert_key, at);

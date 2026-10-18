@@ -53,11 +53,17 @@ func adminWhere(f models.AdminFilter) (string, []interface{}) {
 // tableWhere is adminWhere for one table. On apm_exceptions it also applies
 // the exception-only filter first_error (APM-3): only rows whose (first)
 // occurrence was the first error of its session (error_seq = 1). Rows of
-// SDKs before APM-3 have error_seq 0 and never match it.
+// SDKs before APM-3 have error_seq 0 and never match it. And the issue
+// status (APM-8): groups marked resolved, or all others.
 func tableWhere(table string, f models.AdminFilter) (string, []interface{}) {
 	where, args := adminWhere(f)
 	if f.FirstErrorOnly && table == TableExceptions.Name {
 		where += " AND error_seq = 1"
+	}
+	if table == TableExceptions.Name && (f.IssueStatus == models.IssueResolved || f.IssueStatus == models.IssueUnresolved) {
+		clause, cargs := ResolvedFingerprintsClause(models.IssueKindException, f.IssueStatus == models.IssueResolved)
+		where += " AND " + clause
+		args = append(args, cargs...)
 	}
 	return where, args
 }

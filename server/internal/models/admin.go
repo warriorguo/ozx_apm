@@ -77,6 +77,8 @@ type CrashGroup struct {
 	LastSeen         time.Time `json:"last_seen"`
 	AffectedVersions []string  `json:"affected_versions"`
 	TopDevices       []string  `json:"top_devices"`
+	// APM-8: the issue's state (status, resolved_in_version, ...).
+	IssueStatusInfo
 }
 
 type CrashListResponse struct {
@@ -98,6 +100,8 @@ type CrashDetail struct {
 	VersionDist  []VersionDist     `json:"version_distribution"`
 	DeviceDist   []DeviceDist      `json:"device_distribution"`
 	OSDist       []OSDist          `json:"os_distribution"`
+	// APM-8: the issue's state.
+	IssueStatusInfo
 }
 
 type CrashOccurrence struct {
@@ -157,6 +161,8 @@ type ExceptionGroup struct {
 	// sessions in which this group was the first error; rows of older SDKs
 	// are in neither.
 	SessionsWithSeq int64 `json:"sessions_with_seq"`
+	// APM-8: the issue's state (status, resolved_in_version, ...).
+	IssueStatusInfo
 }
 
 // ExceptionDetail is one exception group for the detail page (APM-11): the
@@ -290,6 +296,9 @@ type AdminFilter struct {
 	// FirstErrorOnly (first_error=1, APM-3) keeps only exception rows whose
 	// occurrence was the first error of its session; other tables ignore it.
 	FirstErrorOnly bool
+	// IssueStatus (status=resolved|unresolved on the exception list, APM-8)
+	// keeps only exception groups in that state; "" all. Other tables ignore it.
+	IssueStatus string
 }
 
 type ContextFilter struct {
