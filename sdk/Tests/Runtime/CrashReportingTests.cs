@@ -99,7 +99,12 @@ namespace OzxApm.Tests
                 : "";
         }
 
-        private int JournalFiles => Directory.Exists(_crashDir) ? Directory.GetFiles(_crashDir, CrashJournal.FilePrefix + "*").Length : 0;
+        // Processes with a journal: each writes two files in turn
+        // (j-<pid>-<start>-a/b.txt), so files are not processes.
+        private int JournalFiles => !Directory.Exists(_crashDir) ? 0 :
+            Directory.GetFiles(_crashDir, CrashJournal.FilePrefix + "*")
+                .Select(f => { var n = Path.GetFileName(f); return n.Substring(0, n.LastIndexOf('-')); })
+                .Distinct().Count();
 
         [Test]
         public void KilledProcess_IsReportedAtTheNextLaunch_WithItsSessionAndContext()
@@ -214,7 +219,7 @@ namespace OzxApm.Tests
             var client = Launch(1001);
             for (int i = 0; i < 5; i++)
                 client.UpdateForTests();
-            Assert.That(() => client.UpdateForTests(), Is.Not.AllocatingGCMemory());
+            Assert.That(() => { client.UpdateForTests(); }, Is.Not.AllocatingGCMemory());
         }
     }
 }

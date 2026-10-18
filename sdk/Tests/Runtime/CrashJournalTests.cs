@@ -197,9 +197,11 @@ namespace OzxApm.Tests
             try
             {
                 CrashJournal.NotifyChanged();
-                Assert.That(() => CrashJournal.NotifyChanged(), Is.Not.AllocatingGCMemory());
+                Assert.That(() => { CrashJournal.NotifyChanged(); }, Is.Not.AllocatingGCMemory());
                 _timeline.OnLog("warming up", "", LogType.Warning, true);
-                Assert.That(() => _timeline.OnLog("Pool empty for enemy 12", "", LogType.Warning, true), Is.Not.AllocatingGCMemory());
+                // A statement lambda: OnLog returns a value, and an expression lambda
+                // would be an ActualValueDelegate, which the constraint refuses.
+                Assert.That(() => { _timeline.OnLog("Pool empty for enemy 12", "", LogType.Warning, true); }, Is.Not.AllocatingGCMemory());
             }
             finally
             {
@@ -217,7 +219,7 @@ namespace OzxApm.Tests
             j.Start(false);
             j.WriteNow();
             j.WriteNow();
-            Assert.That(() => j.WriteNow(), Is.Not.AllocatingGCMemory());
+            Assert.That(() => { j.WriteNow(); }, Is.Not.AllocatingGCMemory());
             j.Stop(true);
         }
 
