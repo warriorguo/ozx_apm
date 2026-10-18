@@ -137,3 +137,38 @@ describe('Exceptions page (APM-11)', () => {
     expect(await screen.findByText('Could not load the exceptions.')).toBeInTheDocument()
   })
 })
+
+describe('Exceptions page (APM-8)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    api.getAppVersions.mockResolvedValue([])
+    api.getContextKeys.mockResolvedValue({ keys: [] })
+    api.getContextValues.mockResolvedValue({ key: '', values: [] })
+  })
+
+  it('shows each group state and filters by state', async () => {
+    api.getExceptions.mockResolvedValue({
+      ...groups,
+      exceptions: [
+        { ...groups.exceptions[0], status: 'resolved', resolved_in_version: '2.4' },
+        { ...groups.exceptions[1], status: 'unresolved', regressed_in_version: '2.5' },
+      ],
+    })
+    render(<Exceptions />, { wrapper })
+    expect(await screen.findByText('Resolved in 2.4')).toBeInTheDocument()
+    expect(screen.getByText('Regressed in 2.5')).toBeInTheDocument()
+    expect(api.getExceptions.mock.lastCall?.[0].status).toBeUndefined()
+
+    fireEvent.change(screen.getByLabelText('Status'), { target: { value: 'unresolved' } })
+    await waitFor(() => expect(api.getExceptions).toHaveBeenLastCalledWith(expect.objectContaining({ status: 'unresolved', page: 1 })))
+    fireEvent.change(screen.getByLabelText('Status'), { target: { value: '' } })
+    await waitFor(() => expect(api.getExceptions.mock.lastCall?.[0].status).toBeUndefined())
+  })
+
+  it('shows no state for an older server', async () => {
+    api.getExceptions.mockResolvedValue(groups)
+    render(<Exceptions />, { wrapper })
+    await screen.findByText('System.InvalidOperationException')
+    expect(screen.queryByText('Unresolved', { selector: 'span' })).toBeNull()
+  })
+})

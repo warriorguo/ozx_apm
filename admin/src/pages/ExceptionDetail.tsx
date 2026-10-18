@@ -5,6 +5,7 @@ import { GlobalFilterBar } from '../components/FilterBar'
 import { Pagination } from '../components/Pagination'
 import { TimeSeriesChart } from '../components/TimeSeriesChart'
 import { BreadcrumbList } from '../components/BreadcrumbList'
+import { IssueStatusControl } from '../components/IssueStatus'
 import { useFilters } from '../hooks/useFilters'
 import {
   useContextKeys,
@@ -133,6 +134,9 @@ function Summary({ detail: d }: { detail: Detail }) {
         <Stat label="Unhandled" value={formatNumber(d.unhandled_count ?? 0)} hint="Occurrences no code caught" />
         <Stat label="First seen" value={`${formatDateTime(d.first_seen)}${d.first_version ? ` · ${d.first_version}` : ''}`} />
         <Stat label="Last seen" value={`${formatDateTime(d.last_seen)}${d.last_version ? ` · ${d.last_version}` : ''}`} />
+      </div>
+      <div className="mt-4">
+        <IssueStatusControl kind="exception" fingerprint={d.fingerprint} info={d} />
       </div>
     </div>
   )

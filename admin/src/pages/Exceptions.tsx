@@ -7,7 +7,8 @@ import { useFilters } from '../hooks/useFilters'
 import { useExceptions } from '../hooks/useApi'
 import { formatNumber, formatDateTime } from '../utils/format'
 import { exceptionDetailLink } from '../utils/timeline'
-import type { ExceptionGroup, ExceptionSort } from '../types/api'
+import { IssueStatusBadge } from '../components/IssueStatus'
+import type { ExceptionGroup, ExceptionSort, IssueStatus } from '../types/api'
 
 const sorts: { value: ExceptionSort; label: string }[] = [
   { value: 'count', label: 'Occurrences' },
@@ -23,10 +24,11 @@ export function Exceptions() {
   const [page, setPage] = useState(1)
   const [sort, setSort] = useState<ExceptionSort>('count')
   const [firstErrorOnly, setFirstErrorOnly] = useState(false)
+  const [status, setStatus] = useState<IssueStatus | ''>('')
 
   // A new filter or sort starts at the first page.
   const filterKey = JSON.stringify(queryParams)
-  useEffect(() => setPage(1), [filterKey, sort, firstErrorOnly])
+  useEffect(() => setPage(1), [filterKey, sort, firstErrorOnly, status])
 
   const { data: exceptionsData, isLoading, isError } = useExceptions({
     ...queryParams,
@@ -34,6 +36,7 @@ export function Exceptions() {
     page_size: 20,
     sort,
     ...(firstErrorOnly ? { first_error: '1' } : {}),
+    ...(status ? { status } : {}),
   })
 
   const columns = [
@@ -69,6 +72,11 @@ export function Exceptions() {
           <p className="text-xs text-gray-400 truncate mt-0.5">{item.fingerprint}</p>
         </div>
       ),
+    },
+    {
+      key: 'status',
+      header: 'Status',
+      render: (item: ExceptionGroup) => <IssueStatusBadge info={item} />,
     },
     {
       key: 'count',
@@ -130,6 +138,19 @@ export function Exceptions() {
                 {s.label}
               </option>
             ))}
+          </select>
+        </label>
+        <label className="flex items-center gap-2">
+          <span className="text-gray-500">Status:</span>
+          <select
+            aria-label="Status"
+            value={status}
+            onChange={(e) => setStatus(e.target.value as IssueStatus | '')}
+            className="px-2 py-1 border border-gray-300 rounded"
+          >
+            <option value="">All</option>
+            <option value="unresolved">Unresolved</option>
+            <option value="resolved">Resolved</option>
           </select>
         </label>
         <label className="flex items-center gap-2" title="Only occurrences that were the first error of their session (SDK with APM-3): root causes rather than follow-up errors">

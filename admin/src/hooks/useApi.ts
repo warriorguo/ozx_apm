@@ -1,6 +1,14 @@
-import { useQuery } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import * as api from '../services/api'
-import type { CustomGroup, ExceptionGroupBy, ExceptionSort, FilterParams, PaginationParams, SessionTimeline } from '../types/api'
+import type {
+  CustomGroup,
+  ExceptionGroupBy,
+  ExceptionSort,
+  FilterParams,
+  IssueStatus,
+  PaginationParams,
+  SessionTimeline,
+} from '../types/api'
 
 export function useSummary(params: FilterParams) {
   return useQuery({
@@ -57,7 +65,7 @@ export function useCrashDetail(fingerprint: string, params: FilterParams) {
 }
 
 export function useExceptions(
-  params: FilterParams & PaginationParams & { sort?: ExceptionSort; first_error?: string }
+  params: FilterParams & PaginationParams & { sort?: ExceptionSort; first_error?: string; status?: IssueStatus }
 ) {
   return useQuery({
     queryKey: ['exceptions', params],
@@ -174,5 +182,18 @@ export function useCustomDistribution(
     queryKey: ['custom-distribution', kind, name, group, params],
     queryFn: () => api.getCustomDistribution(kind, name, group, params),
     enabled: enabled && isValidContextKey(name) && (group.kind === 'by' || isValidContextKey(group.key)),
+  })
+}
+
+// APM-8: change an issue's state; the lists and details showing it reload.
+export function useSetIssueState() {
+  const client = useQueryClient()
+  return useMutation({
+    mutationFn: (change: api.IssueStateChange) => api.setIssueState(change),
+    onSuccess: () => {
+      for (const key of ['exceptions', 'exception-detail', 'crashes', 'crash-detail']) {
+        client.invalidateQueries({ queryKey: [key] })
+      }
+    },
   })
 }

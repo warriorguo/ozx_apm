@@ -1,5 +1,7 @@
 import { useState } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import { GlobalFilterBar } from '../components/FilterBar'
+import { IssueStatusBadge, IssueStatusControl } from '../components/IssueStatus'
 import { DataTable } from '../components/DataTable'
 import { Pagination } from '../components/Pagination'
 import { useFilters } from '../hooks/useFilters'
@@ -10,8 +12,10 @@ import type { CrashGroup } from '../types/api'
 export function Crashes() {
   const { queryParams } = useFilters()
 
+  const [search] = useSearchParams()
   const [page, setPage] = useState(1)
-  const [selectedFingerprint, setSelectedFingerprint] = useState<string | null>(null)
+  // ?fingerprint=F (the link in an alert, APM-8) opens that crash group.
+  const [selectedFingerprint, setSelectedFingerprint] = useState<string | null>(search.get('fingerprint') || null)
 
   const { data: crashesData, isLoading } = useCrashes({
     ...queryParams,
@@ -39,6 +43,11 @@ export function Crashes() {
           {item.sample_message}
         </div>
       ),
+    },
+    {
+      key: 'status',
+      header: 'Status',
+      render: (item: CrashGroup) => <IssueStatusBadge info={item} />,
     },
     {
       key: 'count',
@@ -119,6 +128,8 @@ export function Crashes() {
                     {crashDetail.crash_type}
                   </span>
                 </div>
+
+                <IssueStatusControl kind="crash" fingerprint={crashDetail.fingerprint} info={crashDetail} />
 
                 <div>
                   <p className="text-xs text-gray-500 mb-1">Count</p>

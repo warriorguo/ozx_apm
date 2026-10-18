@@ -26,6 +26,9 @@ import type {
   SessionTimeline,
   SessionInfo,
   DeviceSessionsResponse,
+  IssueKind,
+  IssueState,
+  IssueStatus,
 } from '../types/api'
 
 export const apiConfig = {
@@ -138,14 +141,37 @@ export async function getCrashDetail(
 // Exception APIs
 // sort (APM-11): count (server default), sessions, first_seen, last_seen.
 // first_error (APM-3): only occurrences that were their session's first error.
+// status (APM-8): resolved, unresolved or all (default).
 export async function getExceptions(
-  params: FilterParams & PaginationParams & { sort?: ExceptionSort; first_error?: string }
+  params: FilterParams & PaginationParams & { sort?: ExceptionSort; first_error?: string; status?: IssueStatus }
 ): Promise<ExceptionListResponse> {
   const { data } = await api.get<ExceptionListResponse>('/exceptions', { params })
   if (!data) {
     return { exceptions: [], total_count: 0, page: 1, page_size: 20 }
   }
   return { ...data, exceptions: data.exceptions || [] }
+}
+
+// Issue state (APM-8). A change sends X-Apm-Admin, which the server requires
+// (other origins cannot send it).
+export async function getIssueState(kind: IssueKind, fingerprint: string): Promise<IssueState> {
+  const { data } = await api.get<IssueState>('/issues/state', { params: { kind, fingerprint } })
+  return data
+}
+
+export interface IssueStateChange {
+  kind: IssueKind
+  fingerprint: string
+  status: IssueStatus
+  resolved_in_version?: string
+  comment?: string
+}
+
+export async function setIssueState(change: IssueStateChange): Promise<IssueState> {
+  const { data } = await api.post<IssueState>('/issues/state', change, {
+    headers: { 'Content-Type': 'application/json', 'X-Apm-Admin': '1' },
+  })
+  return data
 }
 
 // Fields an old server or an old SDK's row may lack become empty values, so

@@ -57,7 +57,33 @@ export interface DistributionResponse {
 }
 
 // Crash types
-export interface CrashGroup {
+// APM-8: the state of an exception or crash group. Absent from older servers
+// and when the server could not read the states (then nothing is shown).
+export type IssueStatus = 'unresolved' | 'resolved'
+export type IssueKind = 'exception' | 'crash'
+
+export interface IssueStatusInfo {
+  status?: IssueStatus
+  resolved_in_version?: string
+  resolved_at?: string
+  regressed_in_version?: string
+}
+
+export interface IssueState {
+  kind: IssueKind
+  fingerprint: string
+  status: IssueStatus
+  resolved_in_version: string
+  last_seen_version: string
+  resolved_at?: string
+  regressed_in_version?: string
+  regressed_at?: string
+  updated_at: string
+  updated_by: string
+  comment?: string
+}
+
+export interface CrashGroup extends IssueStatusInfo {
   fingerprint: string
   crash_type: string
   sample_message: string
@@ -104,7 +130,7 @@ export interface OSDist {
   count: number
 }
 
-export interface CrashDetail {
+export interface CrashDetail extends IssueStatusInfo {
   fingerprint: string
   crash_type: string
   stack: string
@@ -119,7 +145,7 @@ export interface CrashDetail {
 }
 
 // Exception types
-export interface ExceptionGroup {
+export interface ExceptionGroup extends IssueStatusInfo {
   fingerprint: string
   message: string
   count: number
