@@ -236,8 +236,9 @@ namespace OzxApm.Core
                 long since = NowMs() - _lastWriteMs;
                 if (since >= 0 && since < MinIntervalMs)
                 {
-                    // Coalesce a burst (warning spam, a context set key by key).
-                    Thread.Sleep((int)(MinIntervalMs - since));
+                    // Coalesce a burst (warning spam, a context set key by key);
+                    // Stop's signal ends the wait at once.
+                    _wake.WaitOne((int)(MinIntervalMs - since));
                     if (_stop)
                         break;
                 }

@@ -191,7 +191,6 @@ namespace OzxApm.Core
                         if (ring.Counts[j] < int.MaxValue)
                             ring.Counts[j]++;
                         ring.LastTimes[j] = now;
-                        _repeats++;
                         repeated = true;
                         break;
                     }
@@ -266,23 +265,6 @@ namespace OzxApm.Core
                 return list;
             }
         }
-
-        /// <summary>
-        /// Recording order of the time line: changes whenever a breadcrumb or a
-        /// log line is recorded (APM-7: the crash journal rewrites itself when
-        /// it changed). Any thread.
-        /// </summary>
-        internal long Version
-        {
-            get
-            {
-                lock (_lock)
-                    return _seq + _repeats;
-            }
-        }
-
-        // Repeats counted on an existing log line (they change its text).
-        private long _repeats;
 
         /// <summary>
         /// The time line as Snapshot formats it, appended to dst: each line as

@@ -105,6 +105,12 @@ namespace OzxApm.Core
         private readonly Func<bool> _allowed;
         private readonly Func<int, bool> _waitPersisted;
 
+        /// <summary>
+        /// The current device id: a journal of another id (written before
+        /// ResetDeviceId) is deleted, never reported. Null: no check (tests).
+        /// </summary>
+        internal Func<string> CurrentDeviceId;
+
         /// <summary>Crash events enqueued, journals without a crash, journals kept for a retry.</summary>
         internal int Reported, NotCrashes, Kept;
         /// <summary>The last run's events (tests).</summary>
@@ -153,6 +159,8 @@ namespace OzxApm.Core
                 journals.RemoveAt(i);
             }
 
+            if (!_allowed())
+                return; // Undecided keeps them; Denied deletes the directory
             var pids = new List<int>();
             foreach (var j in journals)
                 pids.Add(j.Pid);
@@ -171,8 +179,49 @@ namespace OzxApm.Core
             exits = exits ?? new List<ExitRecord>();
 
             var reportedJournals = new List<JournalRecord>();
+            try
+            {
+                Report(journals, exits, reportedJournals);
+            }
+            finally
+            {
+                // Copied traces never stay (also when consent was withdrawn meanwhile).
+                foreach (var e in exits)
+                {
+                    if (e.TracePath != null)
+                        TryDelete(e.TracePath);
+                }
+            }
+            if (reportedJournals.Count == 0)
+                return;
+            // Delete the journals once the events are on disk; if that takes
+            // too long they are reported again next time, with the same event ids.
+            bool persisted = _waitPersisted == null || _waitPersisted(PersistTimeoutMs);
+            foreach (var j in reportedJournals)
+            {
+                if (!persisted)
+                {
+                    Kept++;
+                    continue;
+                }
+                foreach (var f in j.Files)
+                    TryDelete(f);
+            }
+        }
+
+        private void Report(List<JournalRecord> journals, List<ExitRecord> exits, List<JournalRecord> reportedJournals)
+        {
+            string device = CurrentDeviceId?.Invoke();
             foreach (var j in journals)
             {
+                if (device != null && j.DeviceId != device)
+                {
+                    // Written before ResetDeviceId: the old id must not be sent.
+                    NotCrashes++;
+                    foreach (var f in j.Files)
+                        TryDelete(f);
+                    continue;
+                }
                 var exit = Match(exits, j);
                 CrashTraceParser.Result trace = null;
                 if (exit != null && exit.TracePath != null)
@@ -190,25 +239,12 @@ namespace OzxApm.Core
                 }
                 if (!_allowed())
                     return; // consent withdrawn meanwhile: keep the journals (Undecided keeps, Denied deletes them)
+                if (device != null && CurrentDeviceId() != device)
+                    return; // ResetDeviceId meanwhile: its own deletion takes the journals
                 _enqueue(evt);
                 LastEvents.Add(evt);
                 Reported++;
                 reportedJournals.Add(j);
-            }
-            if (reportedJournals.Count == 0)
-                return;
-            // Delete the journals once the events are on disk; if that takes
-            // too long they are reported again next time, with the same event ids.
-            bool persisted = _waitPersisted == null || _waitPersisted(PersistTimeoutMs);
-            foreach (var j in reportedJournals)
-            {
-                if (!persisted)
-                {
-                    Kept++;
-                    continue;
-                }
-                foreach (var f in j.Files)
-                    TryDelete(f);
             }
         }
 

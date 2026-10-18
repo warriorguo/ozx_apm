@@ -388,6 +388,22 @@ namespace OzxApm.Tests
         }
 
         [Test]
+        public void Report_JournalOfAnotherDeviceId_IsDeletedNotReported()
+        {
+            PreviousProcess(100, 1000, true);
+            var exits = new FakeExits();
+            exits.Records.Add(new ExitRecord { Pid = 100, TimestampMs = 2000, Reason = ExitReasons.Anr });
+            exits.Traces[100] = Encoding.UTF8.GetBytes("\"main\" prio=5 tid=1 Native\n  at a.B.c(B.java:1)\n");
+            var sink = new List<CrashEvent>();
+            var reporter = Reporter(exits, sink);
+            reporter.CurrentDeviceId = () => "a-new-device-id-after-a-reset";
+            reporter.ProcessPrevious(1, 1);
+            Assert.AreEqual(0, sink.Count);
+            Assert.AreEqual(1, reporter.NotCrashes);
+            Assert.AreEqual(0, Directory.GetFiles(_dir).Length, "the journal and the copied trace are gone");
+        }
+
+        [Test]
         public void Report_WithoutConsent_EnqueuesNothingAndKeepsTheJournals()
         {
             PreviousProcess(100, 1000, true);

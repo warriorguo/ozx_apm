@@ -77,7 +77,7 @@ namespace OzxApm.Core
 
         private void StartReport()
         {
-            _reporter = new CrashReporter(_dir, _source, _enqueue, _allowed, _waitPersisted);
+            _reporter = new CrashReporter(_dir, _source, _enqueue, _allowed, _waitPersisted) { CurrentDeviceId = _inputs.DeviceId };
             if (!_useThreads)
             {
                 _reporter.ProcessPrevious(_inputs.Pid, _inputs.ProcessStartMs);
@@ -141,55 +141,44 @@ namespace OzxApm.Core
         internal void DeleteAll()
         {
             StopJournal(true);
-            DeleteDirectory(_dir, _useThreads);
+            DeleteDirectory(_dir);
         }
 
-        internal static void DeleteDirectory(string dir, bool async)
+        /// <summary>
+        /// Deletes the directory at once, on the calling thread: it holds a few
+        /// small files (two per process, at most a handful of processes), and
+        /// deleting later would race the next journal and report (a new
+        /// journal unlinked while written, old-id crashes reported after a reset).
+        /// </summary>
+        internal static void DeleteDirectory(string dir)
         {
             if (string.IsNullOrEmpty(dir))
                 return;
-            if (!async)
-            {
-                CrashJournal.DeleteAll(dir);
-                return;
-            }
-            try
-            {
-                ThreadPool.QueueUserWorkItem(_ => CrashJournal.DeleteAll(dir));
-            }
-            catch
-            {
-                CrashJournal.DeleteAll(dir);
-            }
+            CrashJournal.DeleteAll(dir);
         }
 
         /// <summary>ResetDeviceId: journals of earlier processes carry the old id.</summary>
         internal void OnDeviceIdReset()
         {
+            // Synchronous (a few small files): a report still running reads the
+            // directory too, and also skips journals of another device id.
             var own = _journal?.Paths;
-            string dir = _dir;
-            WaitCallback delete = _ =>
+            try
             {
-                try
+                if (System.IO.Directory.Exists(_dir))
                 {
-                    if (!System.IO.Directory.Exists(dir))
-                        return;
-                    foreach (var f in System.IO.Directory.GetFiles(dir))
+                    foreach (var f in System.IO.Directory.GetFiles(_dir))
                     {
                         if (own != null && (f == own[0] || f == own[1]))
                             continue;
                         File.Delete(f);
                     }
                 }
-                catch (Exception ex)
-                {
-                    ApmClient.ReportInternalError("CrashMonitor.OnDeviceIdReset", ex);
-                }
-            };
-            if (_useThreads)
-                ThreadPool.QueueUserWorkItem(delete);
-            else
-                delete(null);
+            }
+            catch (Exception ex)
+            {
+                ApmClient.ReportInternalError("CrashMonitor.OnDeviceIdReset", ex);
+            }
             CrashJournal.NotifyChanged();
         }
 

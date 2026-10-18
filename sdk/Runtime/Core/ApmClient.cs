@@ -325,7 +325,7 @@ namespace OzxApm.Core
             if (_crash != null)
                 _crash.DeleteAll();
             else
-                CrashMonitor.DeleteDirectory(_crashDir, StoragePathForTests == null);
+                CrashMonitor.DeleteDirectory(_crashDir);
         }
 
         /// <summary>Writes the game's SetConsent choices to PlayerPrefs (RememberConsent).</summary>
@@ -877,7 +877,7 @@ namespace OzxApm.Core
                 // ResetDeviceId before Initialize: stored events carry the old id.
                 _resetDeviceIdBeforeInit = false;
                 _offlineStorage.Clear(true);
-                CrashMonitor.DeleteDirectory(_crashDir, CrashDirForTests == null);
+                CrashMonitor.DeleteDirectory(_crashDir);
             }
             if (_config.GetConsent(ConsentCategory.Technical) == ConsentState.Denied)
             {
