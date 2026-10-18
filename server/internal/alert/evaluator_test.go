@@ -400,6 +400,52 @@ func TestRegression_NextVersionAndTimeFallback(t *testing.T) {
 	}
 }
 
+// The alert was written but reopening the issue failed: the next evaluation
+// reopens it without a second alert.
+func TestRegression_ReopenRetriedWithoutSecondAlert(t *testing.T) {
+	store := newFakeStore()
+	c := &clock{t0}
+	sender := &fakeSender{}
+	e := newTestEvaluator(store, sender, c, "a")
+	store.add(models.IssueKindException, occ{fp: "bug", version: "1.0.0", session: "s", at: t0.Add(-2 * time.Hour)})
+	e.Cycle(context.Background())
+	resolve(store, models.IssueKindException, "bug", "", "1.0.0", t0.Add(-time.Hour))
+	store.add(models.IssueKindException, occ{fp: "bug", version: "1.1.0", session: "s2", at: t0})
+	store.failOn["InsertIssueState"] = errors.New("ch down")
+	c.t = t0.Add(time.Minute)
+	e.Cycle(context.Background())
+	if sender.count() != 1 || store.latestStates()["exception/bug"].Status != models.IssueResolved {
+		t.Fatalf("sent %d, state %+v", sender.count(), store.latestStates()["exception/bug"])
+	}
+	delete(store.failOn, "InsertIssueState")
+	c.t = c.t.Add(time.Minute)
+	e.Cycle(context.Background())
+	st := store.latestStates()["exception/bug"]
+	if sender.count() != 1 || st.Status != models.IssueUnresolved || st.RegressedInVersion != "1.1.0" || st.RegressedAt == nil || !st.RegressedAt.Equal(t0) {
+		t.Fatalf("sent %d, state %+v", sender.count(), st)
+	}
+}
+
+// At most maxSendsPerCycle webhook requests per evaluation; the rest next time.
+func TestSend_BoundedPerCycle(t *testing.T) {
+	store := newFakeStore()
+	c := &clock{t0}
+	sender := &fakeSender{}
+	e := newTestEvaluator(store, sender, c, "a")
+	for i := 0; i < 30; i++ {
+		rec, _ := NewTestAlertRecord("x", t0.Add(time.Duration(i)*time.Millisecond))
+		store.InsertAlertRecords(context.Background(), []models.AlertRecord{rec})
+	}
+	e.send(context.Background())
+	if sender.count() != maxSendsPerCycle {
+		t.Fatalf("sent %d in one evaluation", sender.count())
+	}
+	e.send(context.Background())
+	if sender.count() != 30 {
+		t.Fatalf("sent %d after two", sender.count())
+	}
+}
+
 func TestCrashRateSpike(t *testing.T) {
 	store := newFakeStore()
 	c := &clock{t0}
@@ -410,7 +456,7 @@ func TestCrashRateSpike(t *testing.T) {
 			return []models.VersionRate{{AppVersion: "1.0.0", Sessions: 10000, CrashedSessions: 50}}
 		}
 		return []models.VersionRate{
-			{AppVersion: "1.0.0", Sessions: 1000, CrashedSessions: 6, Crashes: 6}, // 0.6%: below 2x baseline
+			{AppVersion: "1.0.0", Sessions: 1000, CrashedSessions: 6, Crashes: 6},  // 0.6%: below 2x baseline
 			{AppVersion: "2.0.0", Sessions: 400, CrashedSessions: 12, Crashes: 15}, // 3%
 			{AppVersion: "2.1.0", Sessions: 30, CrashedSessions: 10, Crashes: 10},  // too few sessions
 			{AppVersion: "2.2.0", Sessions: 1000, CrashedSessions: 3, Crashes: 3},  // too few crashes

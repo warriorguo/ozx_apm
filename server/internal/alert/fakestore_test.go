@@ -243,6 +243,9 @@ func (s *fakeStore) VersionFirstSeen(ctx context.Context, includeDev bool) (map[
 func (s *fakeStore) InsertIssueState(ctx context.Context, st models.IssueState) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.failOn["InsertIssueState"]; err != nil {
+		return err
+	}
 	s.states = append(s.states, st)
 	return nil
 }

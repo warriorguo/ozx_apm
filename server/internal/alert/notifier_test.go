@@ -87,7 +87,9 @@ func TestNotifier_FailuresNeverShowTheURL(t *testing.T) {
 		want string
 	}{
 		{func(*http.Request) (*http.Response, error) { return respond(500, "oops"), nil }, "answered 500"},
-		{func(*http.Request) (*http.Response, error) { return respond(200, `{"code":19021,"msg":"sign match fail @all"}`), nil }, "code 19021"},
+		{func(*http.Request) (*http.Response, error) {
+			return respond(200, `{"code":19021,"msg":"sign match fail @all"}`), nil
+		}, "code 19021"},
 		{func(*http.Request) (*http.Response, error) { return nil, errors.New("connection refused") }, "connection refused"},
 	}
 	for _, c := range cases {

@@ -163,5 +163,3 @@ func versionList(versions []string, n int) string {
 	}
 	return strings.Join(out, ", ")
 }
-
-func urlQueryEscape(s string) string { return url.QueryEscape(s) }

@@ -111,7 +111,7 @@ const (
 	// synchronous; this only covers clock skew and in-flight inserts).
 	claimSettle = 2 * time.Second
 	// cycleTimeout bounds one evaluation.
-	cycleTimeout = 3 * time.Minute
+	cycleTimeout = 5 * time.Minute
 	// firstCycleDelay: the first evaluation starts after the server is up.
 	firstCycleDelay = 15 * time.Second
 )
@@ -384,7 +384,7 @@ func digestAlert(kind string, rest []models.IssueCandidate, now time.Time) Alert
 		}
 		examples = append(examples, CleanText(c.Title, 60)+" ("+CleanText(c.FirstVersion, 40)+")")
 	}
-	path := "/exceptions?sort=first_seen"
+	path := "/exceptions"
 	if kind == models.IssueKindCrash {
 		path = "/crashes"
 	}
@@ -508,29 +508,36 @@ func (e *Evaluator) detectRegressions(ctx context.Context, kind string, now time
 		return err
 	}
 	for _, r := range found {
-		if existing[r.key] {
-			continue
+		first := *r.st.ResolvedAt
+		for _, h := range hits {
+			if h.Fingerprint == r.st.Fingerprint && h.AppVersion == r.version {
+				first = h.FirstSeen
+			}
 		}
-		hit, err := e.store.IssueHitSince(ctx, kind, r.st.Fingerprint, r.version, *r.st.ResolvedAt, e.cfg.IncludeDevBuilds)
-		if err != nil {
-			return err
-		}
-		a := regressionAlert(r.st, hit, now)
-		a.Key = r.key
-		payload, err := json.Marshal(a)
-		if err != nil {
-			return err
-		}
-		if err := e.store.InsertAlertRecords(ctx, []models.AlertRecord{{AlertKey: r.key, At: now, Status: models.AlertPending,
-			Instance: e.instance, Type: TypeRegression, Kind: kind, Fingerprint: r.st.Fingerprint, AppVersion: r.version,
-			Payload: string(payload)}}); err != nil {
-			return err
+		// The alert, unless an earlier evaluation (or another instance)
+		// wrote it already; then only the reopening below may be missing.
+		if !existing[r.key] {
+			hit, err := e.store.IssueHitSince(ctx, kind, r.st.Fingerprint, r.version, *r.st.ResolvedAt, e.cfg.IncludeDevBuilds)
+			if err != nil {
+				return err
+			}
+			first = hit.FirstSeen
+			a := regressionAlert(r.st, hit, now)
+			a.Key = r.key
+			payload, err := json.Marshal(a)
+			if err != nil {
+				return err
+			}
+			if err := e.store.InsertAlertRecords(ctx, []models.AlertRecord{{AlertKey: r.key, At: now, Status: models.AlertPending,
+				Instance: e.instance, Type: TypeRegression, Kind: kind, Fingerprint: r.st.Fingerprint, AppVersion: r.version,
+				Payload: string(payload)}}); err != nil {
+				return err
+			}
 		}
 		// Reopen the issue (a new row; the resolution stays for the record).
 		reopened := r.st
 		reopened.Status = models.IssueUnresolved
 		reopened.RegressedInVersion = r.version
-		first := hit.FirstSeen
 		reopened.RegressedAt = &first
 		reopened.UpdatedAt = now.UTC()
 		reopened.UpdatedBy = "alert"
@@ -661,7 +668,7 @@ func crashRateAlert(v models.VersionRate, rate, threshold, baseline float64, kno
 		},
 		Metrics: map[string]float64{"rate": rate, "threshold": threshold, "baseline": baseline,
 			"sessions": float64(v.Sessions), "crashed_sessions": float64(v.CrashedSessions), "crashes": float64(v.Crashes)},
-		AdminPath: "/crashes?" + "app_version=" + urlQueryEscape(v.AppVersion), DetectedAt: now.UTC(),
+		AdminPath: "/crashes", DetectedAt: now.UTC(),
 	}
 }
 
@@ -705,7 +712,7 @@ func (e *Evaluator) detectStartupRegression(ctx context.Context, now time.Time) 
 		},
 		Metrics: map[string]float64{"p95_ms": cur.P95Ms, "previous_p95_ms": prev.P95Ms, "increase": increase,
 			"samples": float64(cur.Samples), "previous_samples": float64(prev.Samples)},
-		AdminPath: "/performance?app_version=" + urlQueryEscape(cur.AppVersion), DetectedAt: now.UTC(),
+		AdminPath: "/performance", DetectedAt: now.UTC(),
 	}
 	payload, err := json.Marshal(a)
 	if err != nil {
@@ -779,7 +786,9 @@ func (e *Evaluator) send(ctx context.Context) error {
 		return nil
 	}
 	now := e.now()
-	entries, err := e.store.AlertsToSend(ctx, now.Add(-sendWindow), maxSendsPerCycle)
+	// Read more than are sent, so alerts waiting for their backoff do not
+	// hold back new ones.
+	entries, err := e.store.AlertsToSend(ctx, now.Add(-sendWindow), 5*maxSendsPerCycle)
 	if err != nil || len(entries) == 0 {
 		return err
 	}
@@ -794,7 +803,7 @@ func (e *Evaluator) send(ctx context.Context) error {
 			e.logger.Error("alert: abandoned after the last failed attempt", zap.String("key", o.AlertKey), zap.Int("attempts", MaxAttempts))
 			continue
 		}
-		if n == 0 {
+		if n == 0 || len(claims) >= maxSendsPerCycle {
 			continue
 		}
 		attempts[o.AlertKey] = n
