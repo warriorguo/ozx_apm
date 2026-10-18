@@ -19,6 +19,7 @@ import (
 	"github.com/warriorguo/ozx_apm/server/internal/api"
 	"github.com/warriorguo/ozx_apm/server/internal/api/handlers/admin"
 	"github.com/warriorguo/ozx_apm/server/internal/config"
+	"github.com/warriorguo/ozx_apm/server/internal/fingerprint"
 	"github.com/warriorguo/ozx_apm/server/internal/models"
 	"github.com/warriorguo/ozx_apm/server/internal/storage"
 	"github.com/warriorguo/ozx_apm/server/tests/integration/testutil"
@@ -114,10 +115,15 @@ func cycle(ev *alert.Evaluator) {
 
 // exceptionEvent is an SDK exception event of the type, thrown in method, in
 // the version and build type.
+// The event carries a fingerprint as the SDK sends one (ingest requires it):
+// the same for the same type and stack, whatever the message's numbers. The
+// server stores its own fingerprint computed from the same fields.
 func (e *alertEnv) exceptionEvent(typ, method, msg, version, buildType, session string) string {
+	message, stack := typ+": "+msg, apm4Handler(typ, method, msg, 42)
+	clientFP := fingerprint.Analyze(fingerprint.Input{LogType: "exception", Message: message, Stack: stack}).Fingerprint
 	return e.event(session, "1", map[string]interface{}{
-		"app_version": version, "build_type": buildType, "log_type": "exception",
-		"message": typ + ": " + msg, "stack": apm4Handler(typ, method, msg, 42),
+		"app_version": version, "build_type": buildType, "log_type": "exception", "fingerprint": clientFP,
+		"message": message, "stack": stack,
 		"timestamp": time.Now().Add(-time.Minute).UnixMilli() + int64(e.n),
 	})
 }
