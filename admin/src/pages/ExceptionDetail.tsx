@@ -215,8 +215,9 @@ function StackSection({ detail: d }: { detail: Detail }) {
       )}
       {noFileLines(p) && (
         <p className="text-xs text-gray-500 mt-3" data-testid="no-file-line">
-          No file or line in this stack: an IL2CPP build reports them only when built with IL2CPP Stacktrace Information
-          &quot;Method Name, File Name, and Line Number&quot; (Player Settings; RELEASE.md, APM-7).
+          No file or line in this stack: an IL2CPP release build reports them only with IL2CPP Stacktrace Information
+          &quot;Method Name, File Name, and Line Number&quot; (Player Settings, Unity 2023.1 and newer; RELEASE.md, APM-7).
+          Native crash stacks get them from the uploaded symbols.
         </p>
       )}
       {s.inner_exceptions.length > 0 && (

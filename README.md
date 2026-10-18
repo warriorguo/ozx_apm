@@ -247,11 +247,15 @@ the line map, the file and line, also for crashes stored before the upload.
 Build settings (Unity 2022.3, Android):
 
 ```csharp
-EditorUserBuildSettings.androidCreateSymbols = AndroidCreateSymbols.Debugging;  // symbols.zip with libil2cpp.dbg.so
+EditorUserBuildSettings.androidCreateSymbols = AndroidCreateSymbols.Debugging;  // <apk>-...symbols.zip: <abi>/libil2cpp.so with debug info
 PlayerSettings.SetAdditionalIl2CppArgs("--emit-source-mapping --emit-method-map"); // LineNumberMappings.json, MethodMap.tsv
-// For managed exceptions (not native crashes): file and line in their stacks
-PlayerSettings.SetIl2CppStacktraceInformation(NamedBuildTarget.Android, Il2CppStacktraceInformation.MethodFileLineMapping);
 ```
+
+These give native crash frames C# names, files and lines. Managed
+**exception** stacks of a 2022.3 IL2CPP release build keep only method
+names: they carry no addresses to symbolicate, and Unity's
+`Il2CppStacktraceInformation` setting (file:line in managed stacks) exists
+from Unity 2023.1 only.
 
 Upload (Go 1.21+; the token is the admin server's `OZX_SYMBOLS_UPLOAD_TOKEN`):
 
@@ -259,14 +263,17 @@ Upload (Go 1.21+; the token is the admin server's `OZX_SYMBOLS_UPLOAD_TOKEN`):
 cd server && go build -o apmsym ./cmd/apmsym
 export OZX_SYMBOLS_UPLOAD_TOKEN=...            # from the secret store
 ./apmsym upload -url https://<admin-host> -app-version 1.2.3 -app-build 45 \
-    Builds/ozx-1.2.3-v45.symbols.zip Library/Bee/artifacts/Android/il2cppOutput
+    Builds/ozx-1.2.3-v45-IL2CPP.symbols.zip \
+    Builds/ozx_BackUpThisFolder_ButDontShipItWithYourGame/il2cppOutput
 ./apmsym extract <same paths>                  # what would be uploaded, nothing sent
-./apmsym lookup libil2cpp.dbg.so 5417bc        # resolve an address locally
+./apmsym lookup <libil2cpp.so from the zip> 5417bc   # resolve an address locally
 ```
 
-It reads ELF libraries (`*.sym.so`, `*.dbg.so`, `symbols.zip`),
-`MethodMap.tsv` and `LineNumberMappings.json` (searched under the given
-directories), keeps per library a compact table (functions; C# line
+It reads ELF libraries (`symbols.zip`, whose entries are named
+`<abi>/libil2cpp.so`, `libunity.so`, `libmain.so`; also `*.sym.so` /
+`*.dbg.so`), `MethodMap.tsv` and `LineNumberMappings.json` (searched under
+the given directories; IL2CPP writes them to
+`<build>_BackUpThisFolder_ButDontShipItWithYourGame/il2cppOutput/Symbols/`), keeps per library a compact table (functions; C# line
 ranges), and uploads it by the library's ELF build id. Details, limits and
 what each file adds: `server/RELEASE.md` (APM-7).
 

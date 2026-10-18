@@ -2690,17 +2690,25 @@ Unity settings (2022.3, Android; in the build script or Player Settings):
 
 | Setting | What it gives | Without it |
 |---|---|---|
-| `EditorUserBuildSettings.androidCreateSymbols = AndroidCreateSymbols.Debugging` ("Create symbols.zip": Debugging) | `<name>.symbols.zip` next to the APK/AAB, with `libil2cpp.dbg.so` (symbols and DWARF line tables) per ABI | `Public`: `.sym.so` (functions only: names, no lines). The same files are in `Library/Bee/artifacts/Android/il2cppOutput/build/<abi>/` after any IL2CPP build |
-| `PlayerSettings.SetAdditionalIl2CppArgs("--emit-source-mapping --emit-method-map")` | `LineNumberMappings.json` (C++ line -> C# file:line) and `MethodMap.tsv` (C function -> C# method) in IL2CPP's Symbols folder | no C# files/lines; C# names guessed from IL2CPP's function names (`Type_Method_m<hash>` -> `Type.Method`; wrong split for nested types and types with `_`) |
-| `PlayerSettings.SetIl2CppStacktraceInformation(NamedBuildTarget.Android, Il2CppStacktraceInformation.MethodFileLineMapping)` | file and line in **managed exception** stacks (the APM-11 page; OZX-1277) | managed stacks without file/line; they carry no addresses, so the server cannot add them |
+| `EditorUserBuildSettings.androidCreateSymbols = AndroidCreateSymbols.Debugging` ("Create symbols.zip": Debugging) | `<product>-<version>-v<code>-IL2CPP.symbols.zip` next to the APK/AAB, with `<abi>/libil2cpp.so` (symbol table and DWARF line tables; 92 MB on the test app), `libunity.so`, `libmain.so`: named `.so`, not `.sym.so`/`.dbg.so` | `Public`: symbol tables only (names, no lines). Copies also under `Library/Bee/artifacts/Android/il2cppOutput/build/<abi>/` (`.sym.so`, `.dbg.so`) |
+| `PlayerSettings.SetAdditionalIl2CppArgs("--emit-source-mapping --emit-method-map")` | `LineNumberMappings.json` (C++ line -> C# file:line) and `MethodMap.tsv` (C function -> C# method). The place for CI: `<build>_BackUpThisFolder_ButDontShipItWithYourGame/il2cppOutput/Symbols/` next to the APK (copies also under `Library/Bee`) | no C# files/lines; C# names guessed from IL2CPP's function names (`Type_Method_m<hash>` -> `Type.Method`; wrong split for nested types and types with `_`) |
 
 `--emit-source-mapping` is what Unity passes itself when Cloud
 Diagnostics crash reporting is on; the source-mapping comments only change
-the generated C++, not the binary. **Not verified on a build:** that
-il2cpp accepts `--emit-method-map` by that name (it is derived from the
-option `EmitMethodMap` the way `--emit-source-mapping` is from
-`EmitSourceMapping`; if the build log rejects it, drop it: names are then
-guessed) and where the two files land (the tool searches the paths given).
+the generated C++, not the binary. Both arguments are accepted by il2cpp in
+Unity 2022.3.62 (verified on the test app's release build, below).
+
+**Managed exceptions (APM-11 page; OZX-1277) on Unity 2022.3: method names
+only, no file:line.** Unity's `Il2CppStacktraceInformation`
+("IL2CPP Stacktrace Information: Method Name, File Name, and Line Number")
+exists from Unity 2023.1; 2022.3 has no such setting (the build fails with
+CS0117/CS0103). This release cannot add file:line to managed exception
+stacks: such a stack is the text Unity formats (`Type:Method ()`), with no
+native address to look up, so the uploaded symbols and line map only
+serve native crash frames. Possible later, not in APM-7: the SDK capturing
+the native return addresses of the throwing thread (IL2CPP's internal
+stack walk is not a public API), or upgrading OZX to Unity 2023.1+ / Unity 6,
+where the setting gives file:line on the device without the server.
 
 The upload (CI, after the build; `server/cmd/apmsym`, plain Go, no CGO):
 
@@ -2708,7 +2716,7 @@ The upload (CI, after the build; `server/cmd/apmsym`, plain Go, no CGO):
 cd server && go build -o /usr/local/bin/apmsym ./cmd/apmsym
 export OZX_SYMBOLS_UPLOAD_TOKEN=...      # the admin server's token (secret store)
 apmsym upload -url https://<admin-host> -app-version "$VERSION" -app-build "$VERSION_CODE" \
-  "$BUILD_DIR"/*.symbols.zip "$UNITY_PROJECT"/Library/Bee/artifacts/Android/il2cppOutput
+  "$BUILD_DIR"/*.symbols.zip "$BUILD_DIR"/*_BackUpThisFolder_ButDontShipItWithYourGame/il2cppOutput
 ```
 
 - It reads every ELF library under the paths (zips are extracted to a
@@ -2724,8 +2732,13 @@ apmsym upload -url https://<admin-host> -app-version "$VERSION" -app-build "$VER
   build machine's directories are not uploaded). Measured on the test app
   (89 MB `libil2cpp.dbg.so`, 29,611 functions, 843k DWARF rows, synthetic
   line map): 0.26 s.
-- `libunity.sym.so` / `libmain.sym.so` in the zip are uploaded too (engine
-  frames get C++ names). `-modules libil2cpp.so` restricts it.
+- `libunity.so` / `libmain.so` in the zip are uploaded too (engine frames
+  get C++ names). `-modules libil2cpp.so` restricts it.
+- The test app's release build (Unity 2022.3.62f3, arm64, by the lead):
+  `apmsym extract <zip> <BackUpThisFolder>/il2cppOutput` in 0.8 s:
+  libil2cpp build id `96f86f45...`, 30,802 functions (11,614 C# methods,
+  19,074 named from the method map), 22,203 line rows (28,935 of 870,397
+  DWARF rows mapped to C#); libunity 27,460 functions; libmain 9.
 - Upload: parts of at most 900 KB gzip (below nginx's 1 MB default) with a
   random upload id, then a commit with the counts; retried 4 times. The
   server keeps one row per (upload, address) (a part sent twice counts
@@ -2932,7 +2945,9 @@ To remove the tables after a permanent rollback (admin):
   real queries) and the existing migration tests with the new columns and
   tables were compiled, **not run** (the sandbox cannot reach the local
   ClickHouse containers): run on 26.1, 24.1 and 23.8.
-- The build settings (`androidCreateSymbols`, `--emit-source-mapping
-  --emit-method-map`) on a real build, and the upload against the test
-  environment; cost of the symbol lookups at production volume.
+- The upload of a real build against the test environment (the build
+  settings and `apmsym extract` were checked on a real build, above); cost
+  of the symbol lookups at production volume.
+- File and line of managed exception frames on Unity 2022.3: not
+  available (above).
 - iOS.
