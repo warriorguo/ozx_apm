@@ -21,6 +21,14 @@ namespace OzxApm.Collectors
 
         public bool IsActive => _isActive;
 
+        // The last sample's figures, read by the crash journal's thread (APM-7).
+        // Single floats: a torn read is impossible, a stale one harmless.
+        internal volatile float LastFps;
+        internal volatile float LastFrameMs;
+        internal volatile float LastMaxFrameMs;
+        internal volatile float LastMemMb;
+        internal volatile int LastGcCount;
+
         public PerformanceCollector(ApmConfig config, ApmClient client)
         {
             _config = config;
@@ -82,6 +90,11 @@ namespace OzxApm.Collectors
             evt.main_thread_ms = avgFrameTime; // In Unity, main thread ≈ frame time for most cases
             evt.gc_alloc_kb = gcAllocKb;
             evt.mem_mb = _client.GetUsedMemoryMB();
+            LastFps = fps;
+            LastFrameMs = avgFrameTime;
+            LastMaxFrameMs = _maxFrameTime;
+            LastMemMb = evt.mem_mb;
+            LastGcCount = gcCount;
 
             _client.EnqueueEvent(evt);
             ResetCounters();

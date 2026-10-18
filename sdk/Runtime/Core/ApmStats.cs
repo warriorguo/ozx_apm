@@ -65,6 +65,16 @@ namespace OzxApm.Core
         public long TimersUntracked;
         /// <summary>Warning/error/assert lines seen by the time line (repeats included).</summary>
         public long LogLinesSeen;
+        /// <summary>Crash reporting is on (Android player, ApmConfig.EnableCrashReporting; APM-7).</summary>
+        public bool CrashReporting;
+        /// <summary>Crashes of earlier processes reported at this launch.</summary>
+        public int CrashesReported;
+        /// <summary>Earlier processes that ended without a crash (background kills, quits).</summary>
+        public int ExitsNotCrashes;
+        /// <summary>Crash journal writes in this process (its own thread).</summary>
+        public long CrashJournalWrites;
+        /// <summary>Duration of the last crash journal write on its thread, in milliseconds.</summary>
+        public double CrashJournalWriteMs;
         /// <summary>"release", "dev" or "editor"; null before Initialize.</summary>
         public string BuildType;
         /// <summary>False in the Unity Editor unless ApmConfig.UploadInEditor.</summary>

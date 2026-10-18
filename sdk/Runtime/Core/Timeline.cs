@@ -123,6 +123,7 @@ namespace OzxApm.Core
                 return;
             lock (_lock)
                 AddCrumbLocked(NowMs(), KindText, text, null);
+            CrashJournal.NotifyChanged();
         }
 
         /// <summary>A breadcrumb text with the time it happened.</summary>
@@ -132,6 +133,7 @@ namespace OzxApm.Core
                 return;
             lock (_lock)
                 AddCrumbLocked(timeMs, KindText, text, null);
+            CrashJournal.NotifyChanged();
         }
 
         /// <summary>
@@ -144,6 +146,7 @@ namespace OzxApm.Core
                 return;
             lock (_lock)
                 AddCrumbLocked(timeMs, KindEvent, name, props);
+            CrashJournal.NotifyChanged();
         }
 
         private void AddCrumbLocked(long timeMs, byte kind, string text, string[] props)
@@ -174,6 +177,7 @@ namespace OzxApm.Core
                 return false;
             ulong shape = ShapeHash(message);
             var ring = type == LogType.Warning ? _warnings : _errors;
+            bool repeated = false;
             lock (_lock)
             {
                 long now = NowMs();
@@ -187,23 +191,30 @@ namespace OzxApm.Core
                         if (ring.Counts[j] < int.MaxValue)
                             ring.Counts[j]++;
                         ring.LastTimes[j] = now;
-                        return true;
+                        _repeats++;
+                        repeated = true;
+                        break;
                     }
                 }
-                int i = ring.At(ring.Count);
-                if (ring.Count == ring.Capacity)
-                    ring.Start = (ring.Start + 1) % ring.Capacity;
-                else
-                    ring.Count++;
-                ring.Times[i] = now;
-                ring.LastTimes[i] = now;
-                ring.Seqs[i] = ++_seq;
-                // Only a new, very long line is copied (a repeat is only counted).
-                ring.Texts[i] = message.Length > MaxStoredLogLength ? message.Substring(0, MaxStoredLogLength) : message;
-                ring.Counts[i] = 1;
-                ring.Shapes[i] = shape;
-                ring.Types[i] = type;
+                if (!repeated)
+                {
+                    int i = ring.At(ring.Count);
+                    if (ring.Count == ring.Capacity)
+                        ring.Start = (ring.Start + 1) % ring.Capacity;
+                    else
+                        ring.Count++;
+                    ring.Times[i] = now;
+                    ring.LastTimes[i] = now;
+                    ring.Seqs[i] = ++_seq;
+                    // Only a new, very long line is copied (a repeat is only counted).
+                    ring.Texts[i] = message.Length > MaxStoredLogLength ? message.Substring(0, MaxStoredLogLength) : message;
+                    ring.Counts[i] = 1;
+                    ring.Shapes[i] = shape;
+                    ring.Types[i] = type;
+                }
             }
+            // After the lock (a leaf): the crash journal rewrites itself (APM-7).
+            CrashJournal.NotifyChanged();
             return true;
         }
 
@@ -234,42 +245,7 @@ namespace OzxApm.Core
         {
             lock (_lock)
             {
-                int nc = 0;
-                for (int k = _crumbCount - 1; k >= 0 && nc < maxBreadcrumbs; k--)
-                {
-                    int i = (_crumbStart + k) % MaxBreadcrumbs;
-                    if (_crumbTimes[i] < sinceMs)
-                        continue;
-                    _pickCrumbs[nc++] = i;
-                }
-
-                // The newest maxLogs lines of both log rings, newest first.
-                int nl = 0;
-                int kw = _warnings.Count - 1, ke = _errors.Count - 1;
-                while (nl < maxLogs && nl < MaxLogLines && (kw >= 0 || ke >= 0))
-                {
-                    LogRing ring;
-                    int idx;
-                    if (ke < 0 || (kw >= 0 && _warnings.Seqs[_warnings.At(kw)] > _errors.Seqs[_errors.At(ke)]))
-                    {
-                        ring = _warnings;
-                        idx = _warnings.At(kw--);
-                    }
-                    else
-                    {
-                        ring = _errors;
-                        idx = _errors.At(ke--);
-                    }
-                    // Not break: a line counted again recently may sit before
-                    // newer ones (a ring is in order of first occurrence).
-                    if (ring.LastTimes[idx] < sinceMs)
-                        continue;
-                    if (excludeLog != null && ring.Counts[idx] == 1 && ReferenceEquals(ring.Texts[idx], excludeLog))
-                        continue;
-                    _pickLogRing[nl] = ring;
-                    _pickLogIndex[nl++] = idx;
-                }
-
+                PickLocked(maxBreadcrumbs, maxLogs, sinceMs, excludeLog, out int nc, out int nl);
                 var list = new List<string>(nc + nl);
                 // Both picks are newest first; merge oldest first.
                 int c = nc - 1, l = nl - 1;
@@ -278,19 +254,115 @@ namespace OzxApm.Core
                     bool takeCrumb = l < 0 || (c >= 0 && _crumbSeqs[_pickCrumbs[c]] < _pickLogRing[l].Seqs[_pickLogIndex[l]]);
                     if (takeCrumb)
                     {
-                        list.Add(FormatCrumbLocked(_pickCrumbs[c--], maxBreadcrumbLength));
+                        FormatCrumbLocked(_pickCrumbs[c--], maxBreadcrumbLength);
                     }
                     else
                     {
-                        list.Add(FormatLogLocked(_pickLogRing[l], _pickLogIndex[l], maxLogLength));
+                        FormatLogLocked(_pickLogRing[l], _pickLogIndex[l], maxLogLength);
                         _pickLogRing[l--] = null;
                     }
+                    list.Add(_sb.ToString());
                 }
                 return list;
             }
         }
 
-        private string FormatCrumbLocked(int i, int maxLength)
+        /// <summary>
+        /// Recording order of the time line: changes whenever a breadcrumb or a
+        /// log line is recorded (APM-7: the crash journal rewrites itself when
+        /// it changed). Any thread.
+        /// </summary>
+        internal long Version
+        {
+            get
+            {
+                lock (_lock)
+                    return _seq + _repeats;
+            }
+        }
+
+        // Repeats counted on an existing log line (they change its text).
+        private long _repeats;
+
+        /// <summary>
+        /// The time line as Snapshot formats it, appended to dst: each line as
+        /// prefix + line (passed through append, which escapes it) + '\n'.
+        /// Allocates nothing (APM-7: the crash journal, written several times a
+        /// second at most, on its own thread). Returns the number of lines.
+        /// </summary>
+        internal int AppendSnapshot(StringBuilder dst, string prefix, Action<StringBuilder, StringBuilder> append,
+            int maxBreadcrumbs, int maxLogs, int maxBreadcrumbLength, int maxLogLength)
+        {
+            lock (_lock)
+            {
+                PickLocked(maxBreadcrumbs, maxLogs, long.MinValue, null, out int nc, out int nl);
+                int c = nc - 1, l = nl - 1, n = 0;
+                while (c >= 0 || l >= 0)
+                {
+                    bool takeCrumb = l < 0 || (c >= 0 && _crumbSeqs[_pickCrumbs[c]] < _pickLogRing[l].Seqs[_pickLogIndex[l]]);
+                    if (takeCrumb)
+                    {
+                        FormatCrumbLocked(_pickCrumbs[c--], maxBreadcrumbLength);
+                    }
+                    else
+                    {
+                        FormatLogLocked(_pickLogRing[l], _pickLogIndex[l], maxLogLength);
+                        _pickLogRing[l--] = null;
+                    }
+                    dst.Append(prefix);
+                    append(dst, _sb);
+                    dst.Append('\n');
+                    n++;
+                }
+                return n;
+            }
+        }
+
+        // Picks the most recent breadcrumbs and log lines into the scratch
+        // arrays, newest first (under _lock).
+        private void PickLocked(int maxBreadcrumbs, int maxLogs, long sinceMs, string excludeLog, out int ncOut, out int nlOut)
+        {
+            int nc = 0;
+            for (int k = _crumbCount - 1; k >= 0 && nc < maxBreadcrumbs; k--)
+            {
+                int i = (_crumbStart + k) % MaxBreadcrumbs;
+                if (_crumbTimes[i] < sinceMs)
+                    continue;
+                _pickCrumbs[nc++] = i;
+            }
+
+            // The newest maxLogs lines of both log rings, newest first.
+            int nl = 0;
+            int kw = _warnings.Count - 1, ke = _errors.Count - 1;
+            while (nl < maxLogs && nl < MaxLogLines && (kw >= 0 || ke >= 0))
+            {
+                LogRing ring;
+                int idx;
+                if (ke < 0 || (kw >= 0 && _warnings.Seqs[_warnings.At(kw)] > _errors.Seqs[_errors.At(ke)]))
+                {
+                    ring = _warnings;
+                    idx = _warnings.At(kw--);
+                }
+                else
+                {
+                    ring = _errors;
+                    idx = _errors.At(ke--);
+                }
+                // Not break: a line counted again recently may sit before
+                // newer ones (a ring is in order of first occurrence).
+                if (ring.LastTimes[idx] < sinceMs)
+                    continue;
+                if (excludeLog != null && ring.Counts[idx] == 1 && ReferenceEquals(ring.Texts[idx], excludeLog))
+                    continue;
+                _pickLogRing[nl] = ring;
+                _pickLogIndex[nl++] = idx;
+            }
+            ncOut = nc;
+            nlOut = nl;
+        }
+
+        // Formats a breadcrumb into _sb (under _lock).
+        private void FormatCrumbLocked(int i, int maxLength)
         {
             var sb = _sb;
             sb.Length = 0;
@@ -311,10 +383,10 @@ namespace OzxApm.Core
             }
             StripUrlQueries(sb, 15);
             Cut(sb, maxLength);
-            return sb.ToString();
         }
 
-        private string FormatLogLocked(LogRing ring, int i, int maxLength)
+        // Formats a log line into _sb (under _lock).
+        private void FormatLogLocked(LogRing ring, int i, int maxLength)
         {
             var sb = _sb;
             sb.Length = 0;
@@ -330,11 +402,32 @@ namespace OzxApm.Core
             Cut(sb, room);
             if (count > 1)
             {
-                sb.Append(" (x").Append(count).Append(" until ");
+                sb.Append(" (x");
+                AppendDigits(sb, count);
+                sb.Append(" until ");
                 AppendClock(sb, ring.LastTimes[i]);
                 sb.Append(')');
             }
-            return sb.ToString();
+        }
+
+        /// <summary>Appends a non-negative number without allocating (StringBuilder.Append(int) does on Mono).</summary>
+        internal static void AppendDigits(StringBuilder sb, long value)
+        {
+            if (value < 0)
+            {
+                if (value == long.MinValue)
+                {
+                    sb.Append("-9223372036854775808");
+                    return;
+                }
+                sb.Append('-');
+                value = -value;
+            }
+            long div = 1;
+            while (value / div >= 10)
+                div *= 10;
+            for (; div > 0; div /= 10)
+                sb.Append((char)('0' + value / div % 10));
         }
 
         /// <summary>

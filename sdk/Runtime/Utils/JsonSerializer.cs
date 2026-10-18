@@ -149,6 +149,55 @@ namespace OzxApm.Utils
                     Field(w, "fingerprint", crash.fingerprint);
                     Field(w, "stack", crash.stack);
                     ArrayField(w, "breadcrumbs", crash.breadcrumbs);
+                    // APM-7; absent fields are what an older server ignores.
+                    OptionalField(w, "exit_reason", crash.exit_reason);
+                    if (crash.exit_status != 0)
+                    {
+                        w.Name("exit_status");
+                        w.Long(crash.exit_status);
+                    }
+                    OptionalField(w, "exit_description", crash.exit_description);
+                    if (crash.importance != 0)
+                    {
+                        w.Name("importance");
+                        w.Long(crash.importance);
+                    }
+                    if (crash.pss_kb > 0)
+                    {
+                        w.Name("pss_kb");
+                        w.Long(crash.pss_kb);
+                    }
+                    if (crash.rss_kb > 0)
+                    {
+                        w.Name("rss_kb");
+                        w.Long(crash.rss_kb);
+                    }
+                    OptionalField(w, "signal", crash.signal);
+                    OptionalField(w, "signal_code", crash.signal_code);
+                    OptionalField(w, "fault_addr", crash.fault_addr);
+                    OptionalField(w, "abort_message", crash.abort_message);
+                    OptionalField(w, "abi", crash.abi);
+                    if (crash.session_ms > 0)
+                    {
+                        w.Name("session_ms");
+                        w.Long(crash.session_ms);
+                    }
+                    if (crash.foreground)
+                        w.Ascii(",\"foreground\":true");
+                    var details = crash.details;
+                    if (details != null && details.Length >= 2)
+                    {
+                        w.Name("details");
+                        w.Byte((byte)'{');
+                        for (int i = 0; i + 1 < details.Length; i += 2)
+                        {
+                            if (i > 0) w.Byte((byte)',');
+                            w.String(details[i]);
+                            w.Byte((byte)':');
+                            w.String(details[i + 1]);
+                        }
+                        w.Byte((byte)'}');
+                    }
                     break;
 
                 // APM-6

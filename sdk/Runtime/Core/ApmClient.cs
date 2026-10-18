@@ -61,6 +61,10 @@ namespace OzxApm.Core
         private CustomCollector _customCollector;
         // Breadcrumbs and recent warnings (APM-6), shared by the collectors.
         private Timeline _timeline;
+        // Crash journal of this process and report of earlier ones (APM-7);
+        // null where crash reporting is off (not Android, or disabled).
+        private CrashMonitor _crash;
+        private string _crashDir;
 
         // Read by the static API from any thread (TrackEvent, RecordMetric,
         // timers, RecordBreadcrumb) without touching the UnityEngine.Object.
@@ -317,6 +321,11 @@ namespace OzxApm.Core
             _offlineStorage.Clear();
             _networkLogger?.ClearLogs();
             _sessionManager.OnConsentDenied();
+            // The crash journals (APM-7), also those left by earlier processes.
+            if (_crash != null)
+                _crash.DeleteAll();
+            else
+                CrashMonitor.DeleteDirectory(_crashDir, StoragePathForTests == null);
         }
 
         /// <summary>Writes the game's SetConsent choices to PlayerPrefs (RememberConsent).</summary>
@@ -396,6 +405,8 @@ namespace OzxApm.Core
             _offlineStorage.Clear(true);
             _sessionManager.ResetDeviceId();
             _sessionManager.StartNewSession();
+            // Journals of earlier processes carry the old id (APM-7).
+            _crash?.OnDeviceIdReset();
             Log(LogLevel.Info, "Device id reset; local events deleted");
             return _sessionManager.DeviceId;
         }
@@ -860,11 +871,13 @@ namespace OzxApm.Core
                 : new OfflineStorage(config);
             _networkLogger = new NetworkLogger(config);
             _reporter = new EventReporter(config, _offlineStorage, _networkLogger);
+            _crashDir = CrashDirForTests ?? System.IO.Path.Combine(Application.persistentDataPath, CrashJournal.DirectoryName);
             if (_resetDeviceIdBeforeInit)
             {
                 // ResetDeviceId before Initialize: stored events carry the old id.
                 _resetDeviceIdBeforeInit = false;
                 _offlineStorage.Clear(true);
+                CrashMonitor.DeleteDirectory(_crashDir, CrashDirForTests == null);
             }
             if (_config.GetConsent(ConsentCategory.Technical) == ConsentState.Denied)
             {
@@ -877,16 +890,74 @@ namespace OzxApm.Core
             // Initialize collectors
             _timeline = new Timeline();
             s_timeline = _timeline;
+            _currentScene = SceneManager.GetActiveScene().name;
+            CreateCrashMonitor();
             InitializeCollectors();
 
             // Subscribe to scene changes
             SceneManager.sceneLoaded += OnSceneLoaded;
-            _currentScene = SceneManager.GetActiveScene().name;
 
             _isInitialized = true;
             Log(LogLevel.Info, $"APM SDK initialized successfully (build type {_buildType}, consent technical {_config.GetConsent(ConsentCategory.Technical)}, analytics {_config.GetConsent(ConsentCategory.Analytics)})");
             if (!_uploadsEnabled)
                 Log(LogLevel.Info, "Running in the Editor: events are stored but not uploaded (ApmConfig.UploadInEditor)");
+        }
+
+        /// <summary>
+        /// Crash reporting (APM-7): on the Android player unless
+        /// ApmConfig.EnableCrashReporting is off. A few JNI calls here (the
+        /// application context and the pid); the journal is written and earlier
+        /// processes are reported on their own threads once collecting starts.
+        /// </summary>
+        private void CreateCrashMonitor()
+        {
+            if (!_config.EnableCrashReporting)
+                return;
+            IExitInfoSource source;
+            int pid;
+            if (ExitInfoForTests != null || CrashDirForTests != null)
+            {
+                source = ExitInfoForTests;
+                pid = PidForTests;
+            }
+            else if (Application.platform == RuntimePlatform.Android)
+            {
+                var android = AndroidExitInfo.Capture();
+                source = android;
+                pid = android.Pid;
+            }
+            else
+            {
+                return; // iOS and desktop: not yet (the journal alone would report kills as "unknown")
+            }
+            var inputs = new JournalInputs
+            {
+                Pid = pid,
+                ProcessStartMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                AppVersion = _config.AppVersion ?? "",
+                BuildType = _buildType ?? "",
+                Platform = _platform ?? "",
+                DeviceModel = _deviceModel ?? "",
+                OsVersion = _osVersion ?? "",
+                Gpu = _gpu ?? "",
+                RamClass = _ramClass ?? "",
+                Abi = AndroidExitInfo.ProcessAbi(),
+                NetType = _netType ?? "",
+                Scene = _currentScene ?? "",
+                Clock = _sessionManager.Clock,
+                DeviceId = () => _sessionManager.DeviceId,
+                Timeline = _timeline,
+            };
+            var storage = _offlineStorage;
+            bool threads = StoragePathForTests == null;
+            _crash = new CrashMonitor(_crashDir, inputs, source, EnqueuePreviousCrash,
+                () => _config.TechnicalAllowed,
+                timeoutMs =>
+                {
+                    storage.Flush();
+                    return storage.WaitIdle(timeoutMs);
+                },
+                threads);
         }
 
         private void InitializeCollectors()
@@ -895,6 +966,7 @@ namespace OzxApm.Core
             {
                 _performanceCollector = new PerformanceCollector(_config, this);
                 _collectors.Add(_performanceCollector);
+                _crash?.SetPerf(_performanceCollector);
             }
 
             if (_config.EnableJankDetection)
@@ -969,6 +1041,14 @@ namespace OzxApm.Core
                 return;
             _collecting = on;
             s_collecting = on;
+            try
+            {
+                _crash?.OnCollecting(on);
+            }
+            catch (Exception ex)
+            {
+                ReportInternalError("CrashMonitor", ex);
+            }
             foreach (var collector in _collectors)
             {
                 if (ReferenceEquals(collector, _startupTracker))
@@ -1042,6 +1122,22 @@ namespace OzxApm.Core
                 stats.MetricSamplesDropped = samplesDropped;
             }
             stats.CustomRejected = CustomCollector.RejectedCount;
+            if (client._crash != null)
+            {
+                stats.CrashReporting = true;
+                var reporter = client._crash.Reporter;
+                if (reporter != null)
+                {
+                    stats.CrashesReported = reporter.Reported;
+                    stats.ExitsNotCrashes = reporter.NotCrashes;
+                }
+                var journal = client._crash.Journal;
+                if (journal != null)
+                {
+                    stats.CrashJournalWrites = System.Threading.Interlocked.Read(ref journal.Writes);
+                    stats.CrashJournalWriteMs = journal.LastWriteTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+                }
+            }
             stats.TimersSpanningPause = TimerRegistry.SpanningPauseCount;
             stats.TimersUntracked = TimerRegistry.UntrackedCount;
             if (client._timeline != null)
@@ -1058,6 +1154,11 @@ namespace OzxApm.Core
 
         /// <summary>Storage directory for the next Initialize; the worker is then pumped by the test.</summary>
         internal static string StoragePathForTests;
+        /// <summary>APM-7: crash journal directory, exit records and pid for the next Initialize (enables crash reporting off Android).</summary>
+        internal static string CrashDirForTests;
+        internal static IExitInfoSource ExitInfoForTests;
+        internal static int PidForTests = 4242;
+        internal CrashMonitor CrashMonitorForTests => _crash;
         internal OfflineStorage StorageForTests => _offlineStorage;
         internal EventReporter ReporterForTests => _reporter;
         internal ExceptionCollector ExceptionCollectorForTests => _exceptionCollector;
@@ -1086,6 +1187,9 @@ namespace OzxApm.Core
             for (int i = 0; i < _explicitConsent.Length; i++)
                 _explicitConsent[i] = -1;
             StoragePathForTests = null;
+            CrashDirForTests = null;
+            ExitInfoForTests = null;
+            PidForTests = 4242;
         }
 
         private void Update()
@@ -1151,6 +1255,7 @@ namespace OzxApm.Core
             {
                 _nextNetTypeCheck = now + NetTypePollSeconds;
                 _netType = DeviceInfo.GetNetworkType();
+                _crash?.OnNetType(_netType);
             }
 
             using (Markers.Upload.Auto())
@@ -1176,6 +1281,8 @@ namespace OzxApm.Core
             try
             {
                 _sessionManager.OnApplicationPause(paused);
+                // The journal says whether a later kill hit the game in the foreground (APM-7).
+                _crash?.OnPause(paused);
 
                 if (paused)
                 {
@@ -1258,6 +1365,9 @@ namespace OzxApm.Core
 
                 SceneManager.sceneLoaded -= OnSceneLoaded;
 
+                // A clean exit is not a crash: this process's journal goes (APM-7).
+                _crash?.OnShutdown();
+
                 // Unsent batches stay on disk and are uploaded on the next launch.
                 _reporter.Shutdown();
                 _offlineStorage.Shutdown(ShutdownFlushTimeoutMs);
@@ -1278,6 +1388,7 @@ namespace OzxApm.Core
             try
             {
                 _currentScene = scene.name;
+                _crash?.OnScene(scene.name);
                 RecordBreadcrumb($"Scene: {scene.name}");
             }
             catch (Exception ex)
@@ -1298,6 +1409,9 @@ namespace OzxApm.Core
                 // The current window of custom metrics and counts too (it would
                 // otherwise be lost with the process).
                 _customCollector?.FlushPending();
+                // The journal with the exception on its time line (APM-7): the
+                // process ends before the journal's thread would write it.
+                _crash?.Journal?.WriteNow();
                 var storage = _offlineStorage;
                 if (storage == null)
                     return;
@@ -1357,6 +1471,29 @@ namespace OzxApm.Core
             catch (Exception ex)
             {
                 ReportInternalError("EnqueueEvent", ex);
+            }
+        }
+
+        /// <summary>
+        /// Enqueues the crash of an earlier process (APM-7, CrashReporter, on its
+        /// thread). Unlike EnqueueEvent, every field is kept as it is: the
+        /// session, version, scene, device details and context are those of the
+        /// crashed process. Only with technical consent.
+        /// </summary>
+        internal void EnqueuePreviousCrash(CrashEvent evt)
+        {
+            var storage = _offlineStorage;
+            if (evt == null || storage == null || !_config.TechnicalAllowed)
+                return;
+            try
+            {
+                if (evt.ctx == null)
+                    evt.ctx = ContextSnapshot.Empty;
+                storage.Enqueue(evt);
+            }
+            catch (Exception ex)
+            {
+                ReportInternalError("EnqueuePreviousCrash", ex);
             }
         }
 

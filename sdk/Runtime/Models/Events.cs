@@ -147,13 +147,43 @@ namespace OzxApm.Models
         }
     }
 
+    /// <summary>
+    /// A crash of an earlier process (APM-7), reported on the next launch by
+    /// CrashReporter from the crash journal of that process and, on Android
+    /// 11+, Android's record of how it ended (ApplicationExitInfo). Its common
+    /// fields (session, version, scene, context, device) are those of the
+    /// crashed process, not of the reporting one.
+    /// </summary>
     [Serializable]
     public class CrashEvent : BaseEvent
     {
+        /// <summary>"native", "anr", "java", "oom", "killed" or "unknown" (CrashReporter).</summary>
         public string crash_type;
+        /// <summary>The SDK's fingerprint; the server computes its own (with the uploaded symbols).</summary>
         public string fingerprint;
+        /// <summary>The crashed (or blocked) thread first, then UnityMain and main; normalized frame lines.</summary>
         public string stack;
         public List<string> breadcrumbs;
+        /// <summary>ApplicationExitInfo reason ("CRASH_NATIVE", "ANR", "LOW_MEMORY", ...); "" when unknown.</summary>
+        public string exit_reason;
+        public int exit_status;
+        public string exit_description;
+        public int importance;
+        public long pss_kb;
+        public long rss_kb;
+        /// <summary>Native crash: signal name, code name, fault address, abort message (from the tombstone).</summary>
+        public string signal;
+        public string signal_code;
+        public string fault_addr;
+        public string abort_message;
+        /// <summary>The process ABI ("arm64-v8a"): picks the symbols when frames have no build id.</summary>
+        public string abi;
+        /// <summary>Milliseconds from the start of the session to the crash.</summary>
+        public long session_ms;
+        /// <summary>The game was in the foreground (not paused) when it ended.</summary>
+        public bool foreground;
+        /// <summary>Further key, value pairs (last performance figures, how it was detected); null for none.</summary>
+        [NonSerialized] internal string[] details;
 
         public CrashEvent()
         {

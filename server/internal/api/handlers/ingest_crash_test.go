@@ -4,8 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"go.uber.org/zap"
 
@@ -162,5 +166,48 @@ func TestIngest_KilledAndOOMCrashes(t *testing.T) {
 	}
 	if anr.Summary != "ANR: user request after error: Input dispatching timed out in com.ozx.Foo.bar" {
 		t.Errorf("anr summary %q", anr.Summary)
+	}
+}
+
+// testdata/sdk_events_apm7.jsonl: crash events built by the SDK's
+// CrashReporter from a journal and a protobuf tombstone / ANR trace and
+// serialized on Unity's Mono (/tmp/claude-501/apm7/gen). The server must
+// store them with every field, and read the SDK's stack.
+func TestIngest_CrashEventsFromTheSDK(t *testing.T) {
+	b, err := os.ReadFile("../../processor/testdata/sdk_events_apm7.jsonl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := regexp.MustCompile(`"timestamp":\d+`)
+	now := `"timestamp":` + strconv.FormatInt(time.Now().Add(-time.Minute).UnixMilli(), 10)
+	var lines []string
+	for _, l := range strings.Split(strings.TrimSpace(string(b)), "\n") {
+		lines = append(lines, ts.ReplaceAllString(l, now))
+	}
+	store := &fakeEventStore{}
+	h := newIngestHandler(store, zap.NewNop())
+	_, resp := postBatch(t, h, batchOf(lines...), map[string]string{SDKVersionHeader: "2.0.0"})
+	if resp.Accepted != 4 || resp.Rejected != 0 || len(resp.Errors) != 0 || len(store.crashes) != 4 {
+		t.Fatalf("response %+v", resp)
+	}
+	native, anr, oom, unknown := store.crashes[0], store.crashes[1], store.crashes[2], store.crashes[3]
+	if native.CrashType != "native" || native.Signal != "SIGSEGV" || native.SignalCode != "SEGV_MAPERR" || native.ExitReason != "CRASH_NATIVE" ||
+		native.ExitStatus != 11 || native.PssKB != 512000 || native.ABI != "arm64-v8a" || !bool(native.Foreground) || native.SessionMs != 34000 ||
+		native.SessionID != "1760780000000_ab12cd34" || native.Context["roomId"] != "r-12" || native.Details["trace"] != "proto" ||
+		len(native.Breadcrumbs) != 2 || native.EventID != "92fdd3f521c6894037e0a351e02087d0" {
+		t.Errorf("native %+v", native)
+	}
+	// The SDK's stack is parsed by the server: in-app frames of libil2cpp with the build id.
+	if native.CrashSite != "libil2cpp.so+0x5417bc" || !strings.HasPrefix(native.Summary, "SIGSEGV (SEGV_MAPERR) at 0x0000000000000008 in libil2cpp.so+0x5417bc") {
+		t.Errorf("site %q summary %q", native.CrashSite, native.Summary)
+	}
+	if anr.CrashType != "anr" || anr.CrashSite != "libil2cpp.so+0x5417bc" || !strings.HasPrefix(anr.Summary, "ANR: user request after error") {
+		t.Errorf("anr %+v", anr.CrashDetails)
+	}
+	if oom.CrashType != "oom" || oom.Summary != "Killed for low memory in the foreground (PSS 1024 MB)" {
+		t.Errorf("oom %+v", oom.CrashDetails)
+	}
+	if unknown.CrashType != "unknown" || unknown.ExitReason != "" || unknown.Details["detected_by"] != "journal" {
+		t.Errorf("unknown %+v", unknown.CrashDetails)
 	}
 }

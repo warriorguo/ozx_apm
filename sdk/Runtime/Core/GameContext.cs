@@ -196,6 +196,9 @@ namespace OzxApm.Core
         /// <summary>SetContext calls refused so far (invalid key, too many keys, context too large).</summary>
         public static int RejectedCount => s_rejected;
 
+        /// <summary>Changes with every change of the context (APM-7: the crash journal). Any thread.</summary>
+        internal static int Version => s_version;
+
         /// <summary>Values cut to MaxValueLength so far.</summary>
         public static int TruncatedCount => s_truncated;
 
@@ -268,8 +271,10 @@ namespace OzxApm.Core
             }
 
             string reason = null;
+            int versionBefore;
             lock (s_lock)
             {
+                versionBefore = s_version;
                 bool exists = s_values.TryGetValue(key, out string old);
                 if (exists && old.Length == length && string.CompareOrdinal(old, 0, value, 0, length) == 0)
                 {
@@ -301,6 +306,8 @@ namespace OzxApm.Core
                 }
             }
 
+            if (s_version != versionBefore)
+                CrashJournal.NotifyChanged();
             if (reason != null)
             {
                 Violation(reason, key, true);
@@ -323,8 +330,9 @@ namespace OzxApm.Core
                 s_values.Remove(key);
                 s_totalLength -= EntryLength(key, old);
                 s_version++;
-                return true;
             }
+            CrashJournal.NotifyChanged();
+            return true;
         }
 
         /// <summary>Removes every key.</summary>
@@ -338,6 +346,7 @@ namespace OzxApm.Core
                 s_totalLength = 0;
                 s_version++;
             }
+            CrashJournal.NotifyChanged();
         }
 
         internal static void ResetForTests()

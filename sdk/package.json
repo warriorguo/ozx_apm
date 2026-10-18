@@ -2,7 +2,7 @@
   "name": "com.ozx.apm",
   "version": "2.0.0",
   "displayName": "OZX APM",
-  "description": "Application Performance Monitoring SDK for Unity games. Supports crash/exception tracking, FPS/jank detection, startup timing, and scene load monitoring.",
+  "description": "Application Performance Monitoring SDK for Unity games. Supports crash (native, ANR, kills; IL2CPP symbolication)/exception tracking, FPS/jank detection, startup timing, and scene load monitoring.",
   "unity": "2020.3",
   "unityRelease": "0f1",
   "documentationUrl": "https://github.com/warriorguo/ozx_apm",
@@ -25,5 +25,8 @@
       "description": "Shows how to initialize and use the APM SDK",
       "path": "Samples~/BasicUsage"
     }
-  ]
+  ],
+  "dependencies": {
+    "com.unity.modules.androidjni": "1.0.0"
+  }
 }

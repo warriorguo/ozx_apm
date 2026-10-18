@@ -87,6 +87,16 @@ namespace OzxApm.Core
         public int MaxCustomEventsPerMinute { get; set; } = 60;
 
         /// <summary>
+        /// Native crashes, ANRs and kills by the system (APM-7), Android player
+        /// only: a crash journal (session, context, breadcrumbs, recent warnings
+        /// and errors, scene, foreground) is kept on disk while the game runs,
+        /// and the next launch reports how the previous process ended
+        /// (ApplicationExitInfo on Android 11+, with the native stack on 12+ and
+        /// the ANR trace on 11+). Technical data: only with technical consent.
+        /// </summary>
+        public bool EnableCrashReporting { get; set; } = true;
+
+        /// <summary>
         /// Performance sampling interval in seconds
         /// </summary>
         public float SamplingIntervalSeconds { get; set; } = 1.0f;
