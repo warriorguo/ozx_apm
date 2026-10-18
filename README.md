@@ -214,6 +214,62 @@ ApmClient.ResetDeviceId();                   // new id + new session, local even
 - Main thread. Details, server-side deletion and the admin grant:
   `server/RELEASE.md` (APM-14).
 
+### Crashes, ANRs and kills (Android)
+
+On by default on the Android player (`ApmConfig.EnableCrashReporting`), with
+technical consent only. While the game runs, the SDK keeps a small crash
+journal on disk: session, version, scene, foreground/background, the game
+context and the breadcrumb time line (custom events, scene loads, recent
+warnings and errors). It is rewritten on its own thread, at most every
+0.1 s and only when something changed. At the next launch the SDK reports
+how the previous process ended, with that context:
+
+| Android says (11+) | Reported as |
+|---|---|
+| `CRASH_NATIVE` (native or IL2CPP crash; the stack from the tombstone on 12+) | `native` |
+| `ANR` (with the main and UnityMain threads of the ANR trace) | `anr` |
+| `CRASH` (Java) | `java` |
+| `LOW_MEMORY` while in the foreground | `oom` |
+| killed while in the foreground (`SIGNALED`, `EXCESSIVE_RESOURCE_USAGE`, ...) | `killed` |
+| nothing (Android 10 and older), but the game was in the foreground | `unknown` |
+
+A process reclaimed in the background, `Application.Quit` and a clean
+shutdown are not crashes. Nothing to call; `ApmClient.GetStats()` has
+`CrashReporting`, `CrashesReported` and the journal's writes.
+
+### IL2CPP symbols (C# names, files and lines in native stacks)
+
+A release `libil2cpp.so` has no symbols: a native crash only says
+`libil2cpp.so + 0x5417bc`. Upload the build's symbols once per build (CI
+step after the Unity build); the admin then shows the C# method and, with
+the line map, the file and line, also for crashes stored before the upload.
+
+Build settings (Unity 2022.3, Android):
+
+```csharp
+EditorUserBuildSettings.androidCreateSymbols = AndroidCreateSymbols.Debugging;  // symbols.zip with libil2cpp.dbg.so
+PlayerSettings.SetAdditionalIl2CppArgs("--emit-source-mapping --emit-method-map"); // LineNumberMappings.json, MethodMap.tsv
+// For managed exceptions (not native crashes): file and line in their stacks
+PlayerSettings.SetIl2CppStacktraceInformation(NamedBuildTarget.Android, Il2CppStacktraceInformation.MethodFileLineMapping);
+```
+
+Upload (Go 1.21+; the token is the admin server's `OZX_SYMBOLS_UPLOAD_TOKEN`):
+
+```bash
+cd server && go build -o apmsym ./cmd/apmsym
+export OZX_SYMBOLS_UPLOAD_TOKEN=...            # from the secret store
+./apmsym upload -url https://<admin-host> -app-version 1.2.3 -app-build 45 \
+    Builds/ozx-1.2.3-v45.symbols.zip Library/Bee/artifacts/Android/il2cppOutput
+./apmsym extract <same paths>                  # what would be uploaded, nothing sent
+./apmsym lookup libil2cpp.dbg.so 5417bc        # resolve an address locally
+```
+
+It reads ELF libraries (`*.sym.so`, `*.dbg.so`, `symbols.zip`),
+`MethodMap.tsv` and `LineNumberMappings.json` (searched under the given
+directories), keeps per library a compact table (functions; C# line
+ranges), and uploads it by the library's ELF build id. Details, limits and
+what each file adds: `server/RELEASE.md` (APM-7).
+
 ## API Endpoints
 
 ### Ingestion
@@ -296,6 +352,17 @@ next evaluation). Disabled until `OZX_ADMIN_ALERT_TOKEN` is set.
 curl -X POST http://localhost:8081/api/alerts/test -H "Authorization: Bearer $ALERT_TOKEN"
 ```
 
+### Symbols (admin server)
+
+**POST /api/symbols/part**, **POST /api/symbols/commit** - Upload of a
+library's symbol table by `apmsym` (APM-7). Bearer token
+`OZX_SYMBOLS_UPLOAD_TOKEN`; disabled (403) without one.
+
+**GET /api/symbols?build_id=&app_version=&module=** - Uploaded symbols.
+
+**GET /api/crashes/detail?fingerprint=F** - A crash group with its latest
+crash symbolicated (C# method, file, line), exit info, context and breadcrumbs.
+
 ## Event Types
 
 | Type | Description |
@@ -305,7 +372,7 @@ curl -X POST http://localhost:8081/api/alerts/test -H "Authorization: Bearer $AL
 | `startup` | App launch timing phases |
 | `scene_load` | Scene load and activation time |
 | `exception` | Non-fatal exceptions |
-| `crash` | Fatal crashes with breadcrumbs |
+| `crash` | Native crashes, ANRs, kills of the previous process, with its context and breadcrumbs (APM-7) |
 | `custom_event` | `ApmClient.TrackEvent` (APM-6) |
 | `custom_metric` | `RecordMetric` / timers, aggregated per name, context and minute (APM-6) |
 

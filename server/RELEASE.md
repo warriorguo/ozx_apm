@@ -2463,3 +2463,430 @@ curl -sS -X POST https://apm-admin.local.playquota.com/api/issues/state -H 'Cont
 - Crash alerts from real crashes: the SDK sends none until APM-7.
 - Two replicas of app 36 in a real deployment (only simulated).
 - The admin pages in a browser (vitest/jsdom only).
+
+## APM-7: native crashes, ANRs and kills (Android), IL2CPP symbolication (additive schema change)
+
+Deploy order: **server (both apps: 36 and 38), then the symbol upload in
+CI, then the admin UI, then SDK builds.** Each step works without the next:
+an older server stores the new crash events without the new fields (the
+SDK sends `fingerprint`, `stack`, `breadcrumbs`, `crash_type` as before);
+crashes without uploaded symbols show addresses; the previous admin UI
+reads the crash list and detail as before.
+
+Before this the SDK never produced a crash event: a native crash, an ANR or
+a kill ends the process before managed code can report anything, and an
+IL2CPP release `libil2cpp.so` has no symbols, so a native stack is only
+offsets.
+
+### SDK: crash journal
+
+`Core/CrashJournal.cs`. While the game runs (Android player, technical
+consent, `ApmConfig.EnableCrashReporting`, on by default), the SDK keeps a
+file per process in `<persistentDataPath>/ozx_apm_crash/`: pid, process
+start, session id and start, device id, version, build type, device, ABI,
+scene, foreground (not paused), the last perf sample's figures, the game
+context, and the time line a crash carries (the 20 most recent breadcrumbs
+and 10 most recent warning/error lines, cut to 200/300 characters, URL
+query strings removed: what an exception's first occurrence carries).
+
+- Written on its own thread (`OzxApm.Journal`), never on the main thread:
+  recording code (custom events, breadcrumbs, scene loads, warning/error
+  lines, `SetContext`, pause/resume) only calls `NotifyChanged`, a flag
+  (an interlocked exchange; the writer is woken only when it sleeps). The
+  writer writes at once, then at most every 100 ms while things change
+  (bursts are coalesced), and every 5 s otherwise (a heartbeat: `written`
+  says when the process was last alive).
+- No allocation per write: the time line is formatted straight into
+  reused buffers (Timeline.AppendSnapshot; `StripUrlQueries` now replaces
+  in place, which also removes ~550 B per URL from exception snapshots),
+  encoded into a reused byte array, written with an unbuffered FileStream.
+- No fsync: what a process wrote is in the page cache, which survives the
+  process (a native crash, a kill); only a power loss or kernel crash can
+  lose the last write. Page-cache overwrites of the same 4 KB reach the
+  flash at writeback, not at every write.
+- Two files written in turn, each ending with an FNV-1a checksum: a process
+  killed in the middle of a write leaves the other, previous write intact.
+- A crash within ~0.1 s of the last change may miss that change (the
+  writer had not written it yet); an unhandled managed exception that ends
+  the process writes the journal synchronously first (with the exception
+  on its time line).
+- Clean shutdown (`OnApplicationQuit`/`OnDestroy`, `ApmClient.Shutdown`)
+  deletes the process's journal: not a crash.
+
+### SDK: report at the next launch
+
+`Core/CrashReporter.cs`, on a background thread (`OzxApm.CrashReport`)
+once technical consent is granted, for the journals of earlier processes
+(the newest 5; a crash loop's older ones are deleted unreported):
+
+- Android 11+ (API 30): `ActivityManager.getHistoricalProcessExitReasons`
+  of the package (16 most recent) is matched by pid (and time). With the
+  exit's trace (`getTraceInputStream`: the ANR trace on 11+, the native
+  crash's tombstone on 12+, protobuf), copied to a file with
+  `android.os.FileUtils.copy` and reduced on the device (`Utils/CrashTraceParser.cs`)
+  to the signal, code, fault address, abort message, the "Cause:" line,
+  and the stacks of the crashed thread (an ANR: main, which is blocked),
+  UnityMain (where the C# code runs) and main, at most 64 frames each and
+  16,000 characters. Registers, memory dumps, memory maps, open files,
+  other threads and the log buffers (logcat may hold anything) never leave
+  the device; the app's library paths (random install directories) are
+  reduced to the file name (`libil2cpp.so`), system paths are kept.
+- Classification (`crash_type`): `CRASH_NATIVE` -> `native`, `ANR` ->
+  `anr`, `CRASH` -> `java`, always; `LOW_MEMORY` -> `oom` and the other
+  kills (`SIGNALED`, `EXCESSIVE_RESOURCE_USAGE`, `USER_REQUESTED`, `FREEZER`,
+  `OTHER`, ...) -> `killed` only in the foreground (the journal says not
+  paused, or Android's importance is foreground or visible); background
+  kills, `EXIT_SELF`, permission and package changes are not crashes.
+  Without an exit record (Android 10 and older, or Android kept none) a
+  journal that says foreground is reported as `unknown`.
+- The event keeps the crashed process's fields (session, version, scene,
+  device, build type, context, breadcrumbs), the exit's time, Android's
+  reason, status, description, importance and PSS/RSS, the ABI, the time
+  into the session, and `details` (`detected_by` exit_info/journal,
+  `journal_age_ms`, `uptime_ms`, `trace` proto/text/anr/none, `cause`, the
+  last fps / frame_ms / frame_ms_max / mem_mb / gc_count). Its `event_id` is
+  derived from the device id, pid and process start: a re-report (the app
+  died again before the event was on disk) is a duplicate the server drops.
+- The journals are deleted once the events are on disk (3 s wait on the
+  storage worker); otherwise they are reported again at the next launch.
+- JNI: at `Initialize`, on the main thread, the application context, the
+  API level and the pid (four JNI calls); the exit records on the report
+  thread (attached to the JVM while it runs). Every call is guarded: a
+  failure means "no exit record" (the journal is then reported as
+  `unknown` if it was in the foreground), never an error in the game.
+- Consent (APM-14): no journal without technical consent; withdrawing it
+  (Undecided) stops and deletes this process's journal and keeps those of
+  earlier processes (collected with consent; reported once granted again);
+  Denied deletes the directory, also at `Initialize`;
+  `ResetDeviceId` deletes the journals of earlier processes (they carry the
+  old id).
+- iOS and the Editor: off (`GetStats().CrashReporting` false).
+- Deletions of the directory (Denied, a reset before `Initialize`) and of
+  earlier journals (`ResetDeviceId`) are synchronous (a few small files): a
+  deferred delete raced the new journal and the report. The report also
+  deletes, unreported, a journal whose device id is not the current one,
+  and deletes every copied trace before it ends.
+
+### SDK: link.xml
+
+`Runtime/link.xml` preserves the `OzxApm` assembly under managed code
+stripping; because not every Unity version reads link.xml inside packages,
+`Editor/LinkXmlProvider.cs` (`IUnityLinkerProcessor`, assembly
+`OzxApm.Editor`) hands the same content to the linker from
+`Temp/OzxApm/link.xml`. The package now depends on the built-in module
+`com.unity.modules.androidjni`.
+
+### SDK: cost
+
+Unity's Mono outside Unity (M-series Mac), `/tmp/claude-501/apm7/bench`:
+
+| Path | Thread | Time | Allocated |
+|---|---|---|---|
+| `NotifyChanged` (every recording call) | any | 8-13 ns | 0 |
+| Warning repeated (time line + journal flag) | logging thread | 0.12-0.18 us | 0 |
+| Journal write: 30 context keys, 20 breadcrumbs, 10 log lines with URLs, 3.7 KB | journal thread | 21-27 us | 0 |
+| Report at launch (journal read, exit records, trace parse) | report thread | once per launch | a few KB to MB (the trace) |
+
+At most 10 writes a second while something changes every frame (warning
+spam), i.e. ~0.3 ms/s on the journal thread here; idle: one write per 5 s.
+`ApmClient.Update` gains nothing. The main thread pays, once at
+`Initialize`, four JNI calls; on pause/resume a flag.
+
+### Wire format (SDK -> server)
+
+```json
+{"type":"crash", <common fields of the crashed session>, "crash_type":"native",
+ "fingerprint":"896fbc8aa4063a37",
+ "stack":"Thread \"UnityMain\" tid=12380 crashed\n#00 pc 00000000005417bc libil2cpp.so (BuildId: 0d65...)\n#01 pc 000000000004e0dc /apex/com.android.runtime/lib64/bionic/libc.so (abort+164) (BuildId: 2c4f)\n...",
+ "breadcrumbs":["[10:00:01.000] Event: room_enter roomId=r-12", "[10:00:01.200] Warning: Asset not found: anim/x"],
+ "exit_reason":"CRASH_NATIVE", "exit_status":11, "exit_description":"crash", "importance":100,
+ "pss_kb":512000, "rss_kb":600000, "signal":"SIGSEGV", "signal_code":"SEGV_MAPERR",
+ "fault_addr":"0x0000000000000008", "abi":"arm64-v8a", "session_ms":34000, "foreground":true,
+ "details":{"detected_by":"exit_info","trace":"proto","fps":"58.9"}, "ctx":{"roomId":"r-12"}}
+```
+
+`server/internal/processor/testdata/sdk_events_apm7.jsonl` are four such
+events (native, ANR, OOM, unknown) built by the SDK's CrashReporter and
+serialized on Unity's Mono; the ingest test stores them.
+
+### Server: ingest and the crash fingerprint
+
+- `processor.NormalizeCrash` bounds every field (stack 32,000 characters,
+  50 breadcrumbs of 512, description 1,000, abort message 2,000,
+  identifiers 32 printable characters, numbers clamped, an unknown
+  `crash_type` stored as `unknown`); `details` follow the game context's
+  rules (counted in the response's errors when dropped).
+- `fingerprint.ParseCrashStack` reads the SDK's form and Android's text
+  forms (tombstone, ANR trace), bounded (8 threads x 256 frames of 64 KB).
+- Crash fingerprint, version 1 (`internal/fingerprint/crash.go`): native:
+  signal + the first 3 distinct in-app frames of the crashed thread; ANR:
+  the UnityMain thread's in-app frames (else the main thread's); Java: the
+  template of the description; kills: the exit reason. A frame is keyed by
+  `module!function` when uploaded symbols (or the device) name it, else by
+  `module+0x<pc> <build id>`: **with symbols uploaded before the crash
+  arrives (the CI step), the same bug is one group across builds; without,
+  one group per build** (addresses change with every build). Crashes
+  stored before their symbols were uploaded keep their address-keyed group
+  (the list and detail still show them symbolicated). The lookups at
+  ingest have a 3 s budget per batch; after a timeout or error the batch's
+  remaining crashes are keyed by address and stored (one warning).
+- Duplicates (APM-19): a re-sent crash is looked up by `event_id` without
+  the fingerprint filter (`EventIDLookup.AnyKey`), because its fingerprint
+  can differ from the stored copy's when symbols were uploaded in between;
+  crashes are few, the version and time filters and the event_id index
+  bound the read. The ReplacingMergeTree safety net only collapses copies
+  with the same fingerprint, so a duplicate that slips past the lookup
+  (lookup failed) and has another fingerprint stays.
+- `summary` (e.g. `SIGSEGV (SEGV_MAPERR) at 0x8 in Game.Rooms.RoomLoader.LoadTemplate (libil2cpp.so)`,
+  `ANR: Input dispatching timed out ...`, `Killed for low memory in the foreground (PSS 812 MB)`)
+  and `crash_site` are computed at ingest; the session time line shows the summary.
+
+### Symbols: what OZX uploads at build time
+
+Unity settings (2022.3, Android; in the build script or Player Settings):
+
+| Setting | What it gives | Without it |
+|---|---|---|
+| `EditorUserBuildSettings.androidCreateSymbols = AndroidCreateSymbols.Debugging` ("Create symbols.zip": Debugging) | `<name>.symbols.zip` next to the APK/AAB, with `libil2cpp.dbg.so` (symbols and DWARF line tables) per ABI | `Public`: `.sym.so` (functions only: names, no lines). The same files are in `Library/Bee/artifacts/Android/il2cppOutput/build/<abi>/` after any IL2CPP build |
+| `PlayerSettings.SetAdditionalIl2CppArgs("--emit-source-mapping --emit-method-map")` | `LineNumberMappings.json` (C++ line -> C# file:line) and `MethodMap.tsv` (C function -> C# method) in IL2CPP's Symbols folder | no C# files/lines; C# names guessed from IL2CPP's function names (`Type_Method_m<hash>` -> `Type.Method`; wrong split for nested types and types with `_`) |
+| `PlayerSettings.SetIl2CppStacktraceInformation(NamedBuildTarget.Android, Il2CppStacktraceInformation.MethodFileLineMapping)` | file and line in **managed exception** stacks (the APM-11 page; OZX-1277) | managed stacks without file/line; they carry no addresses, so the server cannot add them |
+
+`--emit-source-mapping` is what Unity passes itself when Cloud
+Diagnostics crash reporting is on; the source-mapping comments only change
+the generated C++, not the binary. **Not verified on a build:** that
+il2cpp accepts `--emit-method-map` by that name (it is derived from the
+option `EmitMethodMap` the way `--emit-source-mapping` is from
+`EmitSourceMapping`; if the build log rejects it, drop it: names are then
+guessed) and where the two files land (the tool searches the paths given).
+
+The upload (CI, after the build; `server/cmd/apmsym`, plain Go, no CGO):
+
+```bash
+cd server && go build -o /usr/local/bin/apmsym ./cmd/apmsym
+export OZX_SYMBOLS_UPLOAD_TOKEN=...      # the admin server's token (secret store)
+apmsym upload -url https://<admin-host> -app-version "$VERSION" -app-build "$VERSION_CODE" \
+  "$BUILD_DIR"/*.symbols.zip "$UNITY_PROJECT"/Library/Bee/artifacts/Android/il2cppOutput
+```
+
+- It reads every ELF library under the paths (zips are extracted to a
+  temporary directory; entry names reduced to their base name), keeps per
+  ELF build id the richest file (line table, then DWARF, then most
+  functions), reads `MethodMap.tsv` / `LineNumberMappings.json` when found,
+  and builds per library: the functions (start, size, display name: the C#
+  method from the method map, else the IL2CPP guess, else the demangled
+  C++ name; and the raw symbol) and, from the DWARF line tables mapped
+  through the line map, the addresses where the C# file:line changes
+  (closed by an empty row; only within a function, never across). C# paths
+  are cut to `Assets/...`, `Packages/...`, `Library/PackageCache/...` (the
+  build machine's directories are not uploaded). Measured on the test app
+  (89 MB `libil2cpp.dbg.so`, 29,611 functions, 843k DWARF rows, synthetic
+  line map): 0.26 s.
+- `libunity.sym.so` / `libmain.sym.so` in the zip are uploaded too (engine
+  frames get C++ names). `-modules libil2cpp.so` restricts it.
+- Upload: parts of at most 900 KB gzip (below nginx's 1 MB default) with a
+  random upload id, then a commit with the counts; retried 4 times. The
+  server keeps one row per (upload, address) (a part sent twice counts
+  once) and refuses a commit whose stored counts differ (409): only
+  committed uploads are used. Stateless: works with several admin replicas
+  and across both apps.
+- `apmsym extract <paths>` shows what would be uploaded; `apmsym lookup
+  <library> <hex address>` resolves an address locally (compare with the admin).
+
+### Server: storage, symbolication, admin API
+
+Schema (`schema.go`; `scripts/migrate.sql` regenerated):
+
+```sql
+ALTER TABLE apm_crashes ADD COLUMN IF NOT EXISTS client_fingerprint String DEFAULT '';
+ALTER TABLE apm_crashes ADD COLUMN IF NOT EXISTS fingerprint_version UInt8 DEFAULT 0;
+ALTER TABLE apm_crashes ADD COLUMN IF NOT EXISTS summary String DEFAULT '';
+ALTER TABLE apm_crashes ADD COLUMN IF NOT EXISTS crash_site String DEFAULT '';
+ALTER TABLE apm_crashes ADD COLUMN IF NOT EXISTS exit_reason LowCardinality(String) DEFAULT '';
+ALTER TABLE apm_crashes ADD COLUMN IF NOT EXISTS exit_status Int32 DEFAULT 0;
+ALTER TABLE apm_crashes ADD COLUMN IF NOT EXISTS exit_description String DEFAULT '';
+ALTER TABLE apm_crashes ADD COLUMN IF NOT EXISTS importance UInt16 DEFAULT 0;
+ALTER TABLE apm_crashes ADD COLUMN IF NOT EXISTS pss_kb UInt64 DEFAULT 0;
+ALTER TABLE apm_crashes ADD COLUMN IF NOT EXISTS rss_kb UInt64 DEFAULT 0;
+ALTER TABLE apm_crashes ADD COLUMN IF NOT EXISTS signal LowCardinality(String) DEFAULT '';
+ALTER TABLE apm_crashes ADD COLUMN IF NOT EXISTS signal_code LowCardinality(String) DEFAULT '';
+ALTER TABLE apm_crashes ADD COLUMN IF NOT EXISTS fault_addr String DEFAULT '';
+ALTER TABLE apm_crashes ADD COLUMN IF NOT EXISTS abort_message String DEFAULT '';
+ALTER TABLE apm_crashes ADD COLUMN IF NOT EXISTS abi LowCardinality(String) DEFAULT '';
+ALTER TABLE apm_crashes ADD COLUMN IF NOT EXISTS session_ms UInt64 DEFAULT 0;
+ALTER TABLE apm_crashes ADD COLUMN IF NOT EXISTS foreground UInt8 DEFAULT 0;
+ALTER TABLE apm_crashes ADD COLUMN IF NOT EXISTS details Map(LowCardinality(String), String);
+CREATE TABLE IF NOT EXISTS apm_symbol_files (...)  -- one row per committed upload
+CREATE TABLE IF NOT EXISTS apm_symbol_funcs (...)  -- build_id, upload_id, addr, size, name, raw_name
+CREATE TABLE IF NOT EXISTS apm_symbol_lines (...)  -- build_id, upload_id, addr, file, line
+```
+
+- Columns: metadata only, idempotent, within the `apm` account's `ALTER
+  ADD COLUMN`; fresh and migrated tables have the same columns in the same
+  order. `fingerprint_version` 0 marks rows stored before (the SDK sent
+  none; their fingerprint is whatever a client sent).
+- Symbol tables: `CREATE TABLE IF NOT EXISTS` (the `apm` account may),
+  ReplacingMergeTree `ORDER BY (build_id, upload_id, addr)`, partitioned by
+  month of upload, **TTL 400 days after the upload** (a build crashes for as
+  long as players run it, longer than crash rows live; uploading again
+  starts a new period). No index, no view, no MODIFY: nothing for an
+  admin to do. A refused CREATE is one warning per table at start
+  (`could not create a symbol table`); only symbolication depends on them.
+  No `device_id`: privacy deletion (APM-14) never touches them (tested).
+- Symbolication when a crash is read (`internal/symbols.Symbolizer`, used
+  by ingest for the fingerprint and by the admin API for display): per
+  frame of the app's libraries (in-app native frames of the first 3
+  threads, 64 each; the crash list only the top frame of each group), the
+  newest committed upload of the frame's build id (or, for a frame without
+  one, of the crash's version and ABI, marked "by version"; never without
+  a known ABI), then the function at or before the address and the line row
+  at or before it within that function. A caller frame's return address is
+  looked up minus one (the call, not the next statement). One query per
+  table per batch of 128 addresses: a UNION ALL of `ORDER BY addr DESC
+  LIMIT 1` reads through the sort key (a granule or two each). Cached:
+  resolved addresses per upload (LRU, 50,000 admin / 20,000 ingest) and the
+  upload of a build id for 1 minute (a new upload is used within a minute;
+  a build without symbols is not looked up again for a minute).
+- Inlined code: a frame is named by the function the address is in; with
+  IL2CPP's inlining its file:line can be inside a method that function
+  inlined (the line table's location).
+
+Admin API (both apps run it):
+
+- `POST /api/symbols/part`, `POST /api/symbols/commit`: `Authorization:
+  Bearer <token>`, compared in constant time with `admin_server.symbols_token`,
+  environment **`OZX_SYMBOLS_UPLOAD_TOKEN`**; without it both answer 403
+  (`symbol upload disabled: no token configured`, logged once at start); a
+  missing or wrong token 401, logged with path and remote address, never
+  the token. Body at most 1 MB compressed and 16 MB decompressed (413),
+  100,000 rows per part, build ids 8-80 hex digits, upload ids 32, module a
+  file name (no `/`), arch arm64/arm/x86/x86_64, names cut to 1024 bytes and
+  files to 256, control characters and invalid UTF-8 replaced, addresses
+  below 2^48; at most two parts inserted at once (ClickHouse connections
+  are shared with ingest). Storage errors answer 503 (the tool retries).
+  Set the token like the privacy token (APM-14): a secret environment
+  variable on apps 36 and 38, `openssl rand -hex 32`, redeploy; the CI job
+  gets the same value.
+- `GET /api/symbols?build_id=&app_version=&module=`: committed uploads
+  (no token, read-only like the rest of the admin API).
+- `GET /api/crashes`: per group also `exit_reason`, `signal`, `crash_site`,
+  `top_frame` (the latest crash's first in-app frame symbolicated now, e.g.
+  `Game.Rooms.RoomLoader.LoadTemplate(System.Int32) (Assets/Scripts/Rooms/RoomLoader.cs:71)`),
+  `symbolicated`, `foreground` (crashes in the foreground); `sample_message`
+  is the latest summary; type and stack are the latest crash's (were `any`).
+  The groups query takes the latest crash's `event_id`; the start of its
+  stack (4,000 characters) is read for the page's groups only (`LIMIT 1 BY
+  event_id`), not for every row.
+- `GET /api/crashes/detail`: adds `sample` (the latest crash: every field
+  above, `threads` with frames `{index, native, pc, module, build_id,
+  function, offset, file, line, in_app, symbolicated, symbols_by, raw}`),
+  `symbols` (per app library of the sample: build id, uploaded or not,
+  with C# lines or not), `fingerprint_version`; occurrences (20) add
+  session id, device id, summary and the exit fields.
+- Session time line: a crash item's message is its summary.
+
+Admin UI: Crashes list (summary, symbolicated top frame, foreground
+count) opens a detail page (`/crashes/detail?fingerprint=F`): how the
+process ended, the stack per thread (C# method, file:line; libraries
+without symbols say so), the context, scene and breadcrumbs before the
+crash, links to the session time line at the crash and to the device's
+sessions, distributions, recent crashes. The exception detail page says
+how to get file and line when an IL2CPP stack has none.
+
+### Rolling deploy and rollback
+
+Old and new binaries serve side by side: the old binary names its insert
+columns (its rows read the defaults), ignores the symbol tables and has no
+symbol endpoints (the tool gets 404/405: deploy the server first). A crash
+stored by the old binary has the SDK's fingerprint (version 0), one stored
+by the new one the server's: the same crash can be two groups during the
+deploy. **Rollback:** redeploy the previous binary; no schema action; the
+columns and symbol tables stay (unused; symbols expire by TTL). The SDK
+with APM-7 against an older server: crash events are stored with type,
+fingerprint, stack and breadcrumbs; the rest is ignored. To roll back the
+SDK, ship a build without it; journals left on devices are never read
+(and stay in `ozx_apm_crash/`, a few KB) until a build with the SDK runs
+again. **SDK rollback warning:** none beyond APM-14's.
+
+To remove the tables after a permanent rollback (admin):
+`DROP TABLE apm_symbol_files; DROP TABLE apm_symbol_funcs; DROP TABLE apm_symbol_lines;`
+
+### Verified
+
+- Server: `go vet`, `go test ./...` (unit): the crash stack parser (SDK,
+  tombstone and ANR forms, hostile input), crash fingerprint (the same
+  methods at other addresses in two builds are one group; by address per
+  build otherwise; ANR by UnityMain; kills by reason), normalization,
+  summaries, ingest of SDK-serialized crash events (fixture from the SDK on
+  Unity's Mono) with and without symbols and with a failing symbol store,
+  the symbols package (ELF symbol tables and build ids for arm64 and Thumb,
+  DWARF line tables mapped through a LineNumberMappings.json in IL2CPP's
+  format onto C# lines, function boundaries, method map names, IL2CPP name
+  guess, demangling, upload validation), the symbolizer (return addresses,
+  line ranges, caches, TTL, batching, fallback by version and ABI), the
+  upload endpoints (auth 401/403, token never logged, gzip bomb and body
+  limits 413, invalid rows 400, a part sent twice, early commit 409,
+  storage 503), the admin symbolication of a stack (and `<script>` in frame
+  text kept as text), config. `testdata/` has a library built like IL2CPP
+  output with the NDK (`gen.sh`).
+- `apmsym extract/lookup` on the test app's real `libil2cpp.sym.so` /
+  `.dbg.so` (Unity 2022.3.62, arm64): build id `0d65a2d2...` equal in the
+  shipped, `.sym` and `.dbg` files, 29,611 functions, 11,283 C# methods,
+  `0x5417c0` -> `ApmTestDriver.Apply+0x4`.
+- Admin UI: `tsc`, vitest (134 tests; new: the crash detail page with the
+  symbolicated stack, file:line, exit info, symbol status, context and
+  breadcrumbs, encoded links, `<script>`/`<img onerror>` in game text
+  rendered as text, an older server's response, a kill without stack, 404;
+  the list's top frame and row link; the exception page's file/line hint),
+  `vite build`.
+- A code review (another agent) found: deferred deletions racing the new
+  journal and the report (a reset could still report old-id crashes; a
+  Denied-then-Granted journal could be unlinked while written); re-sent
+  crashes escaping the duplicate lookup when symbols changed their
+  fingerprint; a symbol budget per crash instead of per batch; the crash
+  list reading every row's stack and symbolicating whole stacks for one
+  frame; the upload's concurrency slot taken after decoding 16 MB; copied
+  traces left on disk when consent changed mid-report; the version
+  fallback used without an ABI; the throttle not interruptible by Stop; a
+  token length leak; the crash fingerprint sharing the exceptions'
+  version constant. All fixed, with tests where they apply. Checked by it
+  and found correct: tombstone.proto field numbers, LineNumberMappings
+  parsing, ELF deduplication against the commit counts, zip extraction,
+  upload auth and bounds, no HTML from game text, the JNI signatures, the
+  journal's wake-up handshake and torn-write handling, the SQL on 23.8-26.1.
+- Server unit tests: 453 passing test functions and subtests (`go test -short -v ./...`).
+- SDK: compiles at C# 8 with and without `UNITY_2021_2_OR_NEWER`, for
+  Android and iOS defines, and the editor assembly against Unity 2022.3's
+  `UnityEditor.CoreModule`; on Unity's Mono outside Unity the new parser
+  and journal/reporter tests pass (protobuf tombstone built field by field
+  per tombstone.proto, text tombstone, ANR trace, hostile and truncated
+  input, journal round trip with escaping, torn write and checksum, slot
+  rotation, the writer thread's coalescing, the report's classification
+  matrix, event fields, deterministic ids, journals kept until persisted,
+  no report without consent, a journal of another device id, a crash loop;
+  18 new tests), the previous fixtures still pass (198 pass in all; 2 fail
+  for the environment as before, and `LinkXmlTests` cannot load the editor
+  assembly outside Unity); the allocation numbers above. The test driver
+  (`/tmp/claude-501/apm7/ApmTestDriver.cs`) compiles against this SDK.
+
+### Not verified
+
+- Anything on a device or in Unity: the EditMode tests that need the
+  Unity runtime (`CrashReportingTests` through `ApmClient`, the allocation
+  constraints, `LinkXmlTests`), JNI calls (`AndroidExitInfo`: exit records,
+  `FileUtils.copy` of the trace, from the report thread), the tombstone of
+  a real Android 12+ device (the parser follows tombstone.proto; the device
+  plan checks it), Unity's own signal handler chaining to debuggerd (the
+  tombstone and `CRASH_NATIVE` exist), whether blocking UnityMain produces
+  an ANR on the test device, the low-memory kill's reason, the link.xml
+  under High stripping, Unity 2020.3's `IUnityLinkerProcessor`.
+- ClickHouse: the integration tests (`tests/integration/crash_symbols_test.go`:
+  upload in parts, commit, 409, list; crashes before and after the upload,
+  grouping, top frame, symbolicated detail with C# file:line, version
+  fallback, time line summary, privacy tables; 300 addresses through the
+  real queries) and the existing migration tests with the new columns and
+  tables were compiled, **not run** (the sandbox cannot reach the local
+  ClickHouse containers): run on 26.1, 24.1 and 23.8.
+- The build settings (`androidCreateSymbols`, `--emit-source-mapping
+  --emit-method-map`) on a real build, and the upload against the test
+  environment; cost of the symbol lookups at production volume.
+- iOS.
