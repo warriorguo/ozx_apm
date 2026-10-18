@@ -35,6 +35,7 @@ type crashEnv struct {
 	*apm4Env
 	repo *storage.Repository
 	lib  *symbols.Library
+	cfg  *config.ClickHouseConfig
 }
 
 func setupCrashEnv(t *testing.T, async bool) *crashEnv {
@@ -42,9 +43,10 @@ func setupCrashEnv(t *testing.T, async bool) *crashEnv {
 	e := setupAPM4(t, async)
 	cfg := testutil.TestClickHouseConfig()
 	cfg.Database = currentDB(t, e.client)
+	cfg.AsyncInsert = async
 	repo := storage.NewRepository(e.client, zap.NewNop())
 	e.admin = api.NewAdminRouter(&config.Config{AdminServer: config.AdminServerConfig{SymbolsToken: symbolsToken}}, repo, zap.NewNop())
-	return &crashEnv{apm4Env: e, repo: repo, lib: readDemoLibrary(t)}
+	return &crashEnv{apm4Env: e, repo: repo, lib: readDemoLibrary(t), cfg: cfg}
 }
 
 func currentDB(t *testing.T, c *storage.ClickHouseClient) string {
@@ -189,6 +191,11 @@ func TestCrashSymbols_UploadThenCrashesShowCSharpLines(t *testing.T) {
 				!list.Uploads[0].LineMap || list.Uploads[0].AppVersion != "2.1" {
 				t.Fatalf("uploads %+v", list.Uploads)
 			}
+
+			// The ingest symbolizer remembers for a minute that this build had
+			// no symbols (UploadTTL): a new ingest router stands for a server
+			// a minute later (or another replica).
+			e.ingest = api.NewRouter(&config.Config{ClickHouse: *e.cfg}, e.repo, zap.NewNop())
 
 			// Crashes stored after the upload: grouped by C# method, across a
 			// build without symbols for the same code.

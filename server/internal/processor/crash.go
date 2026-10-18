@@ -102,7 +102,21 @@ type CrashResolver func(f fingerprint.CrashFrame) string
 // ClientFingerprint. resolve may be nil (no symbols: native frames of the
 // app's libraries are keyed by address). Run it after validation and before
 // the duplicate lookup, like ApplyFingerprint for exceptions.
+//
+// A crash without anything the server can group by (no parsable frame and
+// none of the APM-7 fields: a producer other than the APM-7 SDK, or a hand
+// written event) keeps the fingerprint its client sent, with
+// fingerprint_version 0: the server's would put every such crash of a type
+// into one group, and the client's is the only grouping it has.
 func ApplyCrashFingerprint(c *models.Crash, threads []fingerprint.CrashThread, resolve CrashResolver) fingerprint.CrashResult {
+	if KeepsClientFingerprint(c, threads) {
+		d := &c.CrashDetails
+		d.ClientFingerprint = c.Fingerprint
+		d.FingerprintVersion = 0
+		d.CrashSite = ""
+		d.Summary = truncateRunes(CrashSummary(c, ""), maxCrashSummaryLength)
+		return fingerprint.CrashResult{Fingerprint: c.Fingerprint}
+	}
 	r := fingerprint.CrashFingerprint(fingerprint.CrashInput{
 		CrashType:       c.CrashType,
 		Signal:          c.Signal,
@@ -190,4 +204,21 @@ func firstLineOf(s string) string {
 		s = s[:i]
 	}
 	return strings.TrimSpace(s)
+}
+
+// KeepsClientFingerprint reports whether a crash carries nothing the server
+// fingerprint could use (see ApplyCrashFingerprint): a client fingerprint,
+// no frame in its stack, and none of the fields the APM-7 SDK sends.
+func KeepsClientFingerprint(c *models.Crash, threads []fingerprint.CrashThread) bool {
+	if c.Fingerprint == "" {
+		return false
+	}
+	for _, t := range threads {
+		if len(t.Frames) > 0 {
+			return false
+		}
+	}
+	d := &c.CrashDetails
+	return d.ExitReason == "" && d.Signal == "" && d.ABI == "" && d.AbortMessage == "" &&
+		d.ExitDescription == "" && len(d.Details) == 0 && !bool(d.Foreground) && d.SessionMs == 0
 }

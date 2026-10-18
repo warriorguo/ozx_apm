@@ -73,3 +73,24 @@ func TestCrashSummary(t *testing.T) {
 		t.Errorf("java: %q", s)
 	}
 }
+
+// A crash without frames or APM-7 fields (another producer) keeps its
+// client's fingerprint; one from the APM-7 SDK gets the server's.
+func TestApplyCrashFingerprint_KeepsAClientFingerprintWithoutAnythingToGroupBy(t *testing.T) {
+	legacy := models.Crash{CrashType: "native", Fingerprint: "C1", Stack: "st"}
+	r := ApplyCrashFingerprint(&legacy, fingerprint.ParseCrashStack(legacy.Stack), nil)
+	if legacy.Fingerprint != "C1" || r.Fingerprint != "C1" || legacy.FingerprintVersion != 0 || legacy.ClientFingerprint != "C1" || legacy.Summary == "" {
+		t.Fatalf("legacy: %+v", legacy)
+	}
+	sdk := models.Crash{CrashType: "oom", Fingerprint: "C1"}
+	sdk.ExitReason = "LOW_MEMORY"
+	ApplyCrashFingerprint(&sdk, nil, nil)
+	if sdk.Fingerprint == "C1" || sdk.FingerprintVersion != fingerprint.CrashVersion || sdk.ClientFingerprint != "C1" {
+		t.Fatalf("sdk: %+v", sdk)
+	}
+	framed := models.Crash{CrashType: "native", Fingerprint: "C1", Stack: "#00 pc 0000000000001000 libil2cpp.so\n"}
+	ApplyCrashFingerprint(&framed, fingerprint.ParseCrashStack(framed.Stack), nil)
+	if framed.Fingerprint == "C1" || framed.CrashSite != "libil2cpp.so+0x1000" {
+		t.Fatalf("framed: %+v", framed)
+	}
+}

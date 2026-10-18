@@ -2657,6 +2657,22 @@ serialized on Unity's Mono; the ingest test stores them.
   window (it still counts in the 24 h baseline that follows). New-issue
   alerts are not affected (the evaluator's 6-hourly sweep covers late
   uploads).
+- Client fingerprints: the server computes the fingerprint of every crash
+  it can group, i.e. one with a parsable frame or any APM-7 field
+  (`exit_reason`, `signal`, `abi`, `abort_message`, `exit_description`,
+  `details`, `foreground`, `session_ms`): the client's is kept as
+  `client_fingerprint`. A crash with neither (a producer other than the
+  APM-7 SDK, a hand-written event, the API's older tests) keeps the
+  fingerprint it was sent with, `fingerprint_version` 0: the server's would
+  put every such crash of a type into one group. No SDK sent crash events
+  before APM-7, so the only crash rows that exist (e.g. on n192) came from
+  such producers; they keep their stored fingerprints either way (nothing
+  is rewritten), and so do the APM-8 issues and the alert baseline built
+  on them. A producer that wants the server's grouping sends a stack in
+  the normalized form or the APM-7 fields.
+- The ingest symbolizer remembers for a minute that a build has no
+  symbols: crashes ingested within a minute after an upload may still be
+  keyed as unnamed (they stay in that group; the list and detail name them).
 - Duplicates (APM-19): a re-sent crash is looked up by `event_id` without
   the fingerprint filter (`EventIDLookup.AnyKey`), because its fingerprint
   can differ from the stored copy's when symbols were uploaded in between;
