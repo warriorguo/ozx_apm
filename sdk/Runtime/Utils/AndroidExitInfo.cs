@@ -27,6 +27,11 @@ namespace OzxApm.Utils
         private int _sdk;
 #endif
 
+#if UNITY_ANDROID && !UNITY_EDITOR
+        /// <summary>The application context (null if Capture failed).</summary>
+        internal AndroidJavaObject Context => _context;
+#endif
+
         /// <summary>The process id (0 if unknown).</summary>
         internal int Pid { get; private set; }
 
@@ -106,8 +111,14 @@ namespace OzxApm.Utils
                             string process = info.Call<string>("getProcessName") ?? "";
                             if (process.Length > 0 && process != _package)
                                 continue; // another process of the app (a service): not the game
-                            bool hasTrace = r.Reason == ExitReasons.Anr || (r.Reason == ExitReasons.CrashNative && _sdk >= 31);
-                            if (hasTrace && wantTrace != null && wantTrace.Contains(r.Pid))
+                            // Any reason may carry a trace: "typically it'll be available
+                            // when the reason is REASON_ANR, though if the process gets an
+                            // ANR but still continues running and it's killed for some other
+                            // reasons later, the trace will be available too"
+                            // (ApplicationExitInfo.getTraceInputStream). On the A33 (Android
+                            // 16) an ANR without dialog or kill: the later SIGNALED exit had
+                            // it. Null when there is none (no file is created then).
+                            if (wantTrace != null && wantTrace.Contains(r.Pid))
                                 r.TracePath = CopyTrace(info, traceDir, r.Pid);
                             list.Add(r);
                         }

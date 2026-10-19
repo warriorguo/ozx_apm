@@ -228,6 +228,8 @@ how the previous process ended, with that context:
 |---|---|
 | `CRASH_NATIVE` (native or IL2CPP crash; the stack from the tombstone on 12+) | `native` |
 | `ANR` (with the main and UnityMain threads of the ANR trace) | `anr` |
+| an ANR trace on any other exit (an ANR the process survived; time of the ANR) | `anr` (plus the exit itself if that was a crash) |
+| `CRASH` with Unity's own tombstone of that process (a native crash ActivityManager killed first) | `native` |
 | `CRASH` (Java) | `java` |
 | `LOW_MEMORY` while in the foreground | `oom` |
 | killed while in the foreground (`SIGNALED`, `EXCESSIVE_RESOURCE_USAGE`, ...) | `killed` |
@@ -236,6 +238,15 @@ how the previous process ended, with that context:
 A process reclaimed in the background, `Application.Quit` and a clean
 shutdown are not crashes. Nothing to call; `ApmClient.GetStats()` has
 `CrashReporting`, `CrashesReported` and the journal's writes.
+
+ANRs are also reported while the game runs (`ApmConfig.EnableAnrWatchdog`,
+on by default): a background thread checks the Java main thread once a
+second in the foreground (no allocation, no C# on the main thread) and
+reports an ANR once Android has declared the process "not responding",
+with the main thread's stack. The same ANR found again in the exit record
+at the next launch has the same event id (stored once). A frozen game loop
+(UnityMain) with a responsive UI thread is not an ANR for Android and is
+not reported (see `server/RELEASE.md`, APM-7).
 
 ### IL2CPP symbols (C# names, files and lines in native stacks)
 

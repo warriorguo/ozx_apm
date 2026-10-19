@@ -35,6 +35,15 @@ namespace OzxApm.Core
         public PerformanceCollector Perf;
         /// <summary>Where Unity's crash handler writes tombstone_NN (persistentDataPath; read by CrashReporter), null: none.</summary>
         public string UnityTombstoneDir;
+        /// <summary>
+        /// The process is ending cleanly (Shutdown/quit): the journal's last
+        /// write says so and stays until the next launch has seen Android's
+        /// exit record, which may still carry an ANR trace of this process.
+        /// </summary>
+        public volatile bool Clean;
+        /// <summary>An ANR the watchdog reported while the process lived: its time (Unix ms) and event id.</summary>
+        public long AnrMs;
+        public volatile string AnrEventId;
     }
 
     /// <summary>
@@ -314,6 +323,14 @@ namespace OzxApm.Core
             Kv("abi", input.Abi);
             Kv("scene", input.Scene);
             Num("fg", input.Paused ? 0 : 1);
+            if (input.Clean)
+                Num("clean", 1);
+            string anrId = input.AnrEventId;
+            if (anrId != null)
+            {
+                Num("anr_ms", Interlocked.Read(ref input.AnrMs));
+                Kv("anr_id", anrId);
+            }
             var perf = input.Perf;
             if (perf != null && perf.LastFps > 0)
             {
@@ -552,6 +569,11 @@ namespace OzxApm.Core
         public string Abi = "";
         public string Scene = "";
         public bool Foreground;
+        /// <summary>The process ended cleanly (Shutdown/quit): only an ANR trace of its exit is reported.</summary>
+        public bool Clean;
+        /// <summary>The last ANR the watchdog reported in that process (0/null: none).</summary>
+        public long AnrMs;
+        public string AnrEventId;
         public readonly List<string> PerfKeys = new List<string>();
         public readonly List<string> PerfValues = new List<string>();
         public readonly List<string> ContextKeys = new List<string>();
@@ -621,6 +643,9 @@ namespace OzxApm.Core
                     case "abi": r.Abi = value; break;
                     case "scene": r.Scene = value; break;
                     case "fg": r.Foreground = value == "1"; break;
+                    case "clean": r.Clean = value == "1"; break;
+                    case "anr_ms": r.AnrMs = ParseLong(value); break;
+                    case "anr_id": r.AnrEventId = value.Length == 32 ? value : null; break;
                     case "fps":
                     case "frame_ms":
                     case "frame_ms_max":

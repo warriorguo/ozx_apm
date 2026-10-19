@@ -97,6 +97,16 @@ namespace OzxApm.Core
         public bool EnableCrashReporting { get; set; } = true;
 
         /// <summary>
+        /// ANR watchdog (APM-7; Android, with EnableCrashReporting): reports an
+        /// ANR while the game runs (most ANRs do not end the process), not only
+        /// at the next launch. A background thread queues a marker message on
+        /// the Java main thread once a second in the foreground; when it waits
+        /// more than 5 s and Android has declared the process "not responding",
+        /// the ANR is reported with the main thread's Java stack.
+        /// </summary>
+        public bool EnableAnrWatchdog { get; set; } = true;
+
+        /// <summary>
         /// Performance sampling interval in seconds
         /// </summary>
         public float SamplingIntervalSeconds { get; set; } = 1.0f;

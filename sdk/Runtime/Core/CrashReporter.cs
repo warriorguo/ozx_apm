@@ -84,7 +84,17 @@ namespace OzxApm.Core
     /// - no exit record (Android before 11, or none kept) and the journal says
     ///   foreground: "unknown" (a crash, ANR or kill Android did not explain).
     /// Never reported: EXIT_SELF (the app quit), permission/package changes, a
-    /// clean shutdown (its journal was deleted).
+    /// clean shutdown (its journal says clean).
+    ///
+    /// ANR: an exit record of any reason may carry an ANR trace (Android
+    /// keeps the trace of an ANR the process survived, the A33 showed no
+    /// dialog and did not kill it, and attaches it to the later exit, e.g.
+    /// SIGNALED at quit). Such a trace is reported as an "anr" (time: the
+    /// trace's dump time), also for a clean or background end; the exit
+    /// itself is classified as without it (a second event if it was a crash,
+    /// e.g. a foreground kill). An ANR the watchdog already reported (its id
+    /// in the journal, within AnrSameWithinMs) keeps that event id: the
+    /// server drops the duplicate.
     ///
     /// Unity's own tombstone: Unity's crash handler writes the crashed
     /// thread's backtrace to persistentDataPath/tombstone_NN before it forwards
@@ -120,6 +130,8 @@ namespace OzxApm.Core
         internal const long UnityTombstoneBeforeExitMs = 60000;
         /// <summary>Without an exit record: at most this long after the journal's last write (it is rewritten every 5 s).</summary>
         internal const long UnityTombstoneAfterJournalMs = 60000;
+        /// <summary>An exit's ANR trace this close to the watchdog's ANR is the same ANR.</summary>
+        internal const long AnrSameWithinMs = 120000;
 
         private readonly string _dir;
         private readonly IExitInfoSource _source;
@@ -257,10 +269,19 @@ namespace OzxApm.Core
                     trace = ReadTrace(exit);
                     TryDelete(exit.TracePath);
                 }
-                if (trace == null && MayBeNativeWithoutTrace(exit))
+                var events = new List<CrashEvent>(2);
+                if (trace != null && trace.Format == "anr" && exit.Reason != ExitReasons.Anr)
+                {
+                    // An ANR the process survived; then the exit itself, without the trace.
+                    events.Add(BuildAnr(j, exit, trace));
+                    trace = null;
+                }
+                if (trace == null && !j.Clean && MayBeNativeWithoutTrace(exit))
                     trace = FindUnityTombstone(j, exit);
                 var evt = Build(j, exit, trace);
-                if (evt == null)
+                if (evt != null)
+                    events.Add(evt);
+                if (events.Count == 0)
                 {
                     NotCrashes++;
                     foreach (var f in j.Files)
@@ -271,9 +292,12 @@ namespace OzxApm.Core
                     return; // consent withdrawn meanwhile: keep the journals (Undecided keeps, Denied deletes them)
                 if (device != null && CurrentDeviceId() != device)
                     return; // ResetDeviceId meanwhile: its own deletion takes the journals
-                _enqueue(evt);
-                LastEvents.Add(evt);
-                Reported++;
+                foreach (var ev in events)
+                {
+                    _enqueue(ev);
+                    LastEvents.Add(ev);
+                    Reported++;
+                }
                 reportedJournals.Add(j);
             }
         }
@@ -404,7 +428,7 @@ namespace OzxApm.Core
         {
             try
             {
-                if (exit.Reason == ExitReasons.Anr)
+                if (exit.Reason == ExitReasons.Anr || (exit.Reason != ExitReasons.CrashNative && LooksLikeAnrTrace(exit.TracePath)))
                 {
                     using (var reader = new StreamReader(exit.TracePath, new UTF8Encoding(false, false), false, 64 * 1024))
                         return CrashTraceParser.ParseAnr(reader, MaxAnrChars);
@@ -434,6 +458,83 @@ namespace OzxApm.Core
             }
         }
 
+        // An ANR trace (Android 11+: "Subject: ...", "----- pid N at ... -----",
+        // thread dumps) rather than a tombstone (protobuf, or "*** *** ***").
+        private static bool LooksLikeAnrTrace(string path)
+        {
+            var head = new byte[4096];
+            int n;
+            using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                n = fs.Read(head, 0, head.Length);
+            if (n <= 0)
+                return false;
+            string text = Encoding.ASCII.GetString(head, 0, n);
+            return text.StartsWith("Subject: ", StringComparison.Ordinal) ||
+                   text.Contains("\n----- pid ") || text.StartsWith("----- pid ", StringComparison.Ordinal) ||
+                   text.Contains("\n\"main\" prio=");
+        }
+
+        /// <summary>
+        /// An ANR the process survived, from the ANR trace attached to its later
+        /// exit: the time of the trace (else of the exit), the journal's session.
+        /// </summary>
+        internal static CrashEvent BuildAnr(JournalRecord j, ExitRecord e, CrashTraceParser.Result trace)
+        {
+            var evt = Build(j, e, trace, "anr");
+            long at = trace.TimestampMs > 0 ? trace.TimestampMs : e.TimestampMs;
+            if (at > 0)
+            {
+                evt.timestamp = at;
+                evt.session_ms = j.SessionStartMs > 0 && at > j.SessionStartMs ? at - j.SessionStartMs : 0;
+                SetDetail(evt, "uptime_ms", Math.Max(0, at - j.StartMs).ToString(CultureInfo.InvariantCulture));
+                SetDetail(evt, "journal_age_ms", Math.Max(0, at - j.WrittenMs).ToString(CultureInfo.InvariantCulture));
+            }
+            SetDetail(evt, "anr_trace_on", ExitReasons.Name(e.Reason));
+            // The watchdog's report of the same ANR: the same id, a duplicate the server drops.
+            evt.event_id = SameAsWatchdogAnr(j, at) ? j.AnrEventId : EventId(j, "anr");
+            return evt;
+        }
+
+        /// <summary>
+        /// An ANR the watchdog saw while the process lives (Android confirmed
+        /// NOT_RESPONDING): the session and context of the moment (the
+        /// journal's current text), the main thread's Java stack. The first in
+        /// a process has the id the exit record's ANR trace would get.
+        /// </summary>
+        internal static CrashEvent BuildWatchdogAnr(JournalRecord j, long nowMs, string message, string stack, int ordinal)
+        {
+            var trace = new CrashTraceParser.Result { Format = "watchdog", Cause = CrashTraceParser.Cut(message ?? "", 300), Stack = stack ?? "" };
+            var evt = Build(j, null, trace, "anr");
+            evt.timestamp = nowMs;
+            evt.foreground = true;
+            evt.session_ms = j.SessionStartMs > 0 && nowMs > j.SessionStartMs ? nowMs - j.SessionStartMs : 0;
+            SetDetail(evt, "detected_by", "watchdog");
+            SetDetail(evt, "uptime_ms", Math.Max(0, nowMs - j.StartMs).ToString(CultureInfo.InvariantCulture));
+            SetDetail(evt, "journal_age_ms", "0");
+            evt.event_id = EventId(j, ordinal <= 0 ? "anr" : "anr" + ordinal.ToString(CultureInfo.InvariantCulture));
+            return evt;
+        }
+
+        private static bool SameAsWatchdogAnr(JournalRecord j, long at) =>
+            j.AnrEventId != null && j.AnrMs > 0 && at > 0 && Math.Abs(at - j.AnrMs) <= AnrSameWithinMs;
+
+        private static void SetDetail(CrashEvent evt, string key, string value)
+        {
+            var d = evt.details;
+            for (int i = 0; i + 1 < d.Length; i += 2)
+            {
+                if (d[i] == key)
+                {
+                    d[i + 1] = value;
+                    return;
+                }
+            }
+            Array.Resize(ref d, d.Length + 2);
+            d[d.Length - 2] = key;
+            d[d.Length - 1] = value;
+            evt.details = d;
+        }
+
         /// <summary>
         /// The crash type of a journal and its exit record, or null when it was
         /// not a crash (see the class comment).
@@ -441,6 +542,8 @@ namespace OzxApm.Core
         internal static string Classify(JournalRecord j, ExitRecord e, out bool foreground)
         {
             foreground = j.Foreground || (e != null && e.Importance > 0 && e.Importance <= 200);
+            if (j.Clean)
+                return null; // Shutdown/quit: whatever Android recorded (SIGNALED at quit), not a crash
             if (e == null)
                 return j.Foreground ? "unknown" : null;
             switch (e.Reason)
@@ -461,12 +564,14 @@ namespace OzxApm.Core
             }
         }
 
-        internal static CrashEvent Build(JournalRecord j, ExitRecord e, CrashTraceParser.Result trace)
+        internal static CrashEvent Build(JournalRecord j, ExitRecord e, CrashTraceParser.Result trace, string forceType = null)
         {
             string type = Classify(j, e, out bool foreground);
             bool unity = trace != null && trace.Format == CrashTraceParser.UnityFormat;
             if (unity)
                 type = "native"; // Unity's handler wrote the backtrace of a fatal signal of this process
+            if (forceType != null)
+                type = forceType;
             if (type == null)
                 return null;
             var evt = new CrashEvent
@@ -531,6 +636,8 @@ namespace OzxApm.Core
             }
             evt.details = details.ToArray();
             evt.fingerprint = Fingerprint(evt, trace);
+            if (type == "anr" && SameAsWatchdogAnr(j, evt.timestamp))
+                evt.event_id = j.AnrEventId; // reported live by the watchdog: a duplicate the server drops
             return evt;
         }
 
@@ -553,9 +660,16 @@ namespace OzxApm.Core
         }
 
         /// <summary>32 hex digits from the device, pid and process start: the same process always gets the same id.</summary>
-        internal static string EventId(JournalRecord j)
+        internal static string EventId(JournalRecord j) => EventId(j.DeviceId, j.Pid, j.StartMs, null);
+
+        /// <summary>The id of another event of the process (kind "anr": an ANR it survived).</summary>
+        internal static string EventId(JournalRecord j, string kind) => EventId(j.DeviceId, j.Pid, j.StartMs, kind);
+
+        internal static string EventId(string deviceId, int pid, long startMs, string kind)
         {
-            string seed = "crash|" + j.DeviceId + "|" + j.Pid.ToString(CultureInfo.InvariantCulture) + "|" + j.StartMs.ToString(CultureInfo.InvariantCulture);
+            string seed = "crash|" + deviceId + "|" + pid.ToString(CultureInfo.InvariantCulture) + "|" + startMs.ToString(CultureInfo.InvariantCulture);
+            if (kind != null)
+                seed += "|" + kind;
             ulong a = Fnv(seed, 14695981039346656037UL), b = Fnv(seed, 0x9E3779B97F4A7C15UL);
             return a.ToString("x16", CultureInfo.InvariantCulture) + b.ToString("x16", CultureInfo.InvariantCulture);
         }

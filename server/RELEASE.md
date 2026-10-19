@@ -2511,7 +2511,9 @@ query strings removed: what an exception's first occurrence carries).
   the process writes the journal synchronously first (with the exception
   on its time line).
 - Clean shutdown (`OnApplicationQuit`/`OnDestroy`, `ApmClient.Shutdown`)
-  deletes the process's journal: not a crash.
+  marks the process's journal clean (`clean=1`) and keeps it until the
+  next launch has read the exit record: not a crash, unless that record
+  carries an ANR trace (below, "ANRs").
 
 ### SDK: report at the next launch
 
@@ -2611,6 +2613,88 @@ once technical consent is granted, for the journals of earlier processes
   deletes, unreported, a journal whose device id is not the current one,
   and deletes every copied trace before it ends.
 
+### SDK: ANRs (also those the process survives)
+
+Device run (A33, Android 16, One UI): the UI thread blocked 25 s and 40 s
+with taps. Android detected the ANR (`WindowManager: ANR in Window{...
+UnityPlayerActivity}. Reason:Input dispatching timed out`, `ActivityManager:
+anr : com.ozx.apmtest`, stacks dumped) but showed **no dialog and did not
+kill the process**. The game later quit (`Application.Quit`: Unity's own
+SIGKILL), and Android recorded that exit as `SIGNALED` (status 9,
+importance 400) **with the ANR trace attached**
+(`/data/system/procexitstore/anr_2026-10-19-21-44-39-650.gz`). The SDK
+reported nothing: the journal was deleted at the clean quit, and a
+background `SIGNALED` exit is not a crash. Play Console counts such ANRs.
+Now:
+
+- **The trace of any exit.** `getTraceInputStream` is tried for the exit
+  record of every journal's pid, whatever the reason. Android's
+  documentation: "typically it'll be available when the reason is
+  REASON_ANR, though if the process gets an ANR but still continues running
+  and it's killed for some other reasons later, the trace will be available
+  too". Android 16's `SIGNALED` record above carries it; returning it for a
+  non-ANR reason on the device is to be verified in the device run.
+  An ANR trace (recognized by its header: `Subject:`, `----- pid N at ...`,
+  thread dumps) is reported as `anr`: main and UnityMain threads as before,
+  **time = the dump's time** from `----- pid 4796 at 2026-10-19
+  21:44:39.650209283+0800 -----` (else the exit's), `cause` = the `Subject:`
+  line (300 characters), `details.anr_trace_on` = the exit's reason
+  (`SIGNALED`), `exit_reason` the exit's. Independently, the exit itself is
+  classified without the trace: a clean or background end is not a crash
+  (the device case: one event, the ANR); a foreground kill is a second event
+  (`killed`, its own id).
+- **Clean quit keeps the journal.** At `Shutdown`/`OnApplicationQuit` the
+  journal is written once more with `clean=1` (one small file write on the
+  main thread, at quit only) and kept instead of deleted. The next launch
+  reads it like any other: an ANR trace on its exit is reported with that
+  session's fields (session, version, scene, context, breadcrumbs); without
+  one (or without an exit record) a clean journal is deleted unreported,
+  whatever Android recorded (`quit=1` ends as `SIGNALED` 9 importance 400 on
+  the A33: still not a crash). Consent as before: withdrawn/Denied deletes
+  this process's journal, not marked clean.
+- **Live: the ANR watchdog** (`Core/AnrWatchdog.cs`,
+  `Utils/AndroidMainThreadProbe.cs`; `ApmConfig.EnableAnrWatchdog`, on by
+  default with crash reporting; Android only). Most ANRs do not end the
+  process, so waiting for the next launch reports them late or never. A
+  thread (`OzxApm.AnrWatchdog`) checks the Java main thread once a second, in
+  the foreground only, while the journal runs (technical consent): it
+  queues an empty marker message (`Handler.sendEmptyMessage(What)` on a
+  `Handler` of the main looper without a callback) and looks whether it is
+  still queued (`hasMessages`); raw JNI with method ids and arguments made
+  once, **no C# on the main thread, no managed allocation per check**
+  (measured 0 B over 1000 checks), a pooled `Message` on the Java side. If the
+  marker waits more than 5 s, and only then, it polls
+  `ActivityManager.getProcessesInErrorState()` once a second (up to 30 s):
+  when Android has this pid `NOT_RESPONDING`, the ANR is reported at once as
+  `anr`, `details.detected_by=watchdog`, `trace=watchdog`, `cause` = Android's
+  short message, the stack of the Java main thread
+  (`Looper.getMainLooper().getThread().getStackTrace()`, 64 frames), the
+  session, context and breadcrumbs of the moment, once per block, at most 3
+  per process. A slow main thread that Android does not declare (no input
+  waiting) is not reported. Its event id is the one the exit record's trace
+  of the same ANR gets at the next launch (also written to the journal:
+  `anr_id`, `anr_ms`; a trace within 2 minutes of it keeps that id), so the
+  server keeps one event. UnityMain's stack is not in the live report (native,
+  not obtainable cheaply from Java); the exit trace has it. **Unverified on
+  the device:** whether One UI sets `NOT_RESPONDING` when it shows no dialog
+  (the A33 case). If not, the watchdog reports nothing for it and the exit
+  trace at the next launch is the report.
+- **UnityMain frozen, UI thread fine** (`anr=20` with taps on the A33):
+  Android raises no ANR, because input is dispatched to the Java UI thread,
+  which stays responsive, so neither path reports it, and Play Console does
+  not count it either. The player sees a frozen game. Recommendation, a
+  follow-up ticket: a UnityMain watchdog ("hang" event, its own type, not
+  `anr`): the journal thread already wakes every 5 s; a frame counter that
+  `ApmClient.Update` increments (no allocation) and that has not moved for
+  N seconds in the foreground (e.g. 5 s, configurable) would mark a hang,
+  reported with the time line and, on Android, UnityMain's Java-visible state
+  plus a native stack only if obtainable without signals (not cheaply today:
+  so the stack would be missing). Not implemented in APM-7.
+- Managed exceptions that do not end the process (an exception on a new
+  thread, ForceCrash `MonoAbort`): IL2CPP keeps running, so they are not
+  crashes; they are APM-3 exception events (device run: nothing in crashes,
+  as expected).
+
 ### SDK: link.xml
 
 `Runtime/link.xml` preserves the `OzxApm` assembly under managed code
@@ -2630,6 +2714,8 @@ Unity's Mono outside Unity (M-series Mac), `/tmp/claude-501/apm7/bench`:
 | Warning repeated (time line + journal flag) | logging thread | 0.12-0.18 us | 0 |
 | Journal write: 30 context keys, 20 breadcrumbs, 10 log lines with URLs, 3.7 KB | journal thread | 21-27 us | 0 |
 | Report at launch (journal read, exit records, trace parse) | report thread | once per launch | a few KB to MB (the trace) |
+| ANR watchdog check (marker posted / still queued?) | watchdog thread | 1-2 JNI calls per second, foreground only | 0 |
+| ANR watchdog during a block of more than 5 s | watchdog thread | `getProcessesInErrorState` per second, 30 s at most | a few KB per poll |
 
 At most 10 writes a second while something changes every frame (warning
 spam), i.e. ~0.3 ms/s on the journal thread here; idle: one write per 5 s.
@@ -2673,6 +2759,12 @@ serialized on Unity's Mono; the ingest test stores them.
   frames such as libc's `abort`, libraries): coarser, but stable across
   builds. `crash_site` and the summary still show the address
   (`libil2cpp.so+0x5417bc`); the list and detail symbolicate it when read.
+  C# names are normalized like exception frames (`Type:Method` ->
+  `Type.Method`, generic arguments dropped); a C++ name keeps its `::`
+  (device FailFast: the summary showed `il2cpp..os..CrashHelpers..CrashImpl`,
+  now `SIGTRAP in il2cpp::os::CrashHelpers::CrashImpl (libil2cpp.so)`). The
+  summary is text in React (escaped), never HTML. The app's ART-compiled
+  Java code (`base.vdex`, `.odex`, `.oat`) is not an in-app native frame.
   Crashes stored before their symbols were uploaded stay in that coarse
   group; later ones go to their method's group. The lookups at ingest have
   a 3 s budget per batch; after a timeout or error the batch's remaining
@@ -3039,3 +3131,9 @@ To remove the tables after a permanent rollback (admin):
 - File and line of managed exception frames on Unity 2022.3: not
   available (above).
 - iOS.
+- After the device findings (frame lines, REASON_CRASH, ANRs): the Unity
+  tombstone path on the device (the reader is tested with the content of
+  its `CRASH` log lines; the file itself was not readable without root), the
+  trace of a `SIGNALED` exit through `getTraceInputStream`, the watchdog's
+  JNI calls and `NOT_RESPONDING` on One UI, the main thread's stack from
+  `getStackTrace`, the journal kept at quit.

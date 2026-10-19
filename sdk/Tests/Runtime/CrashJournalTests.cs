@@ -494,6 +494,151 @@ namespace OzxApm.Tests
                 Assert.IsFalse(CrashReporter.IsUnityTombstoneName(n), n ?? "null");
         }
 
+        // ------------------------------------------------------------------
+        // ANR the process survived (the trace is on a later exit)
+        // ------------------------------------------------------------------
+
+        private static readonly long AnrMs = new DateTimeOffset(2026, 10, 19, 13, 44, 39, 650, TimeSpan.Zero).ToUnixTimeMilliseconds();
+
+        private void PreviousProcessEnded(int pid, long start, bool clean, bool foreground, Action<JournalInputs> edit = null)
+        {
+            JournalInputs inputs = null;
+            var j = NewJournal(pid, start, i =>
+            {
+                inputs = i;
+                i.Paused = !foreground;
+                edit?.Invoke(i);
+            });
+            j.Start(false);
+            if (clean)
+            {
+                // CrashMonitor.OnShutdown: marked clean, written once more, kept.
+                inputs.Clean = true;
+                j.WriteNow();
+            }
+            j.Stop(false);
+        }
+
+        [Test]
+        public void Report_CleanQuit_WithAnAnrTraceOnTheSignaledExit_IsAnAnr()
+        {
+            GameContext.Set("roomId", "r-anr");
+            PreviousProcessEnded(4796, AnrMs - 60_000, clean: true, foreground: false);
+            GameContext.Set("roomId", "r-now");
+            var exits = new FakeExits();
+            // The A33: no dialog, no kill; Application.Quit later: SIGNALED 9, importance 400, the ANR trace attached.
+            exits.Records.Add(new ExitRecord { Pid = 4796, TimestampMs = AnrMs + 90_000, Reason = ExitReasons.Signaled, Status = 9, Importance = 400 });
+            exits.Traces[4796] = CrashTraceParserTests.AnrTraceOfASurvivedAnr();
+            var sink = new List<CrashEvent>();
+            var reporter = Reporter(exits, sink);
+            reporter.ProcessPrevious(1, 1);
+
+            Assert.AreEqual(1, sink.Count, "the ANR; the quit itself is not a crash");
+            var e = sink[0];
+            Assert.AreEqual("anr", e.crash_type);
+            Assert.AreEqual(AnrMs, e.timestamp, "the time of the ANR, not of the exit");
+            Assert.AreEqual("SIGNALED", e.exit_reason);
+            Assert.AreEqual(SessionId, e.session_id);
+            Assert.IsTrue(e.ctx.TryGetValue("roomId", out var room) && room == "r-anr");
+            StringAssert.StartsWith("Thread \"main\" tid=4796 crashed\n", e.stack);
+            var d = ToDict(e.details);
+            Assert.AreEqual("exit_info", d["detected_by"]);
+            Assert.AreEqual("anr", d["trace"]);
+            Assert.AreEqual("SIGNALED", d["anr_trace_on"]);
+            StringAssert.StartsWith("Input dispatching timed out", d["cause"]);
+            Assert.AreEqual("60000", d["uptime_ms"]);
+            var j = new JournalRecord { DeviceId = DeviceId, Pid = 4796, StartMs = AnrMs - 60_000 };
+            Assert.AreEqual(CrashReporter.EventId(j, "anr"), e.event_id);
+            Assert.AreNotEqual(CrashReporter.EventId(j), e.event_id);
+            Assert.AreEqual(0, Directory.GetFiles(_dir).Length, "the journal and the copied trace are gone");
+        }
+
+        [Test]
+        public void Report_ForegroundKillCarryingAnAnrTrace_IsTheAnrAndTheKill()
+        {
+            PreviousProcessEnded(4796, AnrMs - 60_000, clean: false, foreground: true);
+            var exits = new FakeExits();
+            exits.Records.Add(new ExitRecord { Pid = 4796, TimestampMs = AnrMs + 30_000, Reason = ExitReasons.UserRequested, Importance = 100 });
+            exits.Traces[4796] = CrashTraceParserTests.AnrTraceOfASurvivedAnr();
+            var sink = new List<CrashEvent>();
+            Reporter(exits, sink).ProcessPrevious(1, 1);
+            Assert.AreEqual(2, sink.Count);
+            var anr = sink.Single(x => x.crash_type == "anr");
+            var kill = sink.Single(x => x.crash_type == "killed");
+            Assert.AreEqual(AnrMs, anr.timestamp);
+            Assert.AreEqual(AnrMs + 30_000, kill.timestamp);
+            Assert.AreEqual("", kill.stack, "the kill has no stack of its own");
+            Assert.AreNotEqual(anr.event_id, kill.event_id);
+        }
+
+        [Test]
+        public void Report_CleanQuitWithoutAnAnr_IsNothing()
+        {
+            PreviousProcessEnded(100, 1000, clean: true, foreground: true);
+            PreviousProcessEnded(200, 2000, clean: true, foreground: true);
+            var exits = new FakeExits();
+            exits.Records.Add(new ExitRecord { Pid = 100, TimestampMs = 5000, Reason = ExitReasons.Signaled, Status = 9, Importance = 100 });
+            // pid 200: no exit record (Android before 11): a clean journal is not "unknown".
+            string unity = UnityDir();
+            WriteUnityTombstone(unity, "tombstone_00", pid: 100, timestamp: "1970-01-01 00:00:04.000+0000", writtenMs: 4000);
+            var sink = new List<CrashEvent>();
+            var reporter = new CrashReporter(_dir, exits, sink.Add, () => true, ms => true) { UnityTombstoneDir = unity };
+            reporter.ProcessPrevious(1, 1);
+            Assert.AreEqual(0, sink.Count);
+            Assert.AreEqual(2, reporter.NotCrashes);
+            Assert.AreEqual(0, Directory.GetFiles(_dir, CrashJournal.FilePrefix + "*").Length);
+        }
+
+        [Test]
+        public void Report_AnAnrTheWatchdogReported_KeepsItsEventId()
+        {
+            string watchdogId = new string('a', 32);
+            PreviousProcessEnded(4796, AnrMs - 60_000, clean: true, foreground: true, i =>
+            {
+                i.AnrMs = AnrMs + 3000; // the watchdog saw it a little after the dump
+                i.AnrEventId = watchdogId;
+            });
+            var exits = new FakeExits();
+            exits.Records.Add(new ExitRecord { Pid = 4796, TimestampMs = AnrMs + 90_000, Reason = ExitReasons.Signaled, Status = 9, Importance = 400 });
+            exits.Traces[4796] = CrashTraceParserTests.AnrTraceOfASurvivedAnr();
+            var sink = new List<CrashEvent>();
+            Reporter(exits, sink).ProcessPrevious(1, 1);
+            Assert.AreEqual(watchdogId, sink.Single().event_id, "the same ANR: a duplicate the server drops");
+
+            // An ANR long after the watchdog's: another one.
+            PreviousProcessEnded(4797, AnrMs - 60_000, clean: false, foreground: true, i =>
+            {
+                i.AnrMs = AnrMs - 50_000 - CrashReporter.AnrSameWithinMs;
+                i.AnrEventId = watchdogId;
+            });
+            exits.Records.Clear();
+            exits.Traces.Clear();
+            exits.Records.Add(new ExitRecord { Pid = 4797, TimestampMs = AnrMs + 1000, Reason = ExitReasons.Anr, Importance = 100 });
+            exits.Traces[4797] = CrashTraceParserTests.AnrTraceOfASurvivedAnr(4797);
+            sink.Clear();
+            Reporter(exits, sink).ProcessPrevious(1, 1);
+            Assert.AreEqual("anr", sink.Single().crash_type);
+            Assert.AreNotEqual(watchdogId, sink.Single().event_id);
+        }
+
+        [Test]
+        public void Journal_CleanAndWatchdogAnr_RoundTrip()
+        {
+            var j = NewJournal(4000, 1000, i =>
+            {
+                i.Clean = true;
+                i.AnrMs = 123456;
+                i.AnrEventId = new string('b', 32);
+            });
+            var r = JournalRecord.Parse(Encoding.UTF8.GetBytes(j.BuildText()));
+            Assert.IsTrue(r.Clean);
+            Assert.AreEqual(123456, r.AnrMs);
+            Assert.AreEqual(new string('b', 32), r.AnrEventId);
+            var plain = JournalRecord.Parse(Encoding.UTF8.GetBytes(NewJournal(4001, 1000).BuildText()));
+            Assert.IsFalse(plain.Clean);
+            Assert.IsNull(plain.AnrEventId);
+        }
+
         private static Dictionary<string, string> ToDict(string[] pairs)
         {
             var d = new Dictionary<string, string>();

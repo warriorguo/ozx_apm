@@ -548,6 +548,26 @@ namespace OzxApm.Utils
                 read += raw.Length + 1;
                 if (read > maxChars)
                     break;
+                if (threads.Count == 0 && cur == null)
+                {
+                    // The header: "Subject: Input dispatching timed out (...)",
+                    // "----- pid 4796 at 2026-10-19 21:44:39.650209283+0800 -----".
+                    if (raw.StartsWith("Subject: ", StringComparison.Ordinal) && r.Cause.Length == 0)
+                    {
+                        r.Cause = Cut(Clean(raw.Substring(9).Trim()), 300);
+                        continue;
+                    }
+                    if (raw.StartsWith("----- pid ", StringComparison.Ordinal) && r.TimestampMs == 0)
+                    {
+                        int at = raw.IndexOf(" at ", StringComparison.Ordinal);
+                        int end = raw.LastIndexOf(" -----", StringComparison.Ordinal);
+                        if (at > 0 && end > at)
+                            r.TimestampMs = ParseTimestamp(raw.Substring(at + 4, end - at - 4).Trim());
+                        if (r.Pid == 0)
+                            r.Pid = IntAfter(raw, "----- pid ");
+                        continue;
+                    }
+                }
                 if (raw.StartsWith("\"", StringComparison.Ordinal))
                 {
                     // "main" prio=5 tid=1 Sleeping

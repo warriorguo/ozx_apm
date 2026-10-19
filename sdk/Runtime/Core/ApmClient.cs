@@ -916,11 +916,13 @@ namespace OzxApm.Core
             IExitInfoSource source;
             int pid;
             string unityTombstones;
+            IMainThreadProbe probe = null;
             if (ExitInfoForTests != null || CrashDirForTests != null)
             {
                 source = ExitInfoForTests;
                 pid = PidForTests;
                 unityTombstones = UnityTombstoneDirForTests;
+                probe = ProbeForTests;
             }
             else if (Application.platform == RuntimePlatform.Android)
             {
@@ -929,6 +931,10 @@ namespace OzxApm.Core
                 pid = android.Pid;
                 // Unity's crash handler writes tombstone_NN there (main thread only: read here).
                 unityTombstones = Application.persistentDataPath;
+#if UNITY_ANDROID && !UNITY_EDITOR
+                if (_config.EnableAnrWatchdog && android.Context != null)
+                    probe = new AndroidMainThreadProbe(android.Context, pid);
+#endif
             }
             else
             {
@@ -963,6 +969,7 @@ namespace OzxApm.Core
                     return storage.WaitIdle(timeoutMs);
                 },
                 threads);
+            _crash.Probe = _config.EnableAnrWatchdog ? probe : null;
         }
 
         private void InitializeCollectors()
@@ -1163,6 +1170,7 @@ namespace OzxApm.Core
         internal static string CrashDirForTests;
         internal static IExitInfoSource ExitInfoForTests;
         internal static string UnityTombstoneDirForTests;
+        internal static IMainThreadProbe ProbeForTests;
         internal static int PidForTests = 4242;
         internal CrashMonitor CrashMonitorForTests => _crash;
         internal OfflineStorage StorageForTests => _offlineStorage;
@@ -1196,6 +1204,7 @@ namespace OzxApm.Core
             CrashDirForTests = null;
             ExitInfoForTests = null;
             UnityTombstoneDirForTests = null;
+            ProbeForTests = null;
             PidForTests = 4242;
         }
 
@@ -1372,7 +1381,9 @@ namespace OzxApm.Core
 
                 SceneManager.sceneLoaded -= OnSceneLoaded;
 
-                // A clean exit is not a crash: this process's journal goes (APM-7).
+                // A clean exit is not a crash: this process's journal is marked clean
+                // (kept until the next launch has seen the exit record: an ANR the
+                // process survived is only in its trace; APM-7).
                 _crash?.OnShutdown();
 
                 // Unsent batches stay on disk and are uploaded on the next launch.

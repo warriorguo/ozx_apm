@@ -328,6 +328,44 @@ namespace OzxApm.Tests
             StringAssert.DoesNotContain("Signal Catcher", r.Stack);
         }
 
+        /// <summary>
+        /// The ANR trace Android 11+ keeps for an ANR (getTraceInputStream),
+        /// with its header: the A33's anr_2026-10-19-21-44-39-650 (Input
+        /// dispatching timed out; the process survived it).
+        /// </summary>
+        internal static byte[] AnrTraceOfASurvivedAnr(int pid = 4796) => Encoding.UTF8.GetBytes(
+            "Subject: Input dispatching timed out (Waiting to send key event because the focused window has not finished processing all of the input events that were previously delivered to it.  Outbound queue length: 0.  Wait queue length: 1.)\n" +
+            "RssHwmKb: 512000\n" +
+            "RssKb: 498000\n" +
+            "\n" +
+            "----- pid " + pid + " at 2026-10-19 21:44:39.650209283+0800 -----\n" +
+            "Cmd line: com.ozx.apmtest\n" +
+            "\n" +
+            "\"main\" prio=5 tid=1 Sleeping\n" +
+            "  | sysTid=" + pid + " nice=-10 cgrp=top-app sched=0/0 handle=0x7d\n" +
+            "  at java.lang.Thread.sleep(Native method)\n" +
+            "  at com.ozx.apmtest.Blocker.block(Blocker.java:25)\n" +
+            "  at com.unity3d.player.UnityPlayer$3.run(UnityPlayer.java:120)\n" +
+            "\n" +
+            "\"UnityMain\" prio=5 tid=20 Native\n" +
+            "  | sysTid=" + (pid + 15) + " nice=-4\n" +
+            "  native: #00 pc 00000000005417bc  /data/app/~~Ab12cd==/com.ozx.apmtest-Xy99==/lib/arm64/libil2cpp.so (BuildId: " + BuildId + ")\n" +
+            "\n----- end " + pid + " -----\n");
+
+        [Test]
+        public void AnrTrace_HeaderGivesTheTimeAndTheSubject()
+        {
+            var r = CrashTraceParser.ParseAnr(new StreamReader(new MemoryStream(AnrTraceOfASurvivedAnr())), 1 << 20);
+            Assert.IsNotNull(r);
+            Assert.AreEqual(new DateTimeOffset(2026, 10, 19, 13, 44, 39, 650, TimeSpan.Zero).ToUnixTimeMilliseconds(), r.TimestampMs);
+            Assert.AreEqual(4796, r.Pid);
+            StringAssert.StartsWith("Input dispatching timed out (Waiting to send key event", r.Cause);
+            Assert.LessOrEqual(r.Cause.Length, 300);
+            StringAssert.StartsWith("Thread \"main\" tid=4796 crashed\nat java.lang.Thread.sleep(Native method)\n", r.Stack);
+            StringAssert.Contains("Thread \"UnityMain\" tid=4811\n#00 pc 00000000005417bc libil2cpp.so", r.Stack);
+            StringAssert.DoesNotContain("RssKb", r.Stack);
+        }
+
         [Test]
         public void HostileInput_NeverThrowsAndIsBounded()
         {

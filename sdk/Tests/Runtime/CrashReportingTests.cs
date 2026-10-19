@@ -30,8 +30,20 @@ namespace OzxApm.Tests
         private sealed class FakeExits : IExitInfoSource
         {
             public readonly List<ExitRecord> Records = new List<ExitRecord>();
+            public readonly Dictionary<int, byte[]> Traces = new Dictionary<int, byte[]>();
 
-            public List<ExitRecord> Query(ICollection<int> wantTrace, string traceDir) => Records;
+            public List<ExitRecord> Query(ICollection<int> wantTrace, string traceDir)
+            {
+                foreach (var r in Records)
+                {
+                    if (Traces.TryGetValue(r.Pid, out var data) && wantTrace.Contains(r.Pid))
+                    {
+                        r.TracePath = Path.Combine(traceDir, CrashReporter.TracePrefix + r.Pid + ".bin");
+                        File.WriteAllBytes(r.TracePath, data);
+                    }
+                }
+                return Records;
+            }
         }
 
         private void ResetAll()
@@ -146,10 +158,40 @@ namespace OzxApm.Tests
             var first = Launch(1001);
             first.CrashMonitorForTests.Journal.WriteNow();
             ApmClient.Shutdown();
-            Assert.AreEqual(0, JournalFiles);
+            // Kept, marked clean, until the next launch has seen the exit record.
+            Assert.AreEqual(1, JournalFiles);
+            StringAssert.Contains("\nclean=1\n", string.Concat(Directory.GetFiles(_crashDir).Select(File.ReadAllText)));
             ApmClient.ResetForTests();
+            // Application.Quit on the A33: SIGNALED 9, importance 400.
+            _exits.Records.Add(new ExitRecord { Pid = 1001, TimestampMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), Reason = ExitReasons.Signaled, Status = 9, Importance = 400 });
             var second = Launch(1002);
             Assert.AreEqual(0, second.CrashMonitorForTests.Reporter.Reported);
+            Assert.AreEqual(1, second.CrashMonitorForTests.Reporter.NotCrashes);
+            Assert.AreEqual(1, JournalFiles, "the old journal is gone, the new process has its own");
+        }
+
+        [Test]
+        public void CleanQuitAfterAnAnrTheProcessSurvived_ReportsTheAnrWithItsSession()
+        {
+            var first = Launch(4796);
+            string session = first.Session.SessionId;
+            ApmClient.SetContext("roomId", "r-anr");
+            first.CrashMonitorForTests.Journal.WriteNow();
+            ApmClient.Shutdown();
+            ApmClient.ResetForTests();
+
+            _exits.Records.Add(new ExitRecord { Pid = 4796, TimestampMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), Reason = ExitReasons.Signaled, Status = 9, Importance = 400 });
+            _exits.Traces[4796] = CrashTraceParserTests.AnrTraceOfASurvivedAnr();
+            var second = Launch(4797);
+            var reporter = second.CrashMonitorForTests.Reporter;
+            Assert.AreEqual(1, reporter.Reported);
+            var e = reporter.LastEvents.Single();
+            Assert.AreEqual("anr", e.crash_type);
+            Assert.AreEqual(session, e.session_id);
+            Assert.IsTrue(e.ctx.TryGetValue("roomId", out var room) && room == "r-anr");
+            second.StorageForTests.Pump();
+            StringAssert.Contains("\"crash_type\":\"anr\"", StoredText());
+            Assert.AreEqual(1, JournalFiles);
         }
 
         [Test]
