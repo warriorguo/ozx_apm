@@ -209,4 +209,13 @@ func TestFrameKey(t *testing.T) {
 	if k != "libunity.so!Game.Rooms.RoomLoader.Load" || !sym {
 		t.Fatalf("resolved: %q", k)
 	}
+	// C++ keeps "::" (device FailFast: il2cpp::os::CrashHelpers::CrashImpl showed as "il2cpp..os..").
+	cpp := func(CrashFrame) string { return "il2cpp::os::CrashHelpers::CrashImpl()" }
+	if k, _ := FrameKey(f, cpp); k != "libunity.so!il2cpp::os::CrashHelpers::CrashImpl" {
+		t.Fatalf("C++ name: %q", k)
+	}
+	tmpl := func(CrashFrame) string { return "std::__ndk1::vector<int>::push_back(int const&)" }
+	if k, _ := FrameKey(f, tmpl); k != "libunity.so!std::__ndk1::vector::push_back" {
+		t.Fatalf("C++ template: %q", k)
+	}
 }

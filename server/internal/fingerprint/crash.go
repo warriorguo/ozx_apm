@@ -529,9 +529,24 @@ func FrameKey(f CrashFrame, resolve func(CrashFrame) string) (key string, sym bo
 	}
 	mod := f.ModuleName()
 	if name != "" {
-		return mod + "!" + NormalizeMethod(stripArgs(name)), sym
+		return mod + "!" + normalizeNative(stripArgs(name)), sym
 	}
 	return mod + "!?", false
+}
+
+// normalizeNative is NormalizeMethod for a native frame's function, which
+// keeps C++'s "::" ("il2cpp::os::CrashHelpers::CrashImpl"; NormalizeMethod
+// turns a single ':' of Unity's managed "Type:Method" into '.', and "::"
+// into ".."). Exception fingerprints keep using NormalizeMethod unchanged.
+func normalizeNative(name string) string {
+	if !strings.Contains(name, "::") {
+		return NormalizeMethod(name)
+	}
+	parts := strings.Split(name, "::")
+	for i, p := range parts {
+		parts[i] = NormalizeMethod(p)
+	}
+	return strings.Join(parts, "::")
 }
 
 // stripArgs removes a trailing argument list: "Ns.Type.Method(System.Int32)"

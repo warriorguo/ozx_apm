@@ -74,6 +74,21 @@ func TestCrashSummary(t *testing.T) {
 	}
 }
 
+// Device FailFast (SIGTRAP in il2cpp's CrashHelpers): the summary showed
+// "il2cpp..os..CrashHelpers..CrashImpl"; C++'s "::" is kept.
+func TestCrashSummary_KeepsCppScope(t *testing.T) {
+	c := models.Crash{CrashType: "native"}
+	c.Signal = "SIGTRAP"
+	threads := fingerprint.ParseCrashStack("Thread \"UnityMain\" tid=1 crashed\n#00 pc 0000000000001000 libil2cpp.so (BuildId: aa)\n")
+	ApplyCrashFingerprint(&c, threads, func(fingerprint.CrashFrame) string { return "il2cpp::os::CrashHelpers::CrashImpl()" })
+	if c.Summary != "SIGTRAP in il2cpp::os::CrashHelpers::CrashImpl (libil2cpp.so)" {
+		t.Errorf("summary %q", c.Summary)
+	}
+	if c.CrashSite != "libil2cpp.so!il2cpp::os::CrashHelpers::CrashImpl" {
+		t.Errorf("site %q", c.CrashSite)
+	}
+}
+
 // A crash without frames or APM-7 fields (another producer) keeps its
 // client's fingerprint; one from the APM-7 SDK gets the server's.
 func TestApplyCrashFingerprint_KeepsAClientFingerprintWithoutAnythingToGroupBy(t *testing.T) {
