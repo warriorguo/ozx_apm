@@ -1,9 +1,12 @@
 package processor
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
+	"strconv"
 
 	"github.com/warriorguo/ozx_apm/server/internal/metrics"
 	"github.com/warriorguo/ozx_apm/server/internal/models"
@@ -62,8 +65,55 @@ func NormalizeCustomEvent(e *models.CustomEvent) ContextStats {
 	}
 	var stats ContextStats
 	e.Props, stats = parseContext(e.RawProps)
+	e.PropTypes = propTypes(e.RawProps, e.Props)
 	e.RawProps = nil
 	return stats
+}
+
+// propTypes returns the JSON type of the stored properties that were sent as
+// a number or a boolean (APM-10, ApmClient.Event): parseContext keeps their
+// JSON text in props, this records that they were not strings, so the
+// session export writes them back as such. A number counts only if it parses
+// as a finite float64 (a literal like 1e400 stays text). Nil when every
+// property is a string (old SDKs, TrackEvent).
+func propTypes(raw json.RawMessage, props map[string]string) map[string]uint8 {
+	if len(props) == 0 || !bytes.ContainsAny(raw, "0123456789tf") {
+		return nil
+	}
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(raw, &fields) != nil {
+		return nil
+	}
+	var types map[string]uint8
+	for k, v := range fields {
+		stored, ok := props[k]
+		if !ok {
+			continue
+		}
+		v = bytes.TrimSpace(v)
+		if len(v) == 0 || string(v) != stored {
+			continue // a string, or cut: text
+		}
+		var kind uint8
+		switch v[0] {
+		case 't', 'f':
+			if stored == "true" || stored == "false" {
+				kind = models.PropTypeBool
+			}
+		case '-', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9':
+			if f, err := strconv.ParseFloat(stored, 64); err == nil && !math.IsInf(f, 0) {
+				kind = models.PropTypeNumber
+			}
+		}
+		if kind == 0 {
+			continue
+		}
+		if types == nil {
+			types = map[string]uint8{}
+		}
+		types[k] = kind
+	}
+	return types
 }
 
 // ValidateCustomMetric checks a custom metric row. It is rejected (never

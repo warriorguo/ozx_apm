@@ -38,7 +38,7 @@ func (r *Repository) InsertPerfSamples(ctx context.Context, samples []models.Per
 	}
 
 	batch, err := r.newInsert(ctx, "INSERT INTO apm_perf_samples (timestamp, app_version, platform, device_model, os_version, session_id, device_id, scene, fps, frame_time_ms, main_thread_ms, gc_alloc_kb, mem_mb, event_id, seq, build_type, gpu, ram_class, net_type, ctx, "+
-		"interval_ms, mem_mono_heap_mb, mem_alloc_mb, mem_reserved_mb, mem_gfx_mb, mem_rss_mb)")
+		"interval_ms, mem_mono_heap_mb, mem_alloc_mb, mem_reserved_mb, mem_gfx_mb, mem_rss_mb, game_t, frame)")
 	if err != nil {
 		return fmt.Errorf("prepare batch: %w", err)
 	}
@@ -71,6 +71,8 @@ func (r *Repository) InsertPerfSamples(ctx context.Context, samples []models.Per
 			float32(s.MemReservedMB),
 			float32(s.MemGfxMB),
 			float32(s.MemRssMB),
+			s.GameT, // APM-10: nil (NULL) without the client's clock
+			s.Frame,
 		)
 		if err != nil {
 			return fmt.Errorf("append to batch: %w", err)
@@ -86,7 +88,7 @@ func (r *Repository) InsertJanks(ctx context.Context, janks []models.Jank) error
 		return nil
 	}
 
-	batch, err := r.newInsert(ctx, "INSERT INTO apm_janks (timestamp, app_version, platform, device_model, os_version, session_id, device_id, scene, duration_ms, max_frame_ms, recent_gc_count, recent_gc_alloc_kb, recent_events, event_id, seq, build_type, gpu, ram_class, net_type, ctx)")
+	batch, err := r.newInsert(ctx, "INSERT INTO apm_janks (timestamp, app_version, platform, device_model, os_version, session_id, device_id, scene, duration_ms, max_frame_ms, recent_gc_count, recent_gc_alloc_kb, recent_events, event_id, seq, build_type, gpu, ram_class, net_type, ctx, game_t, frame)")
 	if err != nil {
 		return fmt.Errorf("prepare batch: %w", err)
 	}
@@ -113,6 +115,8 @@ func (r *Repository) InsertJanks(ctx context.Context, janks []models.Jank) error
 			j.RAMClass,
 			j.NetType,
 			contextColumn(j.Context),
+			j.GameT, // APM-10: nil (NULL) without the client's clock
+			j.Frame,
 		)
 		if err != nil {
 			return fmt.Errorf("append to batch: %w", err)
@@ -128,7 +132,7 @@ func (r *Repository) InsertStartups(ctx context.Context, startups []models.Start
 		return nil
 	}
 
-	batch, err := r.newInsert(ctx, "INSERT INTO apm_startups (timestamp, app_version, platform, device_model, os_version, session_id, device_id, phase1_ms, phase2_ms, tti_ms, event_id, seq, build_type, gpu, ram_class, net_type, ctx)")
+	batch, err := r.newInsert(ctx, "INSERT INTO apm_startups (timestamp, app_version, platform, device_model, os_version, session_id, device_id, phase1_ms, phase2_ms, tti_ms, event_id, seq, build_type, gpu, ram_class, net_type, ctx, game_t, frame)")
 	if err != nil {
 		return fmt.Errorf("prepare batch: %w", err)
 	}
@@ -152,6 +156,8 @@ func (r *Repository) InsertStartups(ctx context.Context, startups []models.Start
 			s.RAMClass,
 			s.NetType,
 			contextColumn(s.Context),
+			s.GameT, // APM-10: nil (NULL) without the client's clock
+			s.Frame,
 		)
 		if err != nil {
 			return fmt.Errorf("append to batch: %w", err)
@@ -167,7 +173,7 @@ func (r *Repository) InsertSceneLoads(ctx context.Context, loads []models.SceneL
 		return nil
 	}
 
-	batch, err := r.newInsert(ctx, "INSERT INTO apm_scene_loads (timestamp, app_version, platform, device_model, session_id, device_id, scene_name, load_ms, activate_ms, event_id, seq, build_type, gpu, ram_class, net_type, ctx)")
+	batch, err := r.newInsert(ctx, "INSERT INTO apm_scene_loads (timestamp, app_version, platform, device_model, session_id, device_id, scene_name, load_ms, activate_ms, event_id, seq, build_type, gpu, ram_class, net_type, ctx, game_t, frame)")
 	if err != nil {
 		return fmt.Errorf("prepare batch: %w", err)
 	}
@@ -190,6 +196,8 @@ func (r *Repository) InsertSceneLoads(ctx context.Context, loads []models.SceneL
 			l.RAMClass,
 			l.NetType,
 			contextColumn(l.Context),
+			l.GameT, // APM-10: nil (NULL) without the client's clock
+			l.Frame,
 		)
 		if err != nil {
 			return fmt.Errorf("append to batch: %w", err)
@@ -207,7 +215,7 @@ func (r *Repository) InsertExceptions(ctx context.Context, exceptions []models.E
 
 	batch, err := r.newInsert(ctx, "INSERT INTO apm_exceptions (timestamp, app_version, platform, device_model, os_version, session_id, device_id, scene, fingerprint, message, stack, count, event_id, seq, build_type, gpu, ram_class, net_type, ctx, "+
 		"client_fingerprint, fingerprint_version, log_type, exception_type, message_template, embedded_exception, inner_exceptions, throw_site, call_site, breadcrumbs, "+
-		"error_seq, session_ms, unhandled, ctx_merged)")
+		"error_seq, session_ms, unhandled, ctx_merged, game_t, frame)")
 	if err != nil {
 		return fmt.Errorf("prepare batch: %w", err)
 	}
@@ -248,6 +256,8 @@ func (r *Repository) InsertExceptions(ctx context.Context, exceptions []models.E
 			uint64(e.SessionMs),
 			string(e.Unhandled),
 			boolColumn(bool(e.CtxMerged)),
+			e.GameT, // APM-10: nil (NULL) without the client's clock
+			e.Frame,
 		)
 		if err != nil {
 			return fmt.Errorf("append to batch: %w", err)
@@ -281,7 +291,7 @@ func (r *Repository) InsertCrashes(ctx context.Context, crashes []models.Crash) 
 
 	batch, err := r.newInsert(ctx, "INSERT INTO apm_crashes (timestamp, app_version, platform, device_model, os_version, session_id, device_id, scene, crash_type, fingerprint, stack, breadcrumbs, event_id, seq, build_type, gpu, ram_class, net_type, ctx, "+
 		"client_fingerprint, fingerprint_version, summary, crash_site, exit_reason, exit_status, exit_description, importance, pss_kb, rss_kb, "+
-		"signal, signal_code, fault_addr, abort_message, abi, session_ms, foreground, details)")
+		"signal, signal_code, fault_addr, abort_message, abi, session_ms, foreground, details, game_t, frame)")
 	if err != nil {
 		return fmt.Errorf("prepare batch: %w", err)
 	}
@@ -326,6 +336,8 @@ func (r *Repository) InsertCrashes(ctx context.Context, crashes []models.Crash) 
 			uint64(c.SessionMs),
 			boolColumn(bool(c.Foreground)),
 			contextColumn(c.Details),
+			c.GameT, // APM-10: nil (NULL) without the client's clock
+			c.Frame,
 		)
 		if err != nil {
 			return fmt.Errorf("append to batch: %w", err)
@@ -341,6 +353,15 @@ func contextColumn(ctx map[string]string) map[string]string {
 		return map[string]string{}
 	}
 	return ctx
+}
+
+// propTypesColumn is the value inserted into apm_custom_events.prop_types
+// (APM-10); never nil.
+func propTypesColumn(types map[string]uint8) map[string]uint8 {
+	if types == nil {
+		return map[string]uint8{}
+	}
+	return types
 }
 
 // Query methods

@@ -66,7 +66,7 @@ func (a *asyncInsert) Append(v ...any) error {
 
 // appendMapLiteral writes map(?, ?, ...) for m and appends the keys and
 // values to args. An empty map is map(), which ClickHouse casts to the column type.
-func appendMapLiteral(sb *strings.Builder, args []any, m map[string]string) []any {
+func appendMapLiteral[V string | uint8](sb *strings.Builder, args []any, m map[string]V) []any {
 	keys := make([]string, 0, len(m))
 	for k := range m {
 		keys = append(keys, k)
@@ -117,6 +117,11 @@ func (a *asyncInsert) Send() error {
 			// quote would break out of the literal. Bind every key and value
 			// as its own string parameter instead. Keys in a fixed order so
 			// the statement text is stable.
+			args = appendMapLiteral(&sb, args, m)
+			continue
+		}
+		if m, ok := v.(map[string]uint8); ok {
+			// The same for prop_types (APM-10).
 			args = appendMapLiteral(&sb, args, m)
 			continue
 		}

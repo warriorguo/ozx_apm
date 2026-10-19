@@ -57,6 +57,9 @@ func NewAdminRouter(cfg *config.Config, repo *storage.Repository, logger *zap.Lo
 		sessionHandler := admin.NewSessionHandler(repo, logger)
 		r.Get("/sessions/timeline", sessionHandler.Timeline)
 		r.Get("/sessions", sessionHandler.DeviceSessions)
+		// Session export in OZX's AiTelemetry format (APM-10)
+		exportHandler := admin.NewSessionExportHandler(repo, logger)
+		r.Get("/sessions/export", exportHandler.Export)
 
 		// Game context (APM-5)
 		contextHandler := admin.NewContextHandler(repo, logger)

@@ -48,6 +48,21 @@ type EventContext struct {
 	NetType    string            `json:"net_type"`
 	RawContext json.RawMessage   `json:"ctx"`
 	Context    map[string]string `json:"-"`
+	GameClock
+}
+
+// GameClock is the game's clock when the event happened, as the SDK reported
+// it (APM-10, SDK Core.GameClock): "t", Unity's scaled game time in seconds
+// (AiTelemetry's t), and "frame", Time.frameCount. Absent from older SDKs and
+// from counts and aggregates over a window. processor.NormalizeGameClock
+// validates RawT/RawFrame into GameT/Frame (both or neither; a value of the
+// wrong shape never fails the event); nil is stored as NULL. The server never
+// derives them from anything else.
+type GameClock struct {
+	RawT     json.RawMessage `json:"t"`
+	RawFrame json.RawMessage `json:"frame"`
+	GameT    *float64        `json:"-"`
+	Frame    *int64          `json:"-"`
 }
 
 // Build types. BuildTypeUnknown (empty) marks events from SDKs that predate APM-5.

@@ -24,6 +24,40 @@ func TestNormalizeCustomEvent_BoundsCountAndProps(t *testing.T) {
 	}
 }
 
+// APM-10: numbers and booleans keep their JSON text in props (as before) and
+// their type in PropTypes; strings that look like numbers stay strings.
+func TestNormalizeCustomEvent_PropTypes(t *testing.T) {
+	e := models.CustomEvent{RawProps: json.RawMessage(`{"amount":34.322,"n":-3,"crit":false,"dead":true,` +
+		`"id":"12","flag":"true","huge":1e400,"roomId":"r-1","pos.x":4.990,"zero":0,"nul":null,"bad key":1}`)}
+	NormalizeCustomEvent(&e)
+	want := map[string]uint8{"amount": models.PropTypeNumber, "n": models.PropTypeNumber, "crit": models.PropTypeBool,
+		"dead": models.PropTypeBool, "pos.x": models.PropTypeNumber, "zero": models.PropTypeNumber}
+	if len(e.PropTypes) != len(want) {
+		t.Errorf("types %v", e.PropTypes)
+	}
+	for k, v := range want {
+		if e.PropTypes[k] != v {
+			t.Errorf("%s: %d, want %d", k, e.PropTypes[k], v)
+		}
+	}
+	if e.Props["amount"] != "34.322" || e.Props["pos.x"] != "4.990" || e.Props["huge"] != "1e400" || e.Props["id"] != "12" || e.Props["flag"] != "true" {
+		t.Errorf("props %v", e.Props)
+	}
+	// All strings (TrackEvent, old SDKs): no types at all.
+	e = models.CustomEvent{RawProps: json.RawMessage(`{"roomId":"12","seed":"991"}`)}
+	NormalizeCustomEvent(&e)
+	if e.PropTypes != nil {
+		t.Errorf("types %v", e.PropTypes)
+	}
+	// A number longer than the value limit is cut: text, not a number.
+	long := strings.Repeat("1", models.MaxContextValueLength+5)
+	e = models.CustomEvent{RawProps: json.RawMessage(`{"n":` + long + `}`)}
+	NormalizeCustomEvent(&e)
+	if e.PropTypes != nil || len(e.Props["n"]) != models.MaxContextValueLength {
+		t.Errorf("cut number: %v %d", e.PropTypes, len(e.Props["n"]))
+	}
+}
+
 func TestValidateCustomMetric_WindowAndUnit(t *testing.T) {
 	v := NewValidator()
 	one := 1.0

@@ -20,7 +20,7 @@ func (r *Repository) InsertRuns(ctx context.Context, runs []models.Run) error {
 	}
 	batch, err := r.newInsert(ctx, "INSERT INTO apm_runs (timestamp, app_version, platform, device_model, os_version, session_id, device_id, scene, "+
 		"run_id, end_reason, result, crash_type, duration_ms, samples, peak_mem_mb, peak_mono_heap_mb, peak_alloc_mb, peak_reserved_mb, peak_gfx_mb, peak_rss_mb, "+
-		"start_alloc_mb, start_rss_mb, end_alloc_mb, end_rss_mb, event_id, seq, build_type, gpu, ram_class, net_type, ctx)")
+		"start_alloc_mb, start_rss_mb, end_alloc_mb, end_rss_mb, event_id, seq, build_type, gpu, ram_class, net_type, ctx, game_t, frame)")
 	if err != nil {
 		return fmt.Errorf("prepare batch: %w", err)
 	}
@@ -57,6 +57,8 @@ func (r *Repository) InsertRuns(ctx context.Context, runs []models.Run) error {
 			e.RAMClass,
 			e.NetType,
 			contextColumn(e.Context),
+			e.GameT, // APM-10: nil (NULL) without the client's clock
+			e.Frame,
 		)
 		if err != nil {
 			return fmt.Errorf("append to batch: %w", err)

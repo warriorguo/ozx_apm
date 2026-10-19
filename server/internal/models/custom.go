@@ -37,6 +37,9 @@ type CustomEvent struct {
 	CtxMerged   LenientBool       `json:"ctx_merged"`
 	RawProps    json.RawMessage   `json:"props"`
 	Props       map[string]string `json:"-"`
+	// PropTypes: the JSON type of the props that were not strings (APM-10):
+	// PropTypeNumber or PropTypeBool; Props holds their JSON text.
+	PropTypes map[string]uint8 `json:"-"`
 	EventContext
 }
 
@@ -69,6 +72,13 @@ type CustomMetric struct {
 	CtxMerged   LenientBool `json:"ctx_merged"`
 	EventContext
 }
+
+// Values of CustomEvent.PropTypes (stored in apm_custom_events.prop_types).
+// A property without an entry is a string.
+const (
+	PropTypeNumber uint8 = 1
+	PropTypeBool   uint8 = 2
+)
 
 // Custom endpoints of the admin API.
 

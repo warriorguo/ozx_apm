@@ -105,10 +105,13 @@ func TestSchemaStatements_ExceptionColumnsAPM4AndAPM3(t *testing.T) {
 		}
 	}
 	added := append(append([]string{}, exceptionColumnsAPM4...), exceptionColumnsAPM3...)
-	want := "    ctx Map(LowCardinality(String), String),\n    " + strings.Join(added, ",\n    ") + ",\n    INDEX "
+	want := "    ctx Map(LowCardinality(String), String),\n    " + strings.Join(added, ",\n    ") + ",\n    " +
+		strings.Join(clockColumnsAPM10, ",\n    ") + ",\n    INDEX "
 	if !strings.Contains(create, want) {
 		t.Errorf("CREATE TABLE apm_exceptions: APM-4/APM-3 columns missing or out of order:\n%s", create)
 	}
+	// Then APM-10's clock columns.
+	alters = alters[:len(alters)-len(clockColumnsAPM10)]
 	tail := alters[len(alters)-len(added):]
 	for i, col := range added {
 		if tail[i] != col {
@@ -136,10 +139,13 @@ func TestSchemaStatements_CrashColumnsAPM7(t *testing.T) {
 			alters = append(alters, strings.TrimPrefix(stmt, "ALTER TABLE apm_crashes ADD COLUMN IF NOT EXISTS "))
 		}
 	}
-	want := "    ctx Map(LowCardinality(String), String),\n    " + strings.Join(crashColumnsAPM7, ",\n    ") + ",\n    INDEX "
+	want := "    ctx Map(LowCardinality(String), String),\n    " + strings.Join(crashColumnsAPM7, ",\n    ") + ",\n    " +
+		strings.Join(clockColumnsAPM10, ",\n    ") + ",\n    INDEX "
 	if !strings.Contains(create, want) {
 		t.Errorf("CREATE TABLE apm_crashes: APM-7 columns missing or out of order:\n%s", create)
 	}
+	// The APM-7 columns, then APM-10's clock columns.
+	alters = alters[:len(alters)-len(clockColumnsAPM10)]
 	tail := alters[len(alters)-len(crashColumnsAPM7):]
 	for i, col := range crashColumnsAPM7 {
 		if tail[i] != col {
@@ -176,6 +182,40 @@ func TestSchema_SymbolTables(t *testing.T) {
 		for _, stmt := range schemaStatements {
 			if strings.Contains(stmt, tb.Name) {
 				t.Errorf("%s must not be a statement that has to succeed", tb.Name)
+			}
+		}
+	}
+}
+
+// APM-10: every event table gets the game clock columns, last in CREATE
+// TABLE and last among its ALTERs (so fresh and migrated tables have the same
+// column order); apm_custom_events gets prop_types just before them.
+func TestSchemaStatements_GameClockColumnsAPM10(t *testing.T) {
+	for _, table := range eventTables {
+		var create string
+		var alters []string
+		for _, stmt := range schemaStatements {
+			if strings.HasPrefix(stmt, "CREATE TABLE IF NOT EXISTS "+table+" ") {
+				create = stmt
+			}
+			if strings.HasPrefix(stmt, "ALTER TABLE "+table+" ADD COLUMN") {
+				alters = append(alters, strings.TrimPrefix(stmt, "ALTER TABLE "+table+" ADD COLUMN IF NOT EXISTS "))
+			}
+		}
+		want := []string{"game_t Nullable(Float64)", "frame Nullable(Int64)"}
+		if table == "apm_custom_events" {
+			want = append([]string{"prop_types Map(LowCardinality(String), UInt8)"}, want...)
+		}
+		if !strings.Contains(create, "    "+strings.Join(want, ",\n    ")+",\n    INDEX ") {
+			t.Errorf("%s: CREATE TABLE lacks %v last:\n%s", table, want, create)
+		}
+		if len(alters) < len(want) {
+			t.Fatalf("%s: %d ALTERs", table, len(alters))
+		}
+		tail := alters[len(alters)-len(want):]
+		for i := range want {
+			if tail[i] != want[i] {
+				t.Errorf("%s: ALTER %d: %q, want %q", table, i, tail[i], want[i])
 			}
 		}
 	}

@@ -17,7 +17,8 @@ import (
 // repository_alerts.go), and the symbol tables (APM-7). APM-6 added two
 // event tables (apm_custom_events, apm_custom_metrics) and their daily
 // views, APM-7 the crash columns, APM-9 the perf sample's memory columns and
-// the apm_runs event table (no view); new tables are created by CREATE TABLE
+// the apm_runs event table (no view), APM-10 the game clock columns (game_t,
+// frame) on every event table and prop_types on apm_custom_events; new tables are created by CREATE TABLE
 // IF NOT EXISTS, which the service account may run.
 //
 // The event tables are ReplacingMergeTree with event_id appended to the sort
@@ -70,9 +71,37 @@ type eventTableSchema struct {
 // addedColumns are table-specific columns added after eventColumns, in the
 // order they were added; CREATE TABLE puts them last, as the ALTERs do.
 var addedColumns = map[string][]string{
-	TableExceptions.Name:  append(append([]string{}, exceptionColumnsAPM4...), exceptionColumnsAPM3...),
-	TableCrashes.Name:     crashColumnsAPM7,
-	TablePerfSamples.Name: perfColumnsAPM9,
+	TableExceptions.Name:   append(append([]string{}, exceptionColumnsAPM4...), exceptionColumnsAPM3...),
+	TableCrashes.Name:      crashColumnsAPM7,
+	TablePerfSamples.Name:  perfColumnsAPM9,
+	TableCustomEvents.Name: customEventColumnsAPM10,
+}
+
+// clockColumnsAPM10 are the game's clock when the event happened, as the SDK
+// reported it (APM-10; SDK Core.GameClock): game_t is Unity's scaled game
+// time in seconds (Time.timeAsDouble, AiTelemetry's "t"), frame is
+// Time.frameCount. NULL when the event did not carry them: rows of older
+// SDKs, counts and aggregates over a window (aggregated custom events,
+// metrics), crashes of an earlier process. The server never derives them.
+// Every event table has them, last (after its addedColumns).
+var clockColumnsAPM10 = []string{
+	"game_t Nullable(Float64)",
+	"frame Nullable(Int64)",
+}
+
+// customEventColumnsAPM10: the JSON type of the properties that were not
+// strings (ApmClient.Event, APM-10): props keeps every value as text (as
+// before), prop_types has 1 for a number and 2 for a boolean, so the session
+// export writes them back as JSON numbers and booleans.
+var customEventColumnsAPM10 = []string{
+	"prop_types Map(LowCardinality(String), UInt8)",
+}
+
+// laterColumns are the columns of a table after eventColumns, in the order
+// they were added: its own added columns, then the clock columns.
+func laterColumns(table string) []string {
+	cols := append([]string{}, addedColumns[table]...)
+	return append(cols, clockColumnsAPM10...)
 }
 
 // perfColumnsAPM9 are the memory breakdown of a perf sample (APM-9; 0 on
@@ -328,7 +357,7 @@ func createEventTableStatement(s eventTableSchema) string {
 	for _, col := range eventColumns {
 		sb.WriteString("    " + col + ",\n")
 	}
-	for _, col := range addedColumns[s.table.Name] {
+	for _, col := range laterColumns(s.table.Name) {
 		sb.WriteString("    " + col + ",\n")
 	}
 	sb.WriteString("    INDEX " + EventIDIndexDDL + ",\n")
@@ -359,7 +388,7 @@ var schemaStatements = func() []string {
 		for _, col := range eventColumns {
 			stmts = append(stmts, addColumnStatement(s.table.Name, col))
 		}
-		for _, col := range addedColumns[s.table.Name] {
+		for _, col := range laterColumns(s.table.Name) {
 			stmts = append(stmts, addColumnStatement(s.table.Name, col))
 		}
 	}
@@ -746,7 +775,8 @@ func SchemaSQL() string {
 -- APM-4: the exception columns from client_fingerprint to breadcrumbs;
 -- APM-3: error_seq, session_ms, unhandled, ctx_merged; APM-7: the crash
 -- columns from client_fingerprint to details; APM-9: the perf sample's
--- memory columns from interval_ms to mem_rss_mb). The APM-6 tables
+-- memory columns from interval_ms to mem_rss_mb; APM-10: prop_types on
+-- apm_custom_events, then game_t and frame on every event table). The APM-6 tables
 -- (apm_custom_events, apm_custom_metrics) and APM-9's apm_runs have had all
 -- their columns from the start.
 -- Metadata only (existing parts are not rewritten), idempotent.
@@ -755,7 +785,7 @@ func SchemaSQL() string {
 		for _, col := range eventColumns {
 			sb.WriteString(addColumnStatement(s.table.Name, col) + ";\n")
 		}
-		for _, col := range addedColumns[s.table.Name] {
+		for _, col := range laterColumns(s.table.Name) {
 			sb.WriteString(addColumnStatement(s.table.Name, col) + ";\n")
 		}
 	}

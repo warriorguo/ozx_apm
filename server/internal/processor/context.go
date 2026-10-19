@@ -3,7 +3,9 @@ package processor
 import (
 	"bytes"
 	"encoding/json"
+	"math"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/warriorguo/ozx_apm/server/internal/models"
@@ -48,7 +50,37 @@ func NormalizeEventContext(c *models.EventContext, rawPlatform string) ContextSt
 	var stats ContextStats
 	c.Context, stats = parseContext(c.RawContext)
 	c.RawContext = nil
+	NormalizeGameClock(&c.GameClock)
 	return stats
+}
+
+// Bounds of the game clock (APM-10). Unity's frame counter is an int; game
+// time is seconds since the player started (scaled), far below a year.
+const (
+	maxGameTime  = 1e9
+	maxGameFrame = math.MaxInt32
+)
+
+// NormalizeGameClock validates the client's "t" and "frame" into GameT and
+// Frame: t a finite number in [0, 1e9), frame an integer in [0, 2^31). Both
+// or neither: a missing or invalid one drops the other (an AiTelemetry line
+// needs both). Never fails the event. The raw values are released.
+func NormalizeGameClock(c *models.GameClock) {
+	c.GameT, c.Frame = nil, nil
+	rawT, rawFrame := bytes.TrimSpace(c.RawT), bytes.TrimSpace(c.RawFrame)
+	c.RawT, c.RawFrame = nil, nil
+	if len(rawT) == 0 || len(rawFrame) == 0 || rawT[0] == '"' || rawFrame[0] == '"' {
+		return
+	}
+	t, err := strconv.ParseFloat(string(rawT), 64)
+	if err != nil || math.IsNaN(t) || t < 0 || t >= maxGameTime {
+		return
+	}
+	frame, err := strconv.ParseInt(string(rawFrame), 10, 64)
+	if err != nil || frame < 0 || frame > maxGameFrame {
+		return
+	}
+	c.GameT, c.Frame = &t, &frame
 }
 
 func normalizeBuildType(buildType, rawPlatform string) string {
