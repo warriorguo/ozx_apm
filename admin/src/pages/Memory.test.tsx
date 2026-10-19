@@ -82,8 +82,11 @@ describe('Memory page (APM-9)', () => {
 
     expect(await screen.findByTestId('fig-3.0-mem_rss_mb')).toHaveTextContent('900 MB / 1000 MB')
     expect(screen.getByTestId('fig-3.0-mem_rss_mb')).toHaveTextContent('max 1000 MB · 3')
-    expect(screen.getByTestId('fig-3.0-mem_alloc_mb')).toHaveTextContent('-') // no samples with it
-    expect(screen.getByTestId('fig-3.0-mem_gfx_mb')).toHaveTextContent('-') // absent
+    // Figures no sample has (native allocated here; Graphics in release players) get no column.
+    expect(screen.queryByTestId('fig-3.0-mem_alloc_mb')).toBeNull()
+    expect(screen.queryByRole('columnheader', { name: 'Graphics' })).toBeNull()
+    expect(screen.queryByTestId('fig-3.0-mem_gfx_mb')).toBeNull()
+    expect(screen.getByText('Avg growth (ended runs)')).toBeInTheDocument()
     expect(await screen.findAllByText('4.69 GB')).toHaveLength(2) // p99 and max
     expect(screen.getByText('+450 MB')).toBeInTheDocument()
     const bars = screen.getAllByTestId('peak-bucket')

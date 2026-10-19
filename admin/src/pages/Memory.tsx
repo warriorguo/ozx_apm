@@ -46,6 +46,9 @@ export function Memory() {
   const peaks = useRunPeaks(metric, group, queryParams)
 
   const rows = breakdown.data?.rows ?? []
+  // A figure no sample has is not shown (e.g. Graphics in release players:
+  // Unity keeps Gfx Used Memory in development players only).
+  const shownFigures = figures.filter((f) => rows.some((r) => (r.figures?.[f.name]?.rows ?? 0) > 0))
   const peakRows = peaks.data?.rows ?? []
   const buckets = peaks.data?.buckets ?? []
   const maxBucket = buckets.reduce((m, b) => Math.max(m, b.runs), 0)
@@ -77,7 +80,7 @@ export function Memory() {
                 <tr>
                   <th className="px-3 py-2 text-left">{groupLabel(group)}</th>
                   <th className="px-3 py-2 text-right">Samples</th>
-                  {figures.map((f) => (
+                  {shownFigures.map((f) => (
                     <th key={f.name} className="px-3 py-2 text-right" title={f.hint}>
                       {f.label}
                     </th>
@@ -94,7 +97,7 @@ export function Memory() {
                       {formatNumber(r.samples)}
                       <div className="text-xs text-gray-400">{formatNumber(r.sessions)} sessions</div>
                     </td>
-                    {figures.map((f) => {
+                    {shownFigures.map((f) => {
                       const v = r.figures[f.name]
                       return (
                         <td key={f.name} className="px-3 py-2 text-right whitespace-nowrap" data-testid={`fig-${r.value}-${f.name}`}>
@@ -167,7 +170,7 @@ export function Memory() {
                     <th className="px-3 py-2 text-right">OOM</th>
                     <th className="px-3 py-2 text-right">Killed</th>
                     <th className="px-3 py-2 text-right">Avg length</th>
-                    <th className="px-3 py-2 text-right">Avg growth</th>
+                    <th className="px-3 py-2 text-right" title="End minus start of the runs that ended (EndRun, a new run, quit). Crashed and killed runs are not in it: their end is the memory at death.">Avg growth (ended runs)</th>
                   </tr>
                 </thead>
                 <tbody>

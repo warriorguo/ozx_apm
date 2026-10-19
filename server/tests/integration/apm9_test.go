@@ -199,6 +199,11 @@ func TestAPM9_PerformanceByBucketedContext(t *testing.T) {
 		jank("boss")
 	}
 	jank("forest")
+	// town: 10 s of play and no jank (rate 0, not absent: device check of 9d98887).
+	for i := 0; i < 10; i++ {
+		at += 10
+		events = append(events, e.ev("perf_sample", "c4", "3.0", at, map[string]interface{}{"fps": 60, "interval_ms": 1000, "ctx": map[string]string{"stageType": "town"}}))
+	}
 	e.ingest(t, events)
 
 	var dist models.ContextDistribution
@@ -207,7 +212,7 @@ func TestAPM9_PerformanceByBucketedContext(t *testing.T) {
 	for _, r := range dist.Rows {
 		got = append(got, fmt.Sprintf("%s:%d", r.Value, r.Count))
 	}
-	if dist.Bucket != "count" || strings.Join(got, ",") != "0:20,1-5:20,6-10:40,101-200:20,many:20" {
+	if dist.Bucket != "count" || strings.Join(got, ",") != "0:20,1-5:20,6-10:40,101-200:20,many:20,:10" {
 		t.Fatalf("bucketed %v", got)
 	}
 	for _, r := range dist.Rows {
@@ -217,19 +222,26 @@ func TestAPM9_PerformanceByBucketedContext(t *testing.T) {
 	}
 	var raw models.ContextDistribution
 	e.get(t, "/api/context/distribution", url.Values{"key": {"aliveEnemies"}, "metric": {"fps"}}, &raw)
-	if raw.Bucket != "" || len(raw.Rows) != 6 {
+	if raw.Bucket != "" || len(raw.Rows) != 7 { // 6 values and "" (town's samples lack the key)
 		t.Errorf("raw %+v", raw.Rows)
 	}
 
 	var rate models.ContextDistribution
 	e.get(t, "/api/context/distribution", url.Values{"key": {"stageType"}, "metric": {"jank_rate"}}, &rate)
-	if len(rate.Rows) != 2 || rate.Total != 9 || rate.Unit != "janks/min" {
+	if len(rate.Rows) != 3 || rate.Total != 9 || rate.Unit != "janks/min" {
 		t.Fatalf("jank rate %+v", rate)
 	}
-	// boss: 80 samples of 1 s (80/60 min) and 8 janks; forest: 40 s and 1 jank.
-	boss, forest := rate.Rows[0], rate.Rows[1]
-	if boss.Value != "boss" || boss.Count != 8 || !near3(boss.Minutes, 80.0/60) || !near3(boss.Rate, 8/(80.0/60)) ||
-		forest.Value != "forest" || forest.Count != 1 || !near3(forest.Rate, 1/(40.0/60)) {
+	// boss: 80 samples of 1 s (80/60 min) and 8 janks; forest: 40 s and 1 jank; town: 10 s, none.
+	boss, forest, town := rate.Rows[0], rate.Rows[1], rate.Rows[2]
+	val := func(p *float64) float64 {
+		if p == nil {
+			return math.NaN()
+		}
+		return *p
+	}
+	if boss.Value != "boss" || boss.Count != 8 || !near3(val(boss.Minutes), 80.0/60) || !near3(val(boss.Rate), 8/(80.0/60)) ||
+		forest.Value != "forest" || forest.Count != 1 || !near3(val(forest.Rate), 1/(40.0/60)) ||
+		town.Value != "town" || town.Count != 0 || !near3(val(town.Minutes), 10.0/60) || town.Rate == nil || *town.Rate != 0 {
 		t.Errorf("rows %+v", rate.Rows)
 	}
 	if code := adminStatus(t, e.admin, "/api/context/distribution", url.Values{"key": {"stageType"}, "metric": {"fps"}, "bucket": {"log"}}); code != http.StatusBadRequest {
@@ -349,6 +361,12 @@ func TestAPM9_SessionHealth(t *testing.T) {
 					events = append(events, e.ev("crash", s, "3.0", int64(i)*1000+500, c))
 				}
 			}
+			// h11: the player force-stopped the game in the foreground (APM-7
+			// records it as killed, USER_REQUESTED): not a crash by default.
+			events = append(events,
+				e.ev("perf_sample", "h11", "3.0", 11000, map[string]interface{}{"fps": 60, "ctx": pack(11)}),
+				e.ev("crash", "h11", "3.0", 11500, map[string]interface{}{"crash_type": "killed", "fingerprint": "fp-user", "stack": "", "breadcrumbs": []string{},
+					"exit_reason": "USER_REQUESTED", "foreground": true, "ctx": pack(11)}))
 			exc := func(s string, count int) {
 				f := map[string]interface{}{"fingerprint": "x", "message": "boom", "stack": "", "count": count, "log_type": "exception", "ctx": pack(4)}
 				events = append(events, e.ev("exception", s, "3.0", 20000, f))
@@ -366,22 +384,28 @@ func TestAPM9_SessionHealth(t *testing.T) {
 
 			var h models.SessionHealthResponse
 			e.get(t, "/api/health/sessions", nil, &h)
-			if len(h.Rows) != 1 || strings.Join(h.CrashTypes, ",") != "native,java,oom,killed" {
+			if len(h.Rows) != 1 || strings.Join(h.CrashTypes, ",") != "native,java,oom,killed" || h.UserKillsCounted {
 				t.Fatalf("health %+v", h)
 			}
 			r := h.Rows[0]
-			if r.Value != "3.0" || r.BuildType != "release" || r.Sessions != 10 || r.Users != 9 || r.CrashedSessions != 3 || r.CrashedUsers != 2 ||
-				!near3(r.CrashFreeSessions, 0.7) || !near3(r.CrashFreeUsers, 7.0/9) || r.ANRSessions != 1 || !near3(r.ANRRate, 0.1) ||
-				r.ExceptionSessions != 2 || r.Exceptions != 6 || !near3(r.ExceptionsPerSession, 0.6) {
+			if r.Value != "3.0" || r.BuildType != "release" || r.Sessions != 11 || r.Users != 10 || r.CrashedSessions != 3 || r.CrashedUsers != 2 ||
+				!near3(r.CrashFreeSessions, 8.0/11) || !near3(r.CrashFreeUsers, 0.8) || r.ANRSessions != 1 || !near3(r.ANRRate, 1.0/11) ||
+				r.ExceptionSessions != 2 || r.Exceptions != 6 || !near3(r.ExceptionsPerSession, 6.0/11) {
 				t.Errorf("3.0: %+v", r)
 			}
-			if r.CrashesByType["native"] != 1 || r.CrashesByType["oom"] != 1 || r.CrashesByType["anr"] != 1 || r.CrashesByType["killed"] != 1 || r.CrashesByType["unknown"] != 1 || r.CrashesByType["java"] != 0 {
+			if r.CrashesByType["native"] != 1 || r.CrashesByType["oom"] != 1 || r.CrashesByType["anr"] != 1 || r.CrashesByType["killed"] != 1 ||
+				r.CrashesByType["killed_by_user"] != 1 || r.CrashesByType["unknown"] != 1 || r.CrashesByType["java"] != 0 {
 				t.Errorf("by type %v", r.CrashesByType)
 			}
 			var withUnknown models.SessionHealthResponse
 			e.get(t, "/api/health/sessions", url.Values{"crash_types": {"native,java,oom,killed,unknown"}}, &withUnknown)
 			if withUnknown.Rows[0].CrashedSessions != 4 {
 				t.Errorf("with unknown %+v", withUnknown.Rows[0])
+			}
+			var userKills models.SessionHealthResponse
+			e.get(t, "/api/health/sessions", url.Values{"user_kills": {"1"}}, &userKills)
+			if !userKills.UserKillsCounted || userKills.Rows[0].CrashedSessions != 4 || userKills.Rows[0].CrashedUsers != 3 {
+				t.Errorf("user kills counted %+v", userKills.Rows[0])
 			}
 			var all models.SessionHealthResponse
 			e.get(t, "/api/health/sessions", url.Values{"build_type": {"all"}}, &all)
@@ -396,7 +420,7 @@ func TestAPM9_SessionHealth(t *testing.T) {
 			e.get(t, "/api/health/sessions", url.Values{"key": {"dataVersion"}}, &packs)
 			sort.Slice(packs.Rows, func(a, b int) bool { return packs.Rows[a].Value < packs.Rows[b].Value })
 			if len(packs.Rows) != 2 || packs.Rows[0].Value != "dp-7" || packs.Rows[0].Sessions != 5 || packs.Rows[0].CrashedSessions != 2 ||
-				packs.Rows[0].ExceptionSessions != 2 || packs.Rows[1].Value != "dp-8" || packs.Rows[1].CrashedSessions != 1 || packs.Rows[1].ANRSessions != 0 {
+				packs.Rows[0].ExceptionSessions != 2 || packs.Rows[1].Value != "dp-8" || packs.Rows[1].Sessions != 6 || packs.Rows[1].CrashedSessions != 1 || packs.Rows[1].ANRSessions != 0 {
 				t.Errorf("by data pack %+v", packs.Rows)
 			}
 			if code := adminStatus(t, e.admin, "/api/health/sessions", url.Values{"crash_types": {"x"}}); code != http.StatusBadRequest {

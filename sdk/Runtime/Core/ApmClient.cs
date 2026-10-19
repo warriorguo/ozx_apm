@@ -1106,9 +1106,11 @@ namespace OzxApm.Core
             string statm = ProcStatmPathForTests ??
                 (MemorySourceForTests == null && Application.platform == RuntimePlatform.Android ? ProcStatm.DefaultPath : null);
             var testSource = MemorySourceForTests;
+            // Debug.isDebugBuild: true in development players and the Editor (main thread, read once here).
+            bool gfx = Debug.isDebugBuild;
             Func<IMemorySource> source = testSource != null
                 ? () => testSource
-                : (Func<IMemorySource>)(() => new UnityMemorySource(statm == null));
+                : (Func<IMemorySource>)(() => new UnityMemorySource(statm == null, gfx));
             int intervalMs = (int)(Math.Max(0.1f, _config.SamplingIntervalSeconds) * 1000f);
             _memory = new MemorySampler(_runs, source, statm, intervalMs);
         }

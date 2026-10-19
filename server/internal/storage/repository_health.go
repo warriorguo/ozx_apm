@@ -23,9 +23,43 @@ import (
 // asked for: it may be a kill the player caused.
 var DefaultHealthCrashTypes = []string{fingerprint.CrashTypeNative, fingerprint.CrashTypeJava, fingerprint.CrashTypeOOM, fingerprint.CrashTypeKilled}
 
-// healthCrashTypes are the crash types counted per type in CrashesByType.
-var healthCrashTypes = []string{fingerprint.CrashTypeNative, fingerprint.CrashTypeJava, fingerprint.CrashTypeOOM,
-	fingerprint.CrashTypeKilled, fingerprint.CrashTypeANR, fingerprint.CrashTypeUnknown}
+// UserKillExitReasons are the Android exit reasons of a process the player
+// (or a test harness) stopped: force-stop from the recents screen or the
+// settings, `am force-stop`. APM-7 records such a foreground end as a
+// "killed" crash, but it is not a crash for the crash-free rates (Play
+// Console's crash rate does not count them either): they are left out
+// unless the request counts user kills (HealthOptions.CountUserKills).
+// System kills in the foreground (SIGNALED, EXCESSIVE_RESOURCE_USAGE,
+// FREEZER, OTHER, ...) and low-memory kills ("oom") still count: the
+// player saw the game die. (Device check of APM-9: 12 of 14 "crashed"
+// sessions were `am force-stop` of the test harness, USER_REQUESTED.)
+var UserKillExitReasons = []string{"USER_REQUESTED", "USER_STOPPED"}
+
+// userKillCond is a crash row that is a kill by the player (constants only).
+var userKillCond = "(crash_type = '" + fingerprint.CrashTypeKilled + "' AND exit_reason IN ('" + strings.Join(UserKillExitReasons, "', '") + "'))"
+
+// HealthOptions say what counts as a crash for the crash-free rates.
+type HealthOptions struct {
+	// CrashTypes count as crashes (empty: DefaultHealthCrashTypes).
+	CrashTypes []string
+	// CountUserKills: a "killed" crash with a UserKillExitReasons reason counts too.
+	CountUserKills bool
+}
+
+// healthTypeColumn is one entry of CrashesByType and its condition (constants only).
+type healthTypeColumn struct{ name, cond string }
+
+// healthTypeColumns are the crash counts per type in CrashesByType; kills by
+// the player are their own entry ("killed_by_user"), not in "killed".
+var healthTypeColumns = []healthTypeColumn{
+	{fingerprint.CrashTypeNative, "crash_type = '" + fingerprint.CrashTypeNative + "'"},
+	{fingerprint.CrashTypeJava, "crash_type = '" + fingerprint.CrashTypeJava + "'"},
+	{fingerprint.CrashTypeOOM, "crash_type = '" + fingerprint.CrashTypeOOM + "'"},
+	{fingerprint.CrashTypeKilled, "crash_type = '" + fingerprint.CrashTypeKilled + "' AND NOT " + userKillCond},
+	{"killed_by_user", userKillCond},
+	{fingerprint.CrashTypeANR, "crash_type = '" + fingerprint.CrashTypeANR + "'"},
+	{fingerprint.CrashTypeUnknown, "crash_type = '" + fingerprint.CrashTypeUnknown + "'"},
+}
 
 // healthSessionTables are the tables whose rows say a session existed (every
 // event table that has os_version; scene loads come with perf samples or a
@@ -35,18 +69,26 @@ var healthSessionTables = []EventTable{TablePerfSamples, TableStartups, TableJan
 // sessionHealthQuery builds the query: per table, one row per (group,
 // build type, session) with what the session had (crash flags, exception
 // count, crashes per type), then the groups over the sessions.
-func sessionHealthQuery(f models.AdminFilter, g CustomGroup, crashTypes []string) (string, []interface{}, error) {
+func sessionHealthQuery(f models.AdminFilter, g CustomGroup, opt HealthOptions) (string, []interface{}, error) {
 	expr, exprArgs, err := groupValue(g)
 	if err != nil {
 		return "", nil, err
+	}
+	crashTypes := opt.CrashTypes
+	if len(crashTypes) == 0 {
+		crashTypes = DefaultHealthCrashTypes
+	}
+	crashedCond := "crash_type IN ?"
+	if !opt.CountUserKills {
+		crashedCond += " AND NOT " + userKillCond
 	}
 	// Aliases never equal a column name (ClickHouse would substitute the
 	// aggregate for the column inside it): bt, sid, dev, crashed, anr, exc,
 	// t0..tN per table part; d, sc, sa, se, s0..sN per session.
 	var zeroTypes, typeCols, sessionSums, groupSums strings.Builder
-	for i, t := range healthCrashTypes {
+	for i, t := range healthTypeColumns {
 		fmt.Fprintf(&zeroTypes, ", toUInt64(0) AS t%d", i)
-		fmt.Fprintf(&typeCols, ", toUInt64(countIf(crash_type = '%s')) AS t%d", t, i) // constants, not input
+		fmt.Fprintf(&typeCols, ", toUInt64(countIf(%s)) AS t%d", t.cond, i) // constants, not input
 		fmt.Fprintf(&sessionSums, ", sum(t%d) AS s%d", i, i)
 		fmt.Fprintf(&groupSums, ", toInt64(sum(s%d))", i)
 	}
@@ -67,7 +109,7 @@ func sessionHealthQuery(f models.AdminFilter, g CustomGroup, crashTypes []string
 	}
 	part(TableExceptions.Name, "toUInt8(0)", "toUInt8(0)", "toUInt64(sum(count))", zeroTypes.String())
 	// The crash types that count are bound; the per-type counts are constants.
-	part(TableCrashes.Name, "toUInt8(countIf(crash_type IN ?) > 0)", "toUInt8(countIf(crash_type = 'anr') > 0)", "toUInt64(0)",
+	part(TableCrashes.Name, "toUInt8(countIf("+crashedCond+") > 0)", "toUInt8(countIf(crash_type = 'anr') > 0)", "toUInt64(0)",
 		typeCols.String(), groupSet(crashTypes))
 
 	inner := strings.Join(parts, "\n\t\tUNION ALL\n\t\t")
@@ -90,19 +132,19 @@ func sessionHealthQuery(f models.AdminFilter, g CustomGroup, crashTypes []string
 // GetSessionHealth returns, per group and build type, the sessions and
 // users, the crash-free rates (crashTypes count as crashes), the ANR rate
 // and the exception rates, most sessions first (at most 50 groups).
-func (r *Repository) GetSessionHealth(ctx context.Context, f models.AdminFilter, g CustomGroup, crashTypes []string) (*models.SessionHealthResponse, error) {
-	if len(crashTypes) == 0 {
-		crashTypes = DefaultHealthCrashTypes
+func (r *Repository) GetSessionHealth(ctx context.Context, f models.AdminFilter, g CustomGroup, opt HealthOptions) (*models.SessionHealthResponse, error) {
+	if len(opt.CrashTypes) == 0 {
+		opt.CrashTypes = DefaultHealthCrashTypes
 	}
-	query, args, err := sessionHealthQuery(f, g, crashTypes)
+	query, args, err := sessionHealthQuery(f, g, opt)
 	if err != nil {
 		return nil, err
 	}
-	resp := &models.SessionHealthResponse{GroupBy: g.String(), CrashTypes: crashTypes, Rows: []models.SessionHealthRow{}}
+	resp := &models.SessionHealthResponse{GroupBy: g.String(), CrashTypes: opt.CrashTypes, UserKillsCounted: opt.CountUserKills, Rows: []models.SessionHealthRow{}}
 	err = withAnalysisSlot(ctx, func() error {
 		return r.queryRows(ctx, query, args, func(rows driver.Rows) error {
 			var row models.SessionHealthRow
-			types := make([]int64, len(healthCrashTypes))
+			types := make([]int64, len(healthTypeColumns))
 			dest := []any{&row.Value, &row.BuildType, &row.Sessions, &row.Users, &row.CrashedSessions, &row.CrashedUsers,
 				&row.ANRSessions, &row.ExceptionSessions, &row.Exceptions}
 			for i := range types {
@@ -116,8 +158,8 @@ func (r *Repository) GetSessionHealth(ctx context.Context, f models.AdminFilter,
 				return nil
 			}
 			row.CrashesByType = make(map[string]int64, len(types))
-			for i, t := range healthCrashTypes {
-				row.CrashesByType[t] = types[i]
+			for i, t := range healthTypeColumns {
+				row.CrashesByType[t.name] = types[i]
 			}
 			fillHealthRates(&row)
 			resp.Rows = append(resp.Rows, row)

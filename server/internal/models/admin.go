@@ -427,18 +427,20 @@ type ContextValuesResponse struct {
 // for exceptions, crashes and jank_rate (P05, P90 and P99 since APM-9: for
 // fps the low percentiles are the slow moments). jank_rate (APM-9): Count is
 // janks, Minutes the play time of the value (the perf samples' windows) and
-// Rate janks per minute of play.
+// Rate janks per minute of play: both set on every jank_rate row (0 is 0),
+// except Rate when the value has no play time (minutes 0: no rate). Absent
+// for the other metrics.
 type ContextDistributionRow struct {
-	Value    string  `json:"value"`
-	Count    int64   `json:"count"`
-	Sessions int64   `json:"sessions"`
-	P05      float64 `json:"p05"`
-	P50      float64 `json:"p50"`
-	P90      float64 `json:"p90"`
-	P95      float64 `json:"p95"`
-	P99      float64 `json:"p99"`
-	Minutes  float64 `json:"minutes,omitempty"`
-	Rate     float64 `json:"rate,omitempty"`
+	Value    string   `json:"value"`
+	Count    int64    `json:"count"`
+	Sessions int64    `json:"sessions"`
+	P05      float64  `json:"p05"`
+	P50      float64  `json:"p50"`
+	P90      float64  `json:"p90"`
+	P95      float64  `json:"p95"`
+	P99      float64  `json:"p99"`
+	Minutes  *float64 `json:"minutes,omitempty"`
+	Rate     *float64 `json:"rate,omitempty"`
 }
 
 type ContextDistribution struct {

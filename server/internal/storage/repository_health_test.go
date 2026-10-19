@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -30,7 +31,7 @@ func checkBound(t *testing.T, name, sql string, args []interface{}) {
 
 func TestSessionHealthQuery_BindsEveryValue(t *testing.T) {
 	for _, g := range []CustomGroup{{Kind: "column", Key: "app_version"}, {Kind: "ctx", Key: "dataVersion"}} {
-		q, args, err := sessionHealthQuery(evilFilter(), g, []string{"native", "oom"})
+		q, args, err := sessionHealthQuery(evilFilter(), g, HealthOptions{CrashTypes: []string{"native", "oom"}})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -60,11 +61,45 @@ func TestSessionHealthQuery_BindsEveryValue(t *testing.T) {
 			}
 		}
 	}
-	if _, _, err := sessionHealthQuery(evilFilter(), CustomGroup{Kind: "column", Key: "ctx"}, nil); err == nil {
+	if _, _, err := sessionHealthQuery(evilFilter(), CustomGroup{Kind: "column", Key: "ctx"}, HealthOptions{}); err == nil {
 		t.Error("grouping by an unknown column accepted")
 	}
-	if _, _, err := sessionHealthQuery(evilFilter(), CustomGroup{Kind: "ctx", Key: "bad key"}, nil); err == nil {
+	if _, _, err := sessionHealthQuery(evilFilter(), CustomGroup{Kind: "ctx", Key: "bad key"}, HealthOptions{}); err == nil {
 		t.Error("an invalid context key accepted")
+	}
+}
+
+// A kill by the player (force-stop) is not a crash unless asked for; it has
+// its own entry in crashes_by_type, and "killed" holds the other kills.
+func TestSessionHealthQuery_UserKills(t *testing.T) {
+	g := CustomGroup{Kind: "column", Key: "app_version"}
+	q, args, err := sessionHealthQuery(evilFilter(), g, HealthOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkBound(t, "default", q, args)
+	user := "(crash_type = 'killed' AND exit_reason IN ('USER_REQUESTED', 'USER_STOPPED'))"
+	if !strings.Contains(q, "countIf(crash_type IN ? AND NOT "+user+") > 0) AS crashed") ||
+		!strings.Contains(q, "countIf(crash_type = 'killed' AND NOT "+user+")) AS t3") ||
+		!strings.Contains(q, "countIf("+user+")) AS t4") {
+		t.Errorf("default: %s", q)
+	}
+	q, args, _ = sessionHealthQuery(evilFilter(), g, HealthOptions{CountUserKills: true})
+	checkBound(t, "user kills", q, args)
+	if !strings.Contains(q, "toUInt8(countIf(crash_type IN ?) > 0) AS crashed") {
+		t.Errorf("user kills counted: %s", q)
+	}
+	var set []any
+	for _, a := range args {
+		if s, ok := a.(clickhouse.GroupSet); ok && len(s.Value) == len(DefaultHealthCrashTypes) {
+			set = s.Value
+		}
+	}
+	if fmt.Sprint(set) != "[native java oom killed]" {
+		t.Errorf("default crash types %v", set)
+	}
+	if len(healthTypeColumns) != 7 || healthTypeColumns[4].name != "killed_by_user" {
+		t.Errorf("%v", healthTypeColumns)
 	}
 }
 

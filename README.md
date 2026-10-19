@@ -428,7 +428,7 @@ All take the common filter (time range, at most 31 days; `app_version`,
 
 - **GET /api/memory/breakdown[?by=..|key=..]** - perf samples' memory figures (p50/p95/max) per group
 - **GET /api/memory/runs?metric=peak_rss[&by=..|key=..]** - peak memory per run, OOM/crashed runs, histogram
-- **GET /api/health/sessions[?by=..|key=dataVersion][&crash_types=native,java,oom,killed]** - crash-free sessions and users, ANR and exception rates
+- **GET /api/health/sessions[?by=..|key=dataVersion][&crash_types=native,java,oom,killed][&user_kills=1]** - crash-free sessions and users (force-stops by the player are not crashes unless `user_kills=1`), ANR and exception rates
 - **GET /api/funnel?steps=[{"name":"run_start"},{"name":"room_enter","props":{"roomType":"boss"}}][&window=7200][&by=app_version]** - sessions per step and conversion
 - **GET /api/context/distribution?key=aliveEnemies&metric=fps&bucket=count** - also `metric=jank_rate`
 

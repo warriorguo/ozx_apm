@@ -30,7 +30,7 @@ import (
 type AnalysisStore interface {
 	GetMemoryBreakdown(ctx context.Context, f models.AdminFilter, g storage.CustomGroup) (*models.MemoryBreakdownResponse, error)
 	GetRunPeaks(ctx context.Context, f models.AdminFilter, metric string, g storage.CustomGroup) (*models.RunPeaksResponse, error)
-	GetSessionHealth(ctx context.Context, f models.AdminFilter, g storage.CustomGroup, crashTypes []string) (*models.SessionHealthResponse, error)
+	GetSessionHealth(ctx context.Context, f models.AdminFilter, g storage.CustomGroup, opt storage.HealthOptions) (*models.SessionHealthResponse, error)
 	GetFunnel(ctx context.Context, f models.AdminFilter, steps []models.FunnelStep, windowSec int64, by string) (*models.FunnelResponse, error)
 }
 
@@ -161,7 +161,8 @@ func (h *AnalysisHandler) RunPeaks(w http.ResponseWriter, r *http.Request) {
 // Health: GET /api/health/sessions[?by=..|key=..][&crash_types=native,java,oom,killed]
 // -> per group and build type: sessions, users, crash-free sessions and
 // users, ANR rate, exception rates and crashes per type. crash_types: which
-// crash types make a session crashed (default storage.DefaultHealthCrashTypes).
+// crash types make a session crashed (default storage.DefaultHealthCrashTypes);
+// user_kills=1 also counts kills by the player (force-stop: storage.UserKillExitReasons).
 func (h *AnalysisHandler) Health(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	f, ok := h.filter(w, q)
@@ -187,9 +188,18 @@ func (h *AnalysisHandler) Health(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	opt := storage.HealthOptions{CrashTypes: types}
+	switch q.Get("user_kills") {
+	case "", "0", "false":
+	case "1", "true":
+		opt.CountUserKills = true
+	default:
+		http.Error(w, "user_kills must be 1, true, 0 or false", http.StatusBadRequest)
+		return
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), analysisTimeout)
 	defer cancel()
-	resp, err := h.repo.GetSessionHealth(ctx, f, g, types)
+	resp, err := h.repo.GetSessionHealth(ctx, f, g, opt)
 	if err != nil {
 		h.fail(w, "session health", err)
 		return

@@ -32,11 +32,18 @@ namespace OzxApm.Collectors
         private bool _profilerFailed;
         private bool _recordersFailed;
 
-        internal UnityMemorySource(bool withSystem)
+        /// <param name="withGfx">
+        /// "Gfx Used Memory" is only maintained in development players and the
+        /// Editor: in a release player (A33, IL2CPP, Unity 2022.3) it read 0 on
+        /// every sample. There the recorder is not created (one native
+        /// recorder and one engine call per sample saved); mem_gfx_mb is not sent.
+        /// </param>
+        internal UnityMemorySource(bool withSystem, bool withGfx)
         {
             try
             {
-                _gfx = ProfilerRecorder.StartNew(ProfilerCategory.Memory, "Gfx Used Memory");
+                if (withGfx)
+                    _gfx = ProfilerRecorder.StartNew(ProfilerCategory.Memory, "Gfx Used Memory");
                 if (withSystem)
                     _system = ProfilerRecorder.StartNew(ProfilerCategory.Memory, "System Used Memory");
             }

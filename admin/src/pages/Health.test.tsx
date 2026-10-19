@@ -85,6 +85,17 @@ describe('Health page (APM-9)', () => {
     await waitFor(() => expect(api.getSessionHealth).toHaveBeenLastCalledWith({ kind: 'key', key: 'dataVersion' }, expect.anything(), expect.anything()))
   })
 
+  it('counts force-stops only on request', async () => {
+    api.getSessionHealth.mockResolvedValue({ group_by: 'app_version', crash_types: [], truncated: false, rows: [row('3.1', 0.99, 0)] })
+    render(<Health />, { wrapper })
+    await screen.findByText('99.00%')
+    expect(api.getSessionHealth).toHaveBeenLastCalledWith(expect.anything(), expect.anything(), expect.not.objectContaining({ user_kills: '1' }))
+    fireEvent.click(screen.getByLabelText('Count force-stops'))
+    await waitFor(() =>
+      expect(api.getSessionHealth).toHaveBeenLastCalledWith(expect.anything(), expect.anything(), expect.objectContaining({ user_kills: '1' }))
+    )
+  })
+
   it('keeps at least one crash type (none would make the server count its defaults)', async () => {
     api.getSessionHealth.mockResolvedValue({ group_by: 'app_version', crash_types: [], truncated: false, rows: [row('3.1', 0.99, 0)] })
     render(<Health />, { wrapper })

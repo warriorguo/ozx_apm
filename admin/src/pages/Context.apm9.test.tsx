@@ -79,11 +79,17 @@ describe('Context page, APM-9: count ranges, jank rate, tails', () => {
       unit: 'janks/min',
       total: 9,
       truncated: false,
-      rows: [{ value: 'boss', count: 8, sessions: 1, p50: 0, p95: 0, minutes: 1.3333, rate: 6 }],
+      rows: [
+        { value: 'boss', count: 8, sessions: 1, p50: 0, p95: 0, minutes: 1.3333, rate: 6 },
+        { value: 'town', count: 0, sessions: 0, p50: 0, p95: 0, minutes: 0.5, rate: 0 },
+        { value: 'void', count: 1, sessions: 1, p50: 0, p95: 0, minutes: 0 },
+      ],
     })
     fireEvent.change(screen.getByLabelText('Metric'), { target: { value: 'jank_rate' } })
     expect(await screen.findByText('Janks / min')).toBeInTheDocument()
     expect(screen.getByText('6.00')).toBeInTheDocument()
+    expect(screen.getByText('0.00')).toBeInTheDocument() // played, no jank: 0
+    expect(screen.getByText('-')).toBeInTheDocument() // no play time: no rate
     expect(screen.getByText('1.3')).toBeInTheDocument()
     expect(screen.queryByText('p50')).toBeNull()
     expect(api.getContextDistribution).toHaveBeenLastCalledWith('aliveEnemies', 'jank_rate', expect.anything())

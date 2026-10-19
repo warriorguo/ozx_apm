@@ -3242,8 +3242,12 @@ admin UI needs this server (it calls the new endpoints).
   sample (once per `SamplingIntervalSeconds`, never per frame) reads, on the
   main thread, `Profiler.GetMonoHeapSizeLong` (managed heap reserved),
   `GetTotalAllocatedMemoryLong` / `GetTotalReservedMemoryLong` (Unity's
-  native memory) and the profiler counter "Gfx Used Memory" through a
-  `ProfilerRecorder` created once (engine calls, no allocation). The process
+  native memory) and, in development players and the Editor only, the
+  profiler counter "Gfx Used Memory" through a `ProfilerRecorder` created
+  once (engine calls, no allocation). In a release player the counter is not
+  maintained (device check: 0 on every sample of the A33 release build), so
+  the recorder is not created there and `mem_gfx_mb` is not sent; the admin
+  hides a figure no sample has. The process
   RSS is read on Android from `/proc/self/statm` (resident pages x page size)
   by a thread of its own (`OzxApm.Memory`, 128 KB stack) at the same
   interval (every 10 s while paused): the file is opened once and re-read
@@ -3323,7 +3327,19 @@ admin UI needs this server (it calls the new endpoints).
   crashed sessions/users (a crash of the counted types; default `native`,
   `java`, `oom`, `killed`: the process died in the foreground; `unknown`
   (Android 10 and older, a foreground process ended without an exit record)
-  only on request since it may be a kill the player caused), crash-free rates,
+  only on request since it may be a kill the player caused). **Kills by the
+  player are not crashes:** a `killed` crash whose Android exit reason is
+  `USER_REQUESTED` or `USER_STOPPED` (force-stop from recents or settings,
+  `am force-stop`) is left out of the crash-free rates by default, like Play
+  Console's crash rate (which counts neither those nor low-memory kills);
+  `user_kills=1` counts them. Low-memory kills (`oom`) and the system's
+  other foreground kills (`SIGNALED`, `EXCESSIVE_RESOURCE_USAGE`, `FREEZER`,
+  `OTHER`, ...) still count: the player saw the game die, and an OOM is the
+  memory bug this ticket is about (this is stricter than Play Console; drop
+  `oom` from `crash_types` to compare). Found on the device: 12 of 14
+  "crashed" sessions were the test harness's `am force-stop`. APM-7 keeps
+  recording them (`crashes_by_type.killed_by_user`); APM-8's crash rate
+  spike alert still counts every crash row (unchanged here). Crash-free rates,
   ANR sessions and rate (separate, like Play Console's ANR rate), exception
   sessions, occurrences and per-session rate, crashes per type. Crash rows
   carry the crashed session's version, build type and context (APM-7), so a
@@ -3405,15 +3421,21 @@ key>`; at most 50 groups (`truncated`).
   avg_duration_ms, avg_growth_mb}], buckets[{low, high, runs, oom}],
   truncated}`: exact percentiles (`quantileExactIf`) over the runs that have
   the figure; growth = end - start of RSS or native memory over the runs
-  that ended normally (`end`, `new_run`, `shutdown`); the histogram (MB:
+  that ended normally (`end`, `new_run`, `shutdown`) only, on purpose: a
+  crashed or killed run's "end" is the memory at death (an OOM run would
+  read as gigabytes of growth and swamp the average); its peak is in
+  p50..max and `oom_runs`. The admin labels the column "Avg growth (ended
+  runs)". (Device check: avg growth 48.9 MB before and after an OOM run.)
+  The histogram (MB:
   256, 512, 768, 1024, 1536, 2048, 3072, 4096, `high` 0 = open) over every
   filtered run.
-- `GET /api/health/sessions[&crash_types=native,java,oom,killed]` -> `{group_by,
-  crash_types, rows[{value, build_type, sessions, users, crashed_sessions,
+- `GET /api/health/sessions[&crash_types=native,java,oom,killed][&user_kills=1]` -> `{group_by,
+  crash_types, user_kills_counted, rows[{value, build_type, sessions, users, crashed_sessions,
   crashed_users, crash_free_sessions, crash_free_users, anr_sessions, anr_rate,
   exception_sessions, exceptions, exception_session_rate,
-  exceptions_per_session, crashes_by_type{native, java, oom, killed, anr,
-  unknown}}], truncated}`; rates are fractions; an unknown crash type is a 400.
+  exceptions_per_session, crashes_by_type{native, java, oom, killed (by the
+  system), killed_by_user (force-stops), anr, unknown}}], truncated}`; rates
+  are fractions; an unknown crash type or `user_kills` value is a 400.
 - `GET /api/funnel?steps=<JSON>[&window=<s>][&by=app_version|build_type|platform]`:
   `steps` = `[{"name":"run_start"},{"name":"room_enter","props":{"roomType":"boss"}}]`
   (at most 8 KB; 1-8 steps; names and property keys `[A-Za-z0-9_.-]{1,64}`,
@@ -3424,7 +3446,9 @@ key>`; at most 50 groups (`truncated`).
   step. No match: one group of zeros.
 - `GET /api/context/distribution` adds `bucket=count`, `metric=jank_rate`
   (`count` janks, `minutes`, `rate` janks per minute, unit `janks/min`, rows
-  by play time) and `p05`, `p90`, `p99` on every row; `source=runs` for the
+  by play time; `rate` is 0 for a value played without a jank and absent
+  only when the value has no play time: fixed after the device check, where
+  it was absent for 0 janks) and `p05`, `p90`, `p99` on every row; `source=runs` for the
   context keys/values endpoints.
 - `GET /api/sessions/timeline`: items of type `run` (`run_id`,
   `end_reason`, `result`, `crash_type`, `duration_ms`, `peak_rss_mb`,
@@ -3540,7 +3564,7 @@ remove the table after a permanent rollback (admin): `DROP TABLE apm_runs`.
   runtime (among them the 9 new `RunApiTests`: BeginRun/EndRun through
   ApmClient, shutdown, consent, SetContextCount, no allocation on the
   sampling paths and the journal write).
-- Admin UI: `tsc`, vitest (173 tests, 25 new), `vite build`.
+- Admin UI: `tsc`, vitest (174 tests, 26 new), `vite build`.
 - A code review (another agent, reading the diff) found: the Health page
   sending no crash types when every box was cleared (the server then counts
   its defaults: now at least one stays checked); a run lost or stored twice
@@ -3558,18 +3582,85 @@ remove the table after a permanent rollback (admin): `DROP TABLE apm_runs`.
 - The test driver (`/tmp/claude-501/apm9/ApmTestDriver.cs`) compiles against
   this SDK; the device plan is `/tmp/claude-501/apm9/DEVICE_PLAN.md`.
 
+### Verified before release (lead)
+
+Server, SDK and admin at 9d98887; test app built clean (Unity 2022.3.62f3,
+IL2CPP arm64, release; no `class with ID 115`); local server on ClickHouse;
+Samsung A33, Android 16 (One UI).
+
+- Integration on real ClickHouse: 26.1 61 passed, 24.1 61 passed, 23.8 58
+  passed and 3 skipped (the service-account tests 23.8 cannot run), 0
+  failed: every new query works on the three versions.
+- Unity EditMode: 363 tests, 1 failure:
+  `RunApiTests.SetContextCount_ChangesTheContextOnlyBetweenRanges` (the
+  measured same-range call "allocated"). Cause, measured on Unity's Mono
+  outside Unity (`/tmp/claude-501/apm9/bench/Alloc9.cs`): the first run of
+  a method holding a string literal allocates it once (48 B; the 2nd and
+  3rd runs 0 B; the same call with the key in a field 0 B; `GameContext.Set`
+  0 B): a test artefact, as in APM-7. The test now keeps the key in a field
+  and runs the delegate once before measuring; the SDK is unchanged.
+- Memory breakdown: the RSS thread reads in 0.06 ms; the perf sample's
+  memory reading costs 0.045-0.055 ms on the main thread once a second.
+  `grow=256` raised RSS by 257 MB (`Debug.getPss` 139 -> 396 -> 544 MB across
+  the steps, 22-24 ms per getPss call: unaffordable at 1 Hz, as assumed);
+  `managedgrow` raised the managed heap reserved by 70 MB, textures Unity's
+  native allocation by 32 MB; `interval_ms` ~1004. `Profiler.*` values are
+  given in the release player; **"Gfx Used Memory" was 0 on every sample**
+  (the recorder is no longer created in release players, above).
+- Runs: `end`/`win`, `new_run`, `shutdown` with the right context. (Peak
+  minus start was 148 MB for `growcap=400` because the allocator reused the
+  256 MB freed just before, and RSS does not shrink after a free: a test
+  artefact.)
+- OOM during a run: SDK `mem_rss_mb` 4441.3 MB against Android's `rss_kb`
+  4562836 (4456 MB): 15 MB apart; `mem_age_ms` 2363; context `runId`,
+  `stageType=boss`, `aliveEnemies=31-50`; the run `crash`/`oom` with peak
+  4441 MB; `/api/memory/runs` `oom_runs=1` (avg growth unchanged by it, by
+  design: above).
+- A background kill during a run: the run as `process_end`, no crash.
+  Consent Denied: no OOM report, no run.
+- Context: `bucket=count` rows in range order; FPS p05 drops to 27.6 exactly
+  in 31-50 and 51-100 (the wave's janky frames). The 120 ms frames produced
+  no jank events (the jank detector's bug, APM-21); `jank_rate` returned no
+  `rate` for values played without a jank (fixed: 0, with an integration
+  test).
+- Funnel: 5 / 3 / 3 sessions, conversion 0.6 / 0.6; with `window=10`
+  5 / 3 / 2; the 70 `run_start` calls: 14 rows sent one by one and one
+  aggregated row of 60.
+- Health: ANR separate (`anr_sessions` 1); by `dataVersion`: dp-7 the native
+  crash, dp-8 the ANR. 14 crashed sessions of which 12 `killed`: the test
+  harness's `am force-stop` in the foreground (USER_REQUESTED): now not
+  crashes by default (above, with an integration test).
+- Cost (release, `update_ms` of the frame, 60 s each; APM-7 baseline p50
+  0.038 / p99 0.13 ms): idle p50 0.036 / p99 0.11 ms; a run open 0.036 /
+  0.149; `SetContextCount` every frame (enemy wave) 0.036 / 0.132;
+  `gc_frames_with_alloc` 0 in all three. The run and wave measurements had
+  one GC collection each (heap +8 KB and +32 KB in 60 s, idle 0): the new
+  context snapshots, built off the main thread. A context change (the
+  `runId` key once; a new count range ~twice a second during the wave) is
+  copied once into a new immutable snapshot with its JSON (~0.5-1 KB), by
+  the first reader, which is the crash journal's thread (`NotifyChanged`
+  wakes it before the next perf sample is enqueued): the main thread finds
+  it built (hence 0 frames with allocations). That is the documented cost of
+  a context change (APM-5) at most once per change; within a range nothing
+  is copied. Startup to the first frame unchanged (2468 ms).
+
+### Fixed after the device check (this commit)
+
+- EditMode test artefact (above); crash-free rates exclude force-stops by
+  default (`user_kills=1`, `killed_by_user`, admin "Force-stops" box);
+  `jank_rate` `rate` 0 instead of absent; "Avg growth (ended runs)"
+  labelled and documented; the Gfx recorder only in development players and
+  the Editor, the admin hiding figures no sample has. Server unit and
+  integration tests, admin vitest and the SDK tests updated; the
+  integration tests of this commit have not been run on ClickHouse yet.
+
 ### Not verified
 
-- **Nothing here ran against ClickHouse** (23.8, 24.1, 26.1): the new SQL
-  (the `WITH ctx[?] AS raw_value` grouping, `windowFunnel` on UInt64
-  millisecond timestamps, the session health union, `quantileExactIf`) is
-  covered by the integration tests above, not run.
-- Unity EditMode (the sandbox blocks the licensing client) and the device:
-  whether `Profiler.GetTotalAllocatedMemoryLong` / `GetTotalReservedMemoryLong`
-  and the "Gfx Used Memory" / "System Used Memory" counters give values in
-  an IL2CPP release player on Android 16 (a 0 is sent as "not available"),
-  the statm re-read on procfs under IL2CPP's FileStream, the engine calls'
-  cost on the main thread, RSS against `Debug.getPss`, the OOM report's
-  memory against Android's PSS/RSS.
-- Query cost at any volume; the admin pages in a browser (jsdom only); iOS;
-  16 KB page devices.
+- The integration tests changed after the lead's run (force-stops in the
+  health test, a value played without janks in the jank-rate test): not run
+  on ClickHouse.
+- EditMode on the fixed test; the release player without the Gfx recorder
+  (expected: no `mem_gfx_mb`, nothing else changes).
+- Query cost at production volume (the lead's numbers are a test device's);
+  the admin pages in a browser (jsdom only); iOS; 16 KB page devices;
+  other Android versions.

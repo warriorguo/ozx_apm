@@ -148,7 +148,7 @@ export function Context() {
                     </td>
                     <td className="px-4 py-2 text-right">{formatNumber(r.sessions)}</td>
                     {isRate && <td className="px-4 py-2 text-right">{(r.minutes ?? 0).toFixed(1)}</td>}
-                    {isRate && <td className="px-4 py-2 text-right">{(r.rate ?? 0).toFixed(2)}</td>}
+                    {isRate && <td className="px-4 py-2 text-right">{r.rate == null ? "-" : r.rate.toFixed(2)}</td>}
                     {hasTails && <td className="px-4 py-2 text-right">{formatValue(r.p05 ?? 0, unit)}</td>}
                     {unit && !isRate && <td className="px-4 py-2 text-right">{formatValue(r.p50, unit)}</td>}
                     {unit && !isRate && <td className="px-4 py-2 text-right">{formatValue(r.p95, unit)}</td>}

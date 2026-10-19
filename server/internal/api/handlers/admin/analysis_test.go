@@ -19,6 +19,7 @@ type fakeAnalysisStore struct {
 	group      storage.CustomGroup
 	metric     string
 	crashTypes []string
+	userKills  bool
 	steps      []models.FunnelStep
 	window     int64
 	by         string
@@ -35,8 +36,8 @@ func (f *fakeAnalysisStore) GetRunPeaks(_ context.Context, flt models.AdminFilte
 	return &models.RunPeaksResponse{Metric: metric, Rows: []models.RunPeakRow{}}, f.err
 }
 
-func (f *fakeAnalysisStore) GetSessionHealth(_ context.Context, flt models.AdminFilter, g storage.CustomGroup, types []string) (*models.SessionHealthResponse, error) {
-	f.filter, f.group, f.crashTypes = flt, g, types
+func (f *fakeAnalysisStore) GetSessionHealth(_ context.Context, flt models.AdminFilter, g storage.CustomGroup, opt storage.HealthOptions) (*models.SessionHealthResponse, error) {
+	f.filter, f.group, f.crashTypes, f.userKills = flt, g, opt.CrashTypes, opt.CountUserKills
 	return &models.SessionHealthResponse{Rows: []models.SessionHealthRow{}}, f.err
 }
 
@@ -64,8 +65,14 @@ func TestAnalysis_DefaultsAndGroups(t *testing.T) {
 	if w := serve(h.Health, "/api/health/sessions?by=build_type&build_type=all"); w.Code != 200 || store.crashTypes != nil || store.group.Key != "build_type" {
 		t.Errorf("%d %s %v", w.Code, w.Body, store.crashTypes)
 	}
-	if w := serve(h.Health, "/api/health/sessions?key=dataVersion&crash_types=native,%20oom,native"); w.Code != 200 || strings.Join(store.crashTypes, ",") != "native,oom" {
+	if w := serve(h.Health, "/api/health/sessions?key=dataVersion&crash_types=native,%20oom,native"); w.Code != 200 || strings.Join(store.crashTypes, ",") != "native,oom" || store.userKills {
 		t.Errorf("%d %s %v", w.Code, w.Body, store.crashTypes)
+	}
+	if w := serve(h.Health, "/api/health/sessions?user_kills=1"); w.Code != 200 || !store.userKills {
+		t.Errorf("user_kills: %d %s", w.Code, w.Body)
+	}
+	if w := serve(h.Health, "/api/health/sessions?user_kills=maybe"); w.Code != 400 {
+		t.Errorf("bad user_kills: %d", w.Code)
 	}
 }
 

@@ -56,7 +56,10 @@ export function Health() {
   const [group, setGroup] = useState<AnalysisGroup>({ kind: 'by', key: 'app_version' })
   const [types, setTypes] = useState<CrashTypeName[]>(defaultCrashTypes)
   const [baseline, setBaseline] = useState('')
-  const { data, isLoading, isError, error } = useSessionHealth(group, types, queryParams)
+  // Force-stops by the player (killed, USER_REQUESTED / USER_STOPPED) are not crashes unless asked for.
+  const [userKills, setUserKills] = useState(false)
+  const healthParams = userKills ? ({ ...queryParams, user_kills: '1' } as typeof queryParams) : queryParams
+  const { data, isLoading, isError, error } = useSessionHealth(group, types, healthParams)
   const rows = data?.rows ?? []
   const base = rows.find((r) => rowKey(r) === baseline)
 
@@ -84,6 +87,10 @@ export function Health() {
               {c.label}
             </label>
           ))}
+          <label className="flex items-center gap-1 text-gray-700" title="Killed with Android's exit reason USER_REQUESTED or USER_STOPPED (force-stop): not a crash for Play Console either">
+            <input type="checkbox" checked={userKills} onChange={() => setUserKills((v) => !v)} aria-label="Count force-stops" />
+            Force-stops
+          </label>
         </div>
         <label className="flex items-center gap-2 text-sm text-gray-500">
           Compare to:

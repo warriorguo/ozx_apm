@@ -116,7 +116,8 @@ namespace OzxApm.Core
         /// reserved, native memory allocated and reserved, graphics memory, and
         /// the process RSS (Android: /proc/self/statm on a thread of its own at
         /// SamplingIntervalSeconds; elsewhere Unity's System Used Memory), and
-        /// the peaks of game runs (ApmClient.BeginRun). Read once per perf
+        /// the peaks of game runs (ApmClient.BeginRun). Graphics memory only in
+        /// development players and the Editor (Unity keeps it nowhere else). Read once per perf
         /// sample, never per frame.
         /// </summary>
         public bool EnableMemoryBreakdown { get; set; } = true;

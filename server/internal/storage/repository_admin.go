@@ -1005,6 +1005,7 @@ func (r *Repository) getContextJankRate(ctx context.Context, f models.AdminFilte
 		byValue[v] = rw
 		return rw
 	}
+	minutes := map[*models.ContextDistributionRow]float64{}
 	jWhere, jArgs := tableWhere(TableJanks.Name, f)
 	// The total over every value, not only the listed ones.
 	if err := r.client.conn.QueryRow(ctx, "SELECT toInt64(count()) FROM apm_janks "+jWhere, jArgs...).Scan(&dist.Total); err != nil {
@@ -1036,7 +1037,7 @@ func (r *Repository) getContextJankRate(ctx context.Context, f models.AdminFilte
 		if err := rows.Scan(&v, &m); err != nil {
 			return err
 		}
-		row(v).Minutes = m
+		minutes[row(v)] = m
 		played++
 		return nil
 	})
@@ -1050,14 +1051,17 @@ func (r *Repository) getContextJankRate(ctx context.Context, f models.AdminFilte
 	}
 	rows := make([]models.ContextDistributionRow, 0, len(byValue))
 	for _, rw := range byValue {
-		if rw.Minutes > 0 {
-			rw.Rate = float64(rw.Count) / rw.Minutes
+		m := minutes[rw]
+		rw.Minutes = &m
+		if m > 0 {
+			rate := float64(rw.Count) / m // 0 janks in played time: rate 0, not absent
+			rw.Rate = &rate
 		}
 		rows = append(rows, *rw)
 	}
 	sort.Slice(rows, func(a, b int) bool {
-		if rows[a].Minutes != rows[b].Minutes {
-			return rows[a].Minutes > rows[b].Minutes
+		if *rows[a].Minutes != *rows[b].Minutes {
+			return *rows[a].Minutes > *rows[b].Minutes
 		}
 		if rows[a].Count != rows[b].Count {
 			return rows[a].Count > rows[b].Count

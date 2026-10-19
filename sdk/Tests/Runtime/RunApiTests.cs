@@ -20,6 +20,7 @@ namespace OzxApm.Tests
     [TestFixture]
     public class RunApiTests
     {
+        private static readonly string AliveEnemies = "aliveEnemies";
         private string _dir;
         private string _statm;
         private MemoryRunTests.FakeSource _source;
@@ -186,8 +187,16 @@ namespace OzxApm.Tests
             Assert.AreEqual("11-20", ApmClient.GetContext("aliveEnemies"));
             Assert.IsFalse(ApmClient.SetContextCount("bad key", 1));
             // Statement lambdas: an expression lambda returning a value is an
-            // ActualValueDelegate, which the constraint refuses.
-            Assert.That(() => { ApmClient.SetContextCount("aliveEnemies", 15); }, Is.Not.AllocatingGCMemory());
+            // ActualValueDelegate, which the constraint refuses. The key is a
+            // field and the delegate runs once before it is measured: the first
+            // run of a method with a string literal allocates it once on Mono
+            // (48 B, measured outside Unity: 0 B on the 2nd run, 0 B for the
+            // same call with the key in a field, 0 B for GameContext.Set), which
+            // is not a per-call cost (EditMode failure of 9d98887).
+            TestDelegate sameRange = () => { ApmClient.SetContextCount(AliveEnemies, 15); };
+            sameRange();
+            Assert.AreEqual("11-20", ApmClient.GetContext(AliveEnemies));
+            Assert.That(sameRange, Is.Not.AllocatingGCMemory());
         }
 
         [Test]

@@ -182,10 +182,14 @@ type SessionHealthRow struct {
 }
 
 type SessionHealthResponse struct {
-	GroupBy    string             `json:"group_by"`
-	CrashTypes []string           `json:"crash_types"`
-	Rows       []SessionHealthRow `json:"rows"`
-	Truncated  bool               `json:"truncated"`
+	GroupBy    string   `json:"group_by"`
+	CrashTypes []string `json:"crash_types"`
+	// UserKillsCounted: "killed" crashes with an exit reason of the player
+	// (USER_REQUESTED, USER_STOPPED: force-stop) count as crashes; by
+	// default they do not (they are in crashes_by_type as killed_by_user).
+	UserKillsCounted bool               `json:"user_kills_counted"`
+	Rows             []SessionHealthRow `json:"rows"`
+	Truncated        bool               `json:"truncated"`
 }
 
 // FunnelStep is one step of GET /api/funnel: a custom event name and
