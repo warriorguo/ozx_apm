@@ -2,11 +2,59 @@ package handlers
 
 import (
 	"net/http"
+	"os"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"go.uber.org/zap"
 )
+
+// The SDK's own events (testdata/sdk_events_apm9.jsonl, serialized on
+// Unity's Mono by the APM-9 SDK: MemorySampler, RunTracker, CrashReporter)
+// are stored as sent: the perf sample's breakdown, a run ended by EndRun, an
+// OOM crash with the memory before death and the run that crash ended.
+func TestIngest_APM9EventsFromTheSDK(t *testing.T) {
+	b, err := os.ReadFile("../../processor/testdata/sdk_events_apm9.jsonl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := regexp.MustCompile(`"timestamp":\d+`)
+	now := `"timestamp":` + strconv.FormatInt(time.Now().UnixMilli(), 10)
+	var lines []string
+	for _, l := range strings.Split(strings.TrimSpace(string(b)), "\n") {
+		lines = append(lines, ts.ReplaceAllString(l, now))
+	}
+	store := &fakeEventStore{}
+	h := newIngestHandler(store, zap.NewNop())
+	w, resp := postBatch(t, h, batchOf(lines...), map[string]string{SDKVersionHeader: "2.0.0"})
+	if w.Code != http.StatusOK || resp.Accepted != 4 || resp.Rejected != 0 || len(resp.Errors) != 0 {
+		t.Fatalf("code %d resp %+v", w.Code, resp)
+	}
+	if len(store.perfSamples) != 1 || len(store.runs) != 2 || len(store.crashes) != 1 {
+		t.Fatalf("%d samples, %d runs, %d crashes", len(store.perfSamples), len(store.runs), len(store.crashes))
+	}
+	p := store.perfSamples[0]
+	if p.MemMB != 80.25 || p.IntervalMs != 1004 || p.MemMonoHeapMB != 96.5 || p.MemAllocMB != 410.25 || p.MemReservedMB != 640 ||
+		p.MemGfxMB != 180.75 || p.MemRssMB <= 0 || p.Context["aliveEnemies"] != "11-20" || p.Context["runId"] != "run-1042" {
+		t.Errorf("perf %+v %v", p.PerfMemory, p.Context)
+	}
+	r := store.runs[0]
+	if r.RunID != "run-1042" || r.EndReason != "end" || r.Result != "win" || r.Samples != 2 || r.PeakAllocMB != 905.5 || r.StartAllocMB != 410.25 || r.PeakMemMB != 120 {
+		t.Errorf("run %+v", r)
+	}
+	c := store.crashes[0]
+	if c.CrashType != "oom" || c.Details["mem_rss_mb"] != "4650.5" || c.Details["run_peak_alloc_mb"] != "2600.0" || c.Details["run_id"] != "run-1043" ||
+		c.Details["mem_age_ms"] == "" || c.Details["proc_peak_rss_mb"] != "4650.5" || c.PssKB != 4500000 {
+		t.Errorf("crash %s %+v", c.CrashType, c.Details)
+	}
+	cr := store.runs[1]
+	if cr.RunID != "run-1043" || cr.EndReason != "crash" || cr.CrashType != "oom" || cr.PeakRssMB != 4650.5 || cr.EndAllocMB != 2600 || cr.SessionID != c.SessionID {
+		t.Errorf("crashed run %+v", cr)
+	}
+}
 
 // APM-9: perf samples with the memory breakdown and run events.
 func TestIngest_RunsAndPerfMemory(t *testing.T) {
