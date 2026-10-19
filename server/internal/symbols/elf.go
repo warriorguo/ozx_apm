@@ -28,6 +28,10 @@ type Library struct {
 	IL2CPPMethods int
 	// LineRows: DWARF line rows read; MappedRows: of those, mapped to C#.
 	LineRows, MappedRows int
+	// InlineRanges: address ranges of outermost inlined calls
+	// (DW_TAG_inlined_subroutine); InlinedRows: line rows inside them,
+	// attributed to the call site in the enclosing function.
+	InlineRanges, InlinedRows int
 }
 
 // ModuleName is the library's name on the device for a symbol file name:
@@ -262,6 +266,9 @@ func readLines(f *elf.File, lm *LineMap, lib *Library) error {
 		file string
 		line uint32
 		fn   int
+		// floor: the line the function starts at, when known from this
+		// row (its entry row, before a call inlined at the entry replaced it)
+		floor uint32
 	}
 	var seq []row
 	var lines []Line
@@ -282,8 +289,12 @@ func readLines(f *elf.File, lm *LineMap, lib *Library) error {
 				continue
 			}
 			k := fnFile{r.fn, r.file}
-			if m, ok := minLine[k]; !ok || r.line < m {
-				minLine[k] = r.line
+			low := r.line
+			if r.floor > 0 && r.floor < low {
+				low = r.floor
+			}
+			if m, ok := minLine[k]; !ok || low < m {
+				minLine[k] = low
 			}
 		}
 		last := Line{File: "\x00"} // nothing emitted yet in this sequence
@@ -332,12 +343,47 @@ func readLines(f *elf.File, lm *LineMap, lib *Library) error {
 			continue
 		}
 		lr, err := d.LineReader(e)
-		rd.SkipChildren()
 		if err != nil {
 			return err
 		}
 		if lr == nil {
+			rd.SkipChildren()
 			continue
+		}
+		inl, err := readInlineSites(d, rd, e, lr.Files())
+		if err != nil {
+			return err
+		}
+		lib.InlineRanges += len(inl)
+		// The rows of a sequence are collected, then attributed: code inlined
+		// into a function gets the call site of the outermost inlined call
+		// (its own rows are the lines of the inlined function's body,
+		// elsewhere in the C++, often under another C# method's comment: a
+		// frame is named after the function the address is in, so it must
+		// get that function's line). Line 0 (code the compiler attributes to
+		// no line: merged, hoisted) and an unrecorded call site end the
+		// previous row's range: no file:line rather than another statement's.
+		var raw []rawRow
+		endSeq := func(end uint64) {
+			rows, n := inl.attribute(raw, end)
+			lib.InlinedRows += n
+			for _, r := range rows {
+				if r.file == "" || r.line == 0 {
+					seq = append(seq, row{r.addr, "", 0, -1, 0})
+					continue
+				}
+				fn := -1
+				if lm.HasFile(r.file) {
+					fn = funcIndex(lib.Funcs, r.addr)
+				}
+				var floor uint32
+				if fn >= 0 && r.addr == lib.Funcs[fn].Addr {
+					floor = r.own
+				}
+				seq = append(seq, row{r.addr, r.file, r.line, fn, floor})
+			}
+			raw = raw[:0]
+			flush(end)
 		}
 		var le dwarf.LineEntry
 		for {
@@ -348,21 +394,20 @@ func readLines(f *elf.File, lm *LineMap, lib *Library) error {
 				return err
 			}
 			if le.EndSequence {
-				flush(le.Address)
+				endSeq(le.Address)
 				continue
 			}
 			lib.LineRows++
-			if le.File == nil || le.Line <= 0 || le.Address >= MaxAddress {
+			if le.Address >= MaxAddress {
 				continue
 			}
-			name := le.File.Name
-			fn := -1
-			if lm.HasFile(name) {
-				fn = funcIndex(lib.Funcs, le.Address)
+			r := rawRow{addr: le.Address}
+			if le.File != nil && le.Line > 0 {
+				r.file, r.line = le.File.Name, uint32(le.Line)
 			}
-			seq = append(seq, row{le.Address, name, uint32(le.Line), fn})
+			raw = append(raw, r)
 		}
-		flush(0)
+		endSeq(0)
 	}
 	sort.SliceStable(lines, func(i, j int) bool { return lines[i].Addr < lines[j].Addr })
 	// Rows of overlapping sequences at the same address: keep the last.

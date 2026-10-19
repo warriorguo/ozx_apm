@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
 	"path"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -43,6 +45,7 @@ type lineEntry struct {
 // hundreds of MB for a large game).
 func ReadLineMap(r io.Reader) (*LineMap, error) {
 	lm := &LineMap{files: map[string][]*cppFile{}, csIndex: map[string]int32{}}
+	pkgs := packageResolver{}
 	dec := json.NewDecoder(r)
 	dec.UseNumber()
 	if err := expectDelim(dec, '{'); err != nil {
@@ -62,7 +65,7 @@ func ReadLineMap(r io.Reader) (*LineMap, error) {
 			if err != nil {
 				return nil, err
 			}
-			cs := lm.csFile(SourcePath(csPath))
+			cs := lm.csFile(pkgs.sourcePath(csPath))
 			if err := expectDelim(dec, '{'); err != nil {
 				return nil, err
 			}
@@ -215,4 +218,98 @@ func SourcePath(p string) string {
 		}
 	}
 	return Clean(path.Base(p), MaxFileLength)
+}
+
+// packageResolver gives the C# files of a UPM package referenced from
+// outside the project ("file:../sdk" in manifest.json: its sources are
+// neither under Assets/ nor Packages/) the path Unity shows for them,
+// "Packages/<package name>/<path in the package>", instead of a bare file
+// name. The tool runs on the build machine, so the package's package.json
+// is found next to the sources. Results are cached per directory.
+type packageResolver map[string]string // directory -> "Packages/<name>/<rel dir>" ("" none)
+
+const maxPackageDepth = 16
+
+func (r packageResolver) sourcePath(p string) string {
+	n := normalizePath(p)
+	for _, marker := range []string{"/Library/PackageCache/", "/Assets/", "/Packages/"} {
+		if strings.Contains(n, marker) {
+			return SourcePath(p)
+		}
+	}
+	for _, prefix := range []string{"Assets/", "Packages/", "Library/PackageCache/"} {
+		if strings.HasPrefix(n, prefix) {
+			return SourcePath(p)
+		}
+	}
+	if !path.IsAbs(n) && !filepath.IsAbs(p) {
+		return SourcePath(p)
+	}
+	dir := r.dir(path.Dir(n))
+	if dir == "" {
+		return SourcePath(p)
+	}
+	return Clean(dir+"/"+path.Base(n), MaxFileLength)
+}
+
+// dir returns "Packages/<name>/<rel>" for a directory inside a package, "" when it is in none.
+func (r packageResolver) dir(d string) string {
+	if v, ok := r[d]; ok {
+		return v
+	}
+	v := ""
+	cur, rel := d, ""
+	for i := 0; i < maxPackageDepth; i++ {
+		if name := packageName(filepath.FromSlash(cur + "/package.json")); name != "" {
+			v = "Packages/" + name
+			if rel != "" {
+				v += "/" + rel
+			}
+			break
+		}
+		parent := path.Dir(cur)
+		if parent == cur {
+			break
+		}
+		if rel == "" {
+			rel = path.Base(cur)
+		} else {
+			rel = path.Base(cur) + "/" + rel
+		}
+		cur = parent
+	}
+	r[d] = v
+	return v
+}
+
+// packageName reads the "name" of a UPM package.json ("" when the file is
+// missing, unreadable or not a package: a name like "com.company.package").
+func packageName(file string) string {
+	f, err := os.Open(file)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	var pkg struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(io.LimitReader(f, 1<<20)).Decode(&pkg); err != nil {
+		return ""
+	}
+	if !validPackageName(pkg.Name) {
+		return ""
+	}
+	return pkg.Name
+}
+
+func validPackageName(n string) bool {
+	if n == "" || len(n) > 214 || !strings.Contains(n, ".") {
+		return false
+	}
+	for _, c := range n {
+		if !(c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '.' || c == '-' || c == '_') {
+			return false
+		}
+	}
+	return true
 }

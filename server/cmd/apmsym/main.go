@@ -18,6 +18,7 @@ import (
 	"bufio"
 	"bytes"
 	"compress/gzip"
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -50,6 +51,7 @@ type options struct {
 	modules    string
 	partBytes  int
 	timeout    time.Duration
+	frame0     bool
 }
 
 func main() {
@@ -68,6 +70,7 @@ func main() {
 	fs.StringVar(&o.modules, "modules", "", "comma-separated libraries to upload (default: every library found)")
 	fs.IntVar(&o.partBytes, "part-bytes", 900*1024, "maximum compressed size of one request")
 	fs.DurationVar(&o.timeout, "timeout", 60*time.Second, "timeout of one request")
+	fs.BoolVar(&o.frame0, "frame0", false, "lookup: the first address is the frame that faulted (looked up as is; callers are looked up at pc-1)")
 	_ = fs.Parse(os.Args[2:])
 	var err error
 	switch cmd {
@@ -91,7 +94,8 @@ func usage() {
 	fmt.Fprint(os.Stderr, `usage:
   apmsym upload  -url <admin base URL> [-app-version V] [-app-build N] [-modules libil2cpp.so,...] <path>...
   apmsym extract [-modules ...] <path>...
-  apmsym lookup  <library> <hex address>...
+  apmsym lookup  [-frame0] [-modules libil2cpp.so] <path>... <hex address>...
+                 (resolved as the server shows them; callers at pc-1)
 paths: directories, symbols.zip, .so/.sym.so/.dbg.so, MethodMap.tsv, LineNumberMappings.json
 token: environment variable `+TokenEnv+`
 `)
@@ -326,8 +330,8 @@ func better(a, b *symbols.Library) bool {
 }
 
 func describe(lib *symbols.Library) string {
-	return fmt.Sprintf("%s %s build id %s: %d functions (%d C# methods, %d named from the method map), %d line rows (%d DWARF rows, %d mapped to C#) from %s",
-		lib.Module, lib.Arch, lib.BuildID, len(lib.Funcs), lib.IL2CPPMethods, lib.MethodMapNames, len(lib.Lines), lib.LineRows, lib.MappedRows, lib.Path)
+	return fmt.Sprintf("%s %s build id %s: %d functions (%d C# methods, %d named from the method map), %d line rows (%d DWARF rows, %d mapped to C#, %d in %d inlined calls) from %s",
+		lib.Module, lib.Arch, lib.BuildID, len(lib.Funcs), lib.IL2CPPMethods, lib.MethodMapNames, len(lib.Lines), lib.LineRows, lib.MappedRows, lib.InlinedRows, lib.InlineRanges, lib.Path)
 }
 
 func prepare(o options, paths []string) ([]*symbols.Library, symbols.MethodMap, *symbols.LineMap, func(), error) {
@@ -359,29 +363,63 @@ func runExtract(o options, paths []string) error {
 	return nil
 }
 
+// runLookup resolves addresses the way the server resolves a crash's frames
+// once these symbols are uploaded (the same Symbolizer): a caller's pc is a
+// return address, so pc-1 is looked up; with -frame0 the first address is
+// the frame that faulted and is looked up as is.
 func runLookup(o options, args []string) error {
-	if len(args) < 2 {
-		return errors.New("lookup <library> <hex address>...")
+	var paths []string
+	var addrs []uint64
+	for _, a := range args {
+		if _, err := os.Stat(a); err == nil {
+			paths = append(paths, a)
+			continue
+		}
+		addr, err := strconv.ParseUint(strings.TrimPrefix(strings.ToLower(a), "0x"), 16, 64)
+		if err != nil {
+			return fmt.Errorf("%q is neither a path nor a hex address", a)
+		}
+		addrs = append(addrs, addr)
 	}
-	libs, _, _, cleanup, err := prepare(o, args[:1])
+	if len(paths) == 0 || len(addrs) == 0 {
+		return errors.New("lookup [-frame0] [-modules libil2cpp.so] <path>... <hex address>...")
+	}
+	libs, _, _, cleanup, err := prepare(o, paths)
 	defer cleanup()
 	if err != nil {
 		return err
 	}
 	lib := libs[0]
-	for _, a := range args[1:] {
-		addr, err := strconv.ParseUint(strings.TrimPrefix(strings.ToLower(a), "0x"), 16, 64)
-		if err != nil {
-			return fmt.Errorf("%q is not a hex address", a)
+	for _, l := range libs {
+		if l.Module == "libil2cpp.so" {
+			lib = l
+			break
 		}
-		fn, line, ok := lib.Lookup(addr)
+	}
+	fmt.Fprintln(os.Stderr, "looking up in "+describe(lib))
+	store := symbols.LibraryStore{Lib: lib}
+	sym := symbols.NewSymbolizer(store, 1024)
+	frames := make([]symbols.Frame, len(addrs))
+	for i, a := range addrs {
+		frames[i] = symbols.Frame{Module: lib.Module, BuildID: lib.BuildID, PC: a, ReturnAddress: !(o.frame0 && i == 0)}
+	}
+	got, err := sym.Resolve(context.Background(), frames, symbols.Fallback{})
+	if err != nil {
+		return err
+	}
+	for i, f := range frames {
+		kind := "caller, pc-1 looked up"
+		if !f.ReturnAddress {
+			kind = "faulting frame"
+		}
+		r, ok := got[i]
 		switch {
 		case !ok:
-			fmt.Printf("0x%x\t?\n", addr)
-		case line.File != "":
-			fmt.Printf("0x%x\t%s+0x%x\t%s:%d\n", addr, fn.Name, addr-fn.Addr, line.File, line.Line)
+			fmt.Printf("0x%x\t?\t(%s)\n", f.PC, kind)
+		case r.File != "":
+			fmt.Printf("0x%x\t%s+0x%x\t%s:%d\t(%s)\n", f.PC, r.Name, r.Offset, r.File, r.Line, kind)
 		default:
-			fmt.Printf("0x%x\t%s+0x%x\n", addr, fn.Name, addr-fn.Addr)
+			fmt.Printf("0x%x\t%s+0x%x\tno file:line\t(%s)\n", f.PC, r.Name, r.Offset, kind)
 		}
 	}
 	return nil

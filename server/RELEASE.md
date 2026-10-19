@@ -2729,7 +2729,40 @@ apmsym upload -url https://<admin-host> -app-version "$VERSION" -app-build "$VER
   through the line map, the addresses where the C# file:line changes
   (closed by an empty row; only within a function, never across). C# paths
   are cut to `Assets/...`, `Packages/...`, `Library/PackageCache/...` (the
-  build machine's directories are not uploaded). Measured on the test app
+  build machine's directories are not uploaded); a package referenced from
+  outside the project (`"file:../sdk"` in `manifest.json`, as the test app
+  references the OZX SDK) gets `Packages/<name from its package.json>/...`
+  (the tool runs on the build machine and finds the package.json next to
+  the sources), other paths keep their file name.
+- **Inlined code** (fixed after device run S1): the DWARF line rows of code
+  clang inlined into a function are the lines of the inlined function's
+  body, which in IL2CPP's output is elsewhere in the same .cpp, under
+  another C# method's `//<source_info>` comment. On S1 the frame
+  `ApmTestDriver.UpdateApm7` (its `a?.Invoke()`: `Action_Invoke_..._inline`
+  inlined) showed `SessionManager.cs:30`, a getter of the SDK. The tool
+  now reads the outermost `DW_TAG_inlined_subroutine` ranges of every
+  function and gives their addresses the call site in the function itself
+  (`DW_AT_call_file`/`DW_AT_call_line`), splitting a row's range where an
+  inlined call ends; a frame named after a function always gets a line of
+  that function (no inline frames are emitted). DWARF line 0 (code the
+  compiler attributes to no line) now shows no file:line instead of the
+  previous statement's. Checked on the test app's release build against
+  llvm-symbolizer (its outermost frame's line through the same line map),
+  22,960 addresses in C# methods: equal on all of them (1,824 with a line,
+  21,136 without on both sides); the extraction before this change
+  differed on 1,127 (119 another line, 493 a line where there is none,
+  515 none where there is one). Extraction of that build: 1.3 s.
+  **Symbols uploaded before this change must be uploaded again** (the
+  server only reads the stored rows; the newest upload of a build id wins,
+  within a minute because of the upload cache); the server is unchanged.
+- **Missing frames: tail calls.** A method whose last statement is a call
+  (`Level1() { Level2(); }`, a lambda `() => Level1()`) is compiled to a
+  jump, not a call, even with `[MethodImpl(NoInlining)]`: it leaves no
+  return address, so the native stack (and the admin) skips it. On S1 the
+  stack was `Level3 <- UpdateApm7 <- Update`: the lambda, `Level1` and
+  `Level2` tail-called and are not in it. Nothing on the server can
+  restore them; the line shown for the caller is the call it made
+  (`ApmTestDriver.cs:1088`). Measured on the test app
   (89 MB `libil2cpp.dbg.so`, 29,611 functions, 843k DWARF rows, synthetic
   line map): 0.26 s.
 - `libunity.so` / `libmain.so` in the zip are uploaded too (engine frames
@@ -2738,7 +2771,9 @@ apmsym upload -url https://<admin-host> -app-version "$VERSION" -app-build "$VER
   `apmsym extract <zip> <BackUpThisFolder>/il2cppOutput` in 0.8 s:
   libil2cpp build id `96f86f45...`, 30,802 functions (11,614 C# methods,
   19,074 named from the method map), 22,203 line rows (28,935 of 870,397
-  DWARF rows mapped to C#); libunity 27,460 functions; libmain 9.
+  DWARF rows mapped to C#); libunity 27,460 functions; libmain 9. With the
+  inlined-code attribution below: 14,304 line rows (37,170 rows mapped to
+  C#; 392,593 rows in 150,092 inlined calls).
 - Upload: parts of at most 900 KB gzip (below nginx's 1 MB default) with a
   random upload id, then a commit with the counts; retried 4 times. The
   server keeps one row per (upload, address) (a part sent twice counts
@@ -2746,7 +2781,16 @@ apmsym upload -url https://<admin-host> -app-version "$VERSION" -app-build "$VER
   committed uploads are used. Stateless: works with several admin replicas
   and across both apps.
 - `apmsym extract <paths>` shows what would be uploaded; `apmsym lookup
-  <library> <hex address>` resolves an address locally (compare with the admin).
+  <paths> <hex address>...` resolves addresses through the server's own
+  resolver (the same file:line the admin will show; callers at pc-1,
+  `-frame0` for a faulting first frame). The S1 frames on the test app's
+  release build:
+
+  ```
+  0x5726b8  CrashChain.Level3(System.Int32)+0x90           Assets/Scripts/ApmTestDriver.cs:1559
+  0x56a030  ApmTestDriver.UpdateApm7(System.Single)+0x38c  Assets/Scripts/ApmTestDriver.cs:1088  (was SessionManager.cs:30)
+  0x56542c  ApmTestDriver.Update()+0x684                   Assets/Scripts/ApmTestDriver.cs:347
+  ```
 
 ### Server: storage, symbolication, admin API
 

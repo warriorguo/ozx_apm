@@ -266,7 +266,7 @@ export OZX_SYMBOLS_UPLOAD_TOKEN=...            # from the secret store
     Builds/ozx-1.2.3-v45-IL2CPP.symbols.zip \
     Builds/ozx_BackUpThisFolder_ButDontShipItWithYourGame/il2cppOutput
 ./apmsym extract <same paths>                  # what would be uploaded, nothing sent
-./apmsym lookup <libil2cpp.so from the zip> 5417bc   # resolve an address locally
+./apmsym lookup <same paths> 0x56a030 0x5726b8   # file:line as the admin will show them (callers at pc-1; -frame0: the first is the faulting frame)
 ```
 
 It reads ELF libraries (`symbols.zip`, whose entries are named
