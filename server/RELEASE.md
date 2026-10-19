@@ -3160,33 +3160,69 @@ To remove the tables after a permanent rollback (admin):
   assembly outside Unity); the allocation numbers above. The test driver
   (`/tmp/claude-501/apm7/ApmTestDriver.cs`) compiles against this SDK.
 
+### Verified before release (lead)
+
+Server and SDK at 92b6fba; test app built clean with Unity 2022.3.62f3, IL2CPP,
+Medium stripping, engine code stripped, arm64, release, with the build
+settings above (symbols.zip "Debugging", `--emit-source-mapping
+--emit-method-map`); local server on ClickHouse 26.1; Samsung A33, Android 16
+(One UI).
+
+- Integration on real ClickHouse: 26.1 57 passed, 24.1 57 passed, 23.8 54
+  passed and 3 skipped (the existing service-account tests 23.8 cannot run),
+  0 failed; includes `crash_symbols_test.go` and
+  `TestCrashAnr_WatchdogThenExitTrace_OneRowOneGroup`.
+- Unity EditMode: 336/336.
+- Symbols: `apmsym upload` of the real build in about 1 s (libil2cpp 30,912
+  functions, 15,226 line rows, 150,780 inlined calls; libunity; libmain);
+  without the token "not set", a wrong token 401.
+- Device, each crash reported at the next launch with the context and the
+  breadcrumbs before it:
+  - Native crash from C# (`Marshal.WriteInt32(8)`): SIGSEGV SEGV_MAPERR,
+    cause "null pointer dereference", stack `Marshal.WriteInt32` ->
+    `CrashChain.Level3 (Assets/Scripts/ApmTestDriver.cs:1559)` ->
+    `ApmTestDriver.UpdateApm7 (ApmTestDriver.cs:1088)` -> `Update (:347)` ->
+    il2cpp/libunity frames; the lines match the source. Level1 and Level2 end
+    in a call and are absent (tail calls).
+  - `ForceCrash` AccessViolation five times: one group, count 5; one run was
+    recorded by Android as `CRASH` (2 of 5 in the first round) and was still
+    reported as `native` from Unity's tombstone. Abort, FatalError,
+    PureVirtualFunction (abort message kept) and FailFast: `native` with
+    C++ names. MonoAbort and an exception on a new thread do not end an
+    IL2CPP process: nothing reported.
+  - Kills: a foreground force-stop is `killed` (USER_REQUESTED), a self
+    SIGKILL is `killed` (SIGNALED); a background `am kill` and a clean quit
+    are not crashes.
+  - Low memory: killed at about 4.8 GB RSS, reported as `oom` (LOW_MEMORY).
+  - ANR on the UI thread: One UI raises the ANR without a dialog and does not
+    kill the process. The watchdog reported it about 4 s after Android's
+    "ANR in" (NOT_RESPONDING is set without a dialog); after a quit, the next
+    launch found the ANR trace on the `SIGNALED` exit and was dropped as the
+    same event: one group, count 1, one row.
+  - UnityMain blocked for 20 s: no ANR for Android (the UI thread stays
+    responsive), as documented.
+  - Consent Denied: no journal, a crash while Denied is never reported.
+- Cost (release, 60 s idle, `update_ms` of the frame): main's SDK p50
+  0.034-0.037 ms, p99 0.28-0.29 ms; this SDK p50 0.038 ms, p99 0.13 ms, no GC
+  collection; a warning every frame: p99 0.16 ms (main's SDK 0.28 ms), heap
+  growth the same as main's (618 vs 627 KB per minute, Unity's own log
+  strings); the journal wrote 11 times per second at 0.32 ms each on its own
+  thread. Startup to the first frame unchanged (2.43-2.48 s, as before).
+- "Could not produce class with ID 115" came from a stale incremental build
+  cache, not from the SDK: a clean build registers MonoScript and logs none
+  (see "Symbols: what OZX uploads at build time").
+
 ### Not verified
 
-- Anything on a device or in Unity: the EditMode tests that need the
-  Unity runtime (`CrashReportingTests` through `ApmClient`, the allocation
-  constraints, `LinkXmlTests`), JNI calls (`AndroidExitInfo`: exit records,
-  `FileUtils.copy` of the trace, from the report thread), the tombstone of
-  a real Android 12+ device (the parser follows tombstone.proto; the device
-  plan checks it), Unity's own signal handler chaining to debuggerd (the
-  tombstone and `CRASH_NATIVE` exist), whether blocking UnityMain produces
-  an ANR on the test device, the low-memory kill's reason, the link.xml
-  under High stripping, Unity 2020.3's `IUnityLinkerProcessor`.
-- ClickHouse: the integration tests (`tests/integration/crash_symbols_test.go`:
-  upload in parts, commit, 409, list; crashes before and after the upload,
-  grouping, top frame, symbolicated detail with C# file:line, version
-  fallback, time line summary, privacy tables; 300 addresses through the
-  real queries) and the existing migration tests with the new columns and
-  tables were compiled, **not run** (the sandbox cannot reach the local
-  ClickHouse containers): run on 26.1, 24.1 and 23.8.
-- The upload of a real build against the test environment (the build
-  settings and `apmsym extract` were checked on a real build, above); cost
-  of the symbol lookups at production volume.
-- File and line of managed exception frames on Unity 2022.3: not
-  available (above).
+- Other devices and Android versions: Android 11 (the oldest with exit
+  records), 12 to 15, other vendors' handling of ANRs; Android 10 and older
+  (journal only, reported as "unknown").
+- A real uncaught Java exception (reported as `java` without a stack, by
+  design).
 - iOS.
-- After the device findings (frame lines, REASON_CRASH, ANRs): the Unity
-  tombstone path on the device (the reader is tested with the content of
-  its `CRASH` log lines; the file itself was not readable without root), the
-  trace of a `SIGNALED` exit through `getTraceInputStream`, the watchdog's
-  JNI calls and `NOT_RESPONDING` on One UI, the main thread's stack from
-  `getStackTrace`, the journal kept at quit.
+- File and line of managed exception frames on Unity 2022.3: not available
+  (above).
+- The link.xml under High stripping, Unity 2020.3's `IUnityLinkerProcessor`.
+- Symbol upload and lookups at production volume, and the upload against
+  the test environment (needs `OZX_SYMBOLS_UPLOAD_TOKEN` on apps 36 and 38).
+- The admin crash pages in a browser (jsdom tests and API checks only).
