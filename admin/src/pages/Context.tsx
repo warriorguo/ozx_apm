@@ -3,12 +3,14 @@ import { GlobalFilterBar } from '../components/FilterBar'
 import { useFilters } from '../hooks/useFilters'
 import { useContextKeys, useContextDistribution } from '../hooks/useApi'
 import { formatNumber, formatMs } from '../utils/format'
+import { Clipped } from '../components/GroupPicker'
 import type { ContextMetric, ContextDistributionRow } from '../types/api'
 
 const metrics: { value: ContextMetric; label: string }[] = [
   { value: 'fps', label: 'FPS' },
   { value: 'frame_time', label: 'Frame time' },
   { value: 'janks', label: 'Janks' },
+  { value: 'jank_rate', label: 'Janks per minute of play' },
   { value: 'exceptions', label: 'Exceptions' },
   { value: 'crashes', label: 'Crashes' },
   { value: 'startup', label: 'Startup time' },
@@ -27,17 +29,26 @@ export function Context() {
   const { queryParams, addContextFilter } = useFilters()
   const [selectedKey, setSelectedKey] = useState('')
   const [metric, setMetric] = useState<ContextMetric>('fps')
+  // APM-9: numeric values (e.g. alive enemies) grouped into count ranges.
+  const [bucket, setBucket] = useState(false)
 
   const { data: keyData, isLoading: keysLoading, isError: keysError } = useContextKeys(queryParams)
   const keys = keyData?.keys ?? []
   // Until a key is picked, show the most common one.
   const key = selectedKey || keys[0]?.key || ''
 
-  const { data: dist, isLoading: distLoading, isError: distError } = useContextDistribution(key, metric, queryParams)
+  const { data: dist, isLoading: distLoading, isError: distError } = useContextDistribution(
+    key,
+    metric,
+    bucket ? { ...queryParams, bucket: 'count' } : queryParams
+  )
   const rows: ContextDistributionRow[] = dist?.rows ?? []
   const total = dist?.total ?? 0
   const unit = dist?.unit ?? ''
   const maxCount = rows.reduce((m, r) => Math.max(m, r.count), 0)
+  const isRate = metric === 'jank_rate'
+  // p05 / p99 from servers with APM-9 (absent before); for fps p05 is the slow side.
+  const hasTails = unit !== '' && !isRate && rows.some((r) => r.p05 !== undefined)
 
   return (
     <div>
@@ -78,6 +89,10 @@ export function Context() {
             ))}
           </select>
         </div>
+        <label className="flex items-center gap-2 text-sm text-gray-500" title="E.g. an alive enemy count: 0, 1-5, 6-10, 11-20, 21-30, 31-50, 51-100, 101-200, 201+">
+          <input type="checkbox" checked={bucket} onChange={(e) => setBucket(e.target.checked)} aria-label="Group numeric values into count ranges" />
+          Group numeric values into count ranges
+        </label>
       </div>
 
       {keysLoading ? (
@@ -101,11 +116,15 @@ export function Context() {
             <thead className="bg-gray-50 text-gray-500 text-xs uppercase">
               <tr>
                 <th className="px-4 py-2 text-left">{key}</th>
-                <th className="px-4 py-2 text-right">Count</th>
+                <th className="px-4 py-2 text-right">{isRate ? 'Janks' : 'Count'}</th>
                 <th className="px-4 py-2 text-left w-1/4">Share</th>
                 <th className="px-4 py-2 text-right">Sessions</th>
-                {unit && <th className="px-4 py-2 text-right">p50</th>}
-                {unit && <th className="px-4 py-2 text-right">p95</th>}
+                {isRate && <th className="px-4 py-2 text-right">Minutes played</th>}
+                {isRate && <th className="px-4 py-2 text-right">Janks / min</th>}
+                {hasTails && <th className="px-4 py-2 text-right" title={unit === 'fps' ? 'The slowest 5%' : undefined}>p05</th>}
+                {unit && !isRate && <th className="px-4 py-2 text-right">p50</th>}
+                {unit && !isRate && <th className="px-4 py-2 text-right">p95</th>}
+                {hasTails && <th className="px-4 py-2 text-right">p99</th>}
                 <th className="px-4 py-2" />
               </tr>
             </thead>
@@ -115,8 +134,8 @@ export function Context() {
                 const width = maxCount > 0 ? (r.count / maxCount) * 100 : 0
                 return (
                   <tr key={r.value} className="border-t border-gray-100">
-                    <td className="px-4 py-2 font-mono">
-                      {r.value === '' ? <span className="text-gray-400">(not set)</span> : r.value}
+                    <td className="px-4 py-2 font-mono break-all">
+                      <Clipped text={r.value} />
                     </td>
                     <td className="px-4 py-2 text-right">{formatNumber(r.count)}</td>
                     <td className="px-4 py-2">
@@ -128,15 +147,22 @@ export function Context() {
                       </div>
                     </td>
                     <td className="px-4 py-2 text-right">{formatNumber(r.sessions)}</td>
-                    {unit && <td className="px-4 py-2 text-right">{formatValue(r.p50, unit)}</td>}
-                    {unit && <td className="px-4 py-2 text-right">{formatValue(r.p95, unit)}</td>}
+                    {isRate && <td className="px-4 py-2 text-right">{(r.minutes ?? 0).toFixed(1)}</td>}
+                    {isRate && <td className="px-4 py-2 text-right">{(r.rate ?? 0).toFixed(2)}</td>}
+                    {hasTails && <td className="px-4 py-2 text-right">{formatValue(r.p05 ?? 0, unit)}</td>}
+                    {unit && !isRate && <td className="px-4 py-2 text-right">{formatValue(r.p50, unit)}</td>}
+                    {unit && !isRate && <td className="px-4 py-2 text-right">{formatValue(r.p95, unit)}</td>}
+                    {hasTails && <td className="px-4 py-2 text-right">{formatValue(r.p99 ?? 0, unit)}</td>}
                     <td className="px-4 py-2 text-right">
+                      {/* A count range is not a stored value: no filter for it. */}
+                      {!(dist?.bucket && /^(\d+-\d+|\d+\+)$/.test(r.value)) && (
                       <button
                         onClick={() => addContextFilter({ key, value: r.value })}
                         className="text-xs text-blue-600 hover:underline"
                       >
                         Filter
                       </button>
+                      )}
                     </td>
                   </tr>
                 )

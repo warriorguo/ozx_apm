@@ -5,8 +5,11 @@ const navItems = [
   { path: '/performance', label: 'Performance' },
   { path: '/crashes', label: 'Crashes' },
   { path: '/exceptions', label: 'Exceptions' },
+  { path: '/health', label: 'Health' },
+  { path: '/memory', label: 'Memory' },
   { path: '/context', label: 'Context' },
   { path: '/custom', label: 'Custom' },
+  { path: '/funnel', label: 'Funnel' },
   { path: '/sessions', label: 'Sessions' },
 ]
 

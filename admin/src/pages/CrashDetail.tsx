@@ -72,6 +72,7 @@ export function CrashDetail() {
         <div className="space-y-6">
           <Summary detail={data} />
           {data.sample && <ExitSection sample={data.sample} />}
+          {data.sample && <MemorySection sample={data.sample} />}
           <StackSection detail={data} />
           {data.sample && <ContextSection sample={data.sample} />}
           <Distributions detail={data} />
@@ -130,9 +131,10 @@ function Summary({ detail: d }: { detail: Detail }) {
   )
 }
 
+// Memory in KB as MB (formatNumber would write 4.6K MB for 4.5 GB).
 function kb(v?: number): string {
   if (!v) return '-'
-  return v >= 1024 ? `${formatNumber(v / 1024, 0)} MB` : `${formatNumber(v)} KB`
+  return v >= 1024 ? `${Math.round(v / 1024).toLocaleString('en-US')} MB` : `${formatNumber(v)} KB`
 }
 
 function ExitSection({ sample: s }: { sample: CrashOccurrence }) {
@@ -165,6 +167,92 @@ function ExitSection({ sample: s }: { sample: CrashOccurrence }) {
           ))}
         </tbody>
       </table>
+    </div>
+  )
+}
+
+// A details value the SDK wrote as a number (game-sent text: parsed
+// defensively; anything else is not shown as a number).
+export function detailNumber(details: Record<string, string> | undefined, key: string): number | undefined {
+  const raw = details?.[key]
+  if (raw === undefined || raw === '' || raw.length > 32) return undefined
+  const n = Number(raw)
+  return Number.isFinite(n) ? n : undefined
+}
+
+function mbText(v: number | undefined): string {
+  if (v === undefined) return '-'
+  return v >= 1024 ? `${(v / 1024).toFixed(2)} GB` : `${v.toFixed(0)} MB`
+}
+
+// [last sample key, run peak key, label] as the SDK writes them into details.
+const memoryFigures: [string, string, string][] = [
+  ['mem_rss_mb', 'run_peak_rss_mb', 'Resident (RSS)'],
+  ['mem_alloc_mb', 'run_peak_alloc_mb', 'Native allocated'],
+  ['mem_reserved_mb', 'run_peak_reserved_mb', 'Native reserved'],
+  ['mem_gfx_mb', 'run_peak_gfx_mb', 'Graphics'],
+  ['mem_mb', 'run_peak_mem_mb', 'Managed used'],
+  ['mem_mono_heap_mb', 'run_peak_mono_heap_mb', 'Managed heap'],
+]
+
+// APM-9: the last memory sample before the process died, the peak of the
+// game run it was in and of the process, and Android's figures at the exit.
+// Shown when the crash carries any of them (SDK with APM-9).
+function MemorySection({ sample: s }: { sample: CrashOccurrence }) {
+  const d = s.details
+  const last = memoryFigures.map(([k, , label]) => [label, detailNumber(d, k)] as const)
+  const peak = memoryFigures.map(([, k, label]) => [label, detailNumber(d, k)] as const)
+  const hasLast = last.some(([, v]) => v !== undefined)
+  const hasPeak = peak.some(([, v]) => v !== undefined)
+  const procPeak = detailNumber(d, 'proc_peak_rss_mb')
+  const age = detailNumber(d, 'mem_age_ms')
+  const runMs = detailNumber(d, 'run_ms')
+  const runId = d?.run_id ?? ''
+  const android = !!(s.pss_kb || s.rss_kb)
+  if (!hasLast && !hasPeak && procPeak === undefined && !runId) return null
+  const lowMemory = s.crash_type === 'oom' || s.crash_type === 'killed'
+  return (
+    <div className="bg-white rounded-lg shadow p-6" data-testid="memory-before-death">
+      <h3 className="text-sm font-medium text-gray-700 mb-1">Memory before death</h3>
+      <p className="text-xs text-gray-500 mb-3">
+        {lowMemory
+          ? 'The process was killed: what the SDK last recorded, and how high memory went in the game run and the process.'
+          : 'What the SDK last recorded before the crash.'}
+      </p>
+      <table className="text-xs">
+        <thead className="text-gray-500">
+          <tr>
+            <th className="pr-4 text-left font-normal" />
+            {hasLast && <th className="pr-4 text-right font-normal">Last sample{age !== undefined && age > 0 ? ` (${formatSessionMs(age)} before)` : ''}</th>}
+            {hasPeak && <th className="pr-4 text-right font-normal">Peak of the run</th>}
+          </tr>
+        </thead>
+        <tbody>
+          {memoryFigures.map(([, , label], i) =>
+            last[i][1] === undefined && peak[i][1] === undefined ? null : (
+              <tr key={label}>
+                <td className="pr-4 py-0.5 text-gray-500 whitespace-nowrap">{label}</td>
+                {hasLast && <td className="pr-4 py-0.5 text-right text-gray-800">{mbText(last[i][1])}</td>}
+                {hasPeak && <td className="pr-4 py-0.5 text-right text-gray-800">{mbText(peak[i][1])}</td>}
+              </tr>
+            )
+          )}
+        </tbody>
+      </table>
+      <div className="text-xs text-gray-600 mt-2 space-y-0.5">
+        {procPeak !== undefined && <p>Peak resident memory of the process: {mbText(procPeak)}</p>}
+        {android && (
+          <p>
+            Android at the exit: PSS {kb(s.pss_kb)} · RSS {kb(s.rss_kb)}
+          </p>
+        )}
+        {runId && (
+          <p className="break-all">
+            Game run <span className="font-mono">{runId.length > 120 ? runId.slice(0, 120) + '…' : runId}</span>
+            {runMs !== undefined ? `, ${formatSessionMs(runMs)} in` : ''}
+          </p>
+        )}
+      </div>
     </div>
   )
 }

@@ -30,5 +30,9 @@ describe('Layout', () => {
     expect(screen.getByText('Performance').closest('a')).toHaveAttribute('href', '/performance')
     expect(screen.getByText('Crashes').closest('a')).toHaveAttribute('href', '/crashes')
     expect(screen.getByText('Exceptions').closest('a')).toHaveAttribute('href', '/exceptions')
+    // APM-9
+    expect(screen.getByText('Memory').closest('a')).toHaveAttribute('href', '/memory')
+    expect(screen.getByText('Health').closest('a')).toHaveAttribute('href', '/health')
+    expect(screen.getByText('Funnel').closest('a')).toHaveAttribute('href', '/funnel')
   })
 })

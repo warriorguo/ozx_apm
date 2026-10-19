@@ -1,6 +1,10 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import * as api from '../services/api'
 import type {
+  AnalysisGroup,
+  FunnelSplit,
+  FunnelStep,
+  RunPeakMetric,
   CustomGroup,
   ExceptionGroupBy,
   ExceptionSort,
@@ -139,10 +143,51 @@ export function useContextValues(key: string, params: FilterParams & { source?: 
   })
 }
 
+// APM-9: memory, session health, funnels
+function validGroup(group: AnalysisGroup): boolean {
+  return group.kind === 'by' || isValidContextKey(group.key)
+}
+
+export function useMemoryBreakdown(group: AnalysisGroup, params: FilterParams) {
+  return useQuery({
+    queryKey: ['memory-breakdown', group, params],
+    queryFn: () => api.getMemoryBreakdown(group, params),
+    enabled: validGroup(group),
+  })
+}
+
+export function useRunPeaks(metric: RunPeakMetric, group: AnalysisGroup, params: FilterParams) {
+  return useQuery({
+    queryKey: ['run-peaks', metric, group, params],
+    queryFn: () => api.getRunPeaks(metric, group, params),
+    enabled: validGroup(group),
+  })
+}
+
+export function useSessionHealth(group: AnalysisGroup, crashTypes: string[], params: FilterParams) {
+  return useQuery({
+    queryKey: ['session-health', group, crashTypes, params],
+    queryFn: () => api.getSessionHealth(group, crashTypes, params),
+    enabled: validGroup(group),
+  })
+}
+
+// The funnel only runs on demand (request: the steps as last submitted).
+export function useFunnel(
+  request: { steps: FunnelStep[]; windowSeconds: number; by: FunnelSplit } | null,
+  params: FilterParams
+) {
+  return useQuery({
+    queryKey: ['funnel', request, params],
+    queryFn: () => api.getFunnel(request!.steps, request!.windowSeconds, request!.by, params),
+    enabled: !!request && request.steps.length > 0,
+  })
+}
+
 export function useContextDistribution(
   key: string,
   metric: string,
-  params: FilterParams & { fingerprint?: string }
+  params: FilterParams & { fingerprint?: string; bucket?: string }
 ) {
   return useQuery({
     queryKey: ['context-distribution', key, metric, params],

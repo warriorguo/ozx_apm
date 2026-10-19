@@ -30,6 +30,14 @@ import type {
   IssueKind,
   IssueState,
   IssueStatus,
+  AnalysisGroup,
+  MemoryBreakdownResponse,
+  RunPeakMetric,
+  RunPeaksResponse,
+  SessionHealthResponse,
+  FunnelStep,
+  FunnelSplit,
+  FunnelResponse,
 } from '../types/api'
 
 export const apiConfig = {
@@ -364,10 +372,11 @@ export async function getContextValues(
   return { key, values: data?.values || [] }
 }
 
+// bucket (APM-9): 'count' groups numeric values into count ranges.
 export async function getContextDistribution(
   key: string,
   metric: string,
-  params: FilterParams & { fingerprint?: string }
+  params: FilterParams & { fingerprint?: string; bucket?: string }
 ): Promise<ContextDistribution> {
   const { data } = await api.get<ContextDistribution>('/context/distribution', {
     params: { key, metric, ...params },
@@ -379,6 +388,77 @@ export async function getContextDistribution(
     total: data?.total || 0,
     truncated: !!data?.truncated,
     rows: data?.rows || [],
+    ...(data?.bucket ? { bucket: data.bucket } : {}),
+  }
+}
+
+// ---- APM-9: memory, session health, funnels ----
+
+function groupParam(group: AnalysisGroup): Record<string, string> {
+  return { [group.kind]: group.key }
+}
+
+export async function getMemoryBreakdown(group: AnalysisGroup, params: FilterParams): Promise<MemoryBreakdownResponse> {
+  const { data } = await api.get<MemoryBreakdownResponse>('/memory/breakdown', {
+    params: { ...groupParam(group), ...params },
+  })
+  return {
+    group_by: data?.group_by || '',
+    rows: (data?.rows || []).map((r) => ({ ...r, figures: r.figures || {} })),
+    truncated: !!data?.truncated,
+  }
+}
+
+export async function getRunPeaks(metric: RunPeakMetric, group: AnalysisGroup, params: FilterParams): Promise<RunPeaksResponse> {
+  const { data } = await api.get<RunPeaksResponse>('/memory/runs', {
+    params: { metric, ...groupParam(group), ...params },
+  })
+  return {
+    metric: data?.metric || metric,
+    group_by: data?.group_by || '',
+    rows: data?.rows || [],
+    buckets: data?.buckets || [],
+    truncated: !!data?.truncated,
+  }
+}
+
+// crashTypes: which crash types make a session crashed (server default when empty).
+export async function getSessionHealth(
+  group: AnalysisGroup,
+  crashTypes: string[],
+  params: FilterParams
+): Promise<SessionHealthResponse> {
+  const extra: Record<string, string> = crashTypes.length > 0 ? { crash_types: crashTypes.join(',') } : {}
+  const { data } = await api.get<SessionHealthResponse>('/health/sessions', {
+    params: { ...groupParam(group), ...extra, ...params },
+  })
+  return {
+    group_by: data?.group_by || '',
+    crash_types: data?.crash_types || [],
+    rows: (data?.rows || []).map((r) => ({ ...r, crashes_by_type: r.crashes_by_type || {} })),
+    truncated: !!data?.truncated,
+  }
+}
+
+// steps are sent as one JSON parameter; window in seconds.
+export async function getFunnel(
+  steps: FunnelStep[],
+  windowSeconds: number,
+  by: FunnelSplit,
+  params: FilterParams
+): Promise<FunnelResponse> {
+  const extra: Record<string, string> = by ? { by } : {}
+  const { data } = await api.get<FunnelResponse>('/funnel', {
+    params: { steps: JSON.stringify(steps), window: windowSeconds, ...extra, ...params },
+  })
+  return {
+    start_time: data?.start_time || '',
+    end_time: data?.end_time || '',
+    window_seconds: data?.window_seconds || windowSeconds,
+    group_by: data?.group_by || '',
+    steps: data?.steps || steps,
+    groups: (data?.groups || []).map((g) => ({ ...g, steps: g.steps || [] })),
+    truncated: !!data?.truncated,
   }
 }
 

@@ -358,6 +358,7 @@ export type TimelineType =
   | 'jank'
   | 'scene_load'
   | 'startup'
+  | 'run'
   | 'context'
   | 'breadcrumb'
 
@@ -415,6 +416,13 @@ export interface TimelineItem {
   repeats?: number
   repeat_until?: string
   time_unknown?: boolean
+  // run (APM-9): a game run that ended (duration_ms: its length)
+  run_id?: string
+  end_reason?: string
+  result?: string
+  peak_rss_mb?: number
+  peak_alloc_mb?: number
+  peak_mem_mb?: number
 }
 
 export interface SessionInfo {
@@ -529,6 +537,7 @@ export type ContextMetric =
   | 'fps'
   | 'frame_time'
   | 'janks'
+  | 'jank_rate'
   | 'startup'
   | 'scene_load'
   | 'exceptions'
@@ -538,8 +547,15 @@ export interface ContextDistributionRow {
   value: string // '' = key not set
   count: number
   sessions: number
+  // APM-9; absent from older servers
+  p05?: number
   p50: number
+  p90?: number
   p95: number
+  p99?: number
+  // jank_rate (APM-9): count = janks, minutes of play, janks per minute
+  minutes?: number
+  rate?: number
 }
 
 export interface ContextDistribution {
@@ -552,6 +568,8 @@ export interface ContextDistribution {
   // APM-3 (exceptions): occurrences whose value of the key is unknown because
   // the SDK merged them across contexts; not in rows.
   merged?: number
+  // APM-9: 'count' when numeric values were grouped into count ranges
+  bucket?: string
 }
 
 export interface PaginationParams {
@@ -613,4 +631,126 @@ export interface CustomDistribution {
   merged: number
   truncated: boolean
   rows: CustomMetricStat[]
+}
+
+// APM-9: memory, session health, funnels
+
+// How an analysis groups: a column or a game context key.
+export type AnalysisColumn = 'app_version' | 'build_type' | 'device_model' | 'platform' | 'os_version' | 'ram_class'
+export type AnalysisGroup = { kind: 'by'; key: AnalysisColumn } | { kind: 'key'; key: string }
+
+export type MemoryFigureName = 'mem_mb' | 'mem_mono_heap_mb' | 'mem_alloc_mb' | 'mem_reserved_mb' | 'mem_gfx_mb' | 'mem_rss_mb'
+
+// One perf sample memory column (MB) over the samples that have it (> 0).
+export interface MemoryFigure {
+  rows: number
+  p50: number
+  p95: number
+  max: number
+}
+
+export interface MemoryBreakdownRow {
+  value: string
+  samples: number
+  sessions: number
+  figures: Partial<Record<MemoryFigureName, MemoryFigure>>
+}
+
+export interface MemoryBreakdownResponse {
+  group_by: string
+  rows: MemoryBreakdownRow[]
+  truncated: boolean
+}
+
+export type RunPeakMetric = 'peak_rss' | 'peak_alloc' | 'peak_reserved' | 'peak_gfx' | 'peak_mem' | 'peak_mono_heap'
+
+export interface RunPeakRow {
+  value: string
+  runs: number
+  with_value: number
+  sessions: number
+  devices: number
+  crashed_runs: number
+  oom_runs: number
+  killed_runs: number
+  p50: number
+  p90: number
+  p99: number
+  max: number
+  avg_duration_ms: number
+  avg_growth_mb: number
+}
+
+// [low, high) MB; high 0 = open-ended
+export interface RunPeakBucket {
+  low: number
+  high: number
+  runs: number
+  oom: number
+}
+
+export interface RunPeaksResponse {
+  metric: string
+  group_by: string
+  rows: RunPeakRow[]
+  buckets: RunPeakBucket[]
+  truncated: boolean
+}
+
+export type CrashTypeName = 'native' | 'java' | 'oom' | 'killed' | 'anr' | 'unknown'
+
+// Rates are fractions (0.993 = 99.3%).
+export interface SessionHealthRow {
+  value: string
+  build_type: string
+  sessions: number
+  users: number
+  crashed_sessions: number
+  crashed_users: number
+  crash_free_sessions: number
+  crash_free_users: number
+  anr_sessions: number
+  anr_rate: number
+  exception_sessions: number
+  exceptions: number
+  exception_session_rate: number
+  exceptions_per_session: number
+  crashes_by_type: Record<string, number>
+}
+
+export interface SessionHealthResponse {
+  group_by: string
+  crash_types: string[]
+  rows: SessionHealthRow[]
+  truncated: boolean
+}
+
+export interface FunnelStep {
+  name: string
+  props?: Record<string, string>
+}
+
+export interface FunnelStepResult {
+  name: string
+  props?: Record<string, string>
+  sessions: number
+  conversion: number
+  from_previous: number
+}
+
+export interface FunnelGroup {
+  value: string
+  steps: FunnelStepResult[]
+}
+
+export type FunnelSplit = '' | 'app_version' | 'build_type' | 'platform'
+
+export interface FunnelResponse {
+  start_time: string
+  end_time: string
+  window_seconds: number
+  group_by: string
+  steps: FunnelStep[]
+  groups: FunnelGroup[]
+  truncated: boolean
 }

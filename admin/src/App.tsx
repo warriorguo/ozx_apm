@@ -9,6 +9,9 @@ import { Context } from './pages/Context'
 import { Custom } from './pages/Custom'
 import { ExceptionDetail } from './pages/ExceptionDetail'
 import { Sessions } from './pages/Sessions'
+import { Memory } from './pages/Memory'
+import { Health } from './pages/Health'
+import { Funnel } from './pages/Funnel'
 import { FiltersProvider } from './hooks/useFilters'
 
 function App() {
@@ -26,6 +29,9 @@ function App() {
             <Route path="sessions" element={<Sessions />} />
             <Route path="context" element={<Context />} />
             <Route path="custom" element={<Custom />} />
+            <Route path="memory" element={<Memory />} />
+            <Route path="health" element={<Health />} />
+            <Route path="funnel" element={<Funnel />} />
           </Route>
         </Routes>
       </FiltersProvider>

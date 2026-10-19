@@ -15,6 +15,7 @@ const typeLabels: Record<TimelineType, { label: string; className: string }> = {
   jank: { label: 'Jank', className: 'bg-pink-100 text-pink-800' },
   scene_load: { label: 'Scene load', className: 'bg-purple-100 text-purple-800' },
   startup: { label: 'Startup', className: 'bg-green-100 text-green-800' },
+  run: { label: 'Run', className: 'bg-indigo-100 text-indigo-800' },
   context: { label: 'Context', className: 'bg-slate-100 text-slate-700' },
   breadcrumb: { label: 'Log / breadcrumb', className: 'bg-gray-100 text-gray-700' },
 }
@@ -431,6 +432,11 @@ function Details({ summary, children }: { summary: string; children: ReactNode }
   )
 }
 
+// Game text cut for one line (run ids, results).
+function clip(s: string, max = 120): string {
+  return s.length > max ? s.slice(0, max) + '…' : s
+}
+
 function ItemBody({ item: it }: { item: TimelineItem }) {
   switch (it.type) {
     case 'custom_event':
@@ -515,6 +521,26 @@ function ItemBody({ item: it }: { item: TimelineItem }) {
           app → Unity {formatMs(it.phase1_ms ?? 0)}, Unity → first frame {formatMs(it.phase2_ms ?? 0)}, → interactive{' '}
           {formatMs(it.tti_ms ?? 0)}
         </span>
+      )
+    case 'run':
+      return (
+        <div className="text-xs">
+          <span className="font-mono font-medium break-all">{clip(it.run_id ?? '')}</span>{' '}
+          <span className={it.end_reason === 'crash' ? 'text-red-700' : 'text-gray-700'}>
+            ended: {it.end_reason || '?'}
+            {it.crash_type ? ` (${it.crash_type})` : ''}
+          </span>
+          {it.result && <span className="text-gray-600 break-all"> · result {clip(it.result)}</span>}
+          {it.duration_ms ? <span className="text-gray-600"> · {formatMs(it.duration_ms)}</span> : null}
+          {!!(it.peak_rss_mb || it.peak_alloc_mb || it.peak_mem_mb) && (
+            <span className="text-gray-600">
+              {' '}
+              · peak{it.peak_rss_mb ? ` RSS ${Math.round(it.peak_rss_mb)} MB` : ''}
+              {it.peak_alloc_mb ? ` native ${Math.round(it.peak_alloc_mb)} MB` : ''}
+              {it.peak_mem_mb ? ` managed ${Math.round(it.peak_mem_mb)} MB` : ''}
+            </span>
+          )}
+        </div>
       )
     case 'context':
       return (
