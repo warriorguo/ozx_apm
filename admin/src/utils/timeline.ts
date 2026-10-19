@@ -102,6 +102,16 @@ export function deviceSessionsLink(deviceId: string, around?: string): string {
   return '/sessions?' + params.toString()
 }
 
+// sessionExportLink: the session export (APM-10, GET /api/sessions/export: a
+// zip of OZX's AiTelemetry session directory) over the range the time line
+// was read with.
+export function sessionExportLink(sessionId: string, startTime?: string, endTime?: string): string {
+  const params = new URLSearchParams({ session_id: sessionId })
+  if (startTime) params.set('start_time', startTime)
+  if (endTime) params.set('end_time', endTime)
+  return '/api/sessions/export?' + params.toString()
+}
+
 // fillTrend adds the empty buckets between the points (the server leaves
 // them out), so a chart does not draw a line across periods without
 // occurrences.

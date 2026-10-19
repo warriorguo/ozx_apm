@@ -146,6 +146,19 @@ describe('Sessions page (APM-15)', () => {
     expect(renderedTypes()).toEqual(items.filter((i) => i.type !== 'breadcrumb' && i.type !== 'context').map((i) => i.type))
   })
 
+  // APM-10: the export of the session over the time line's range, the id encoded.
+  it('links the session export (AiTelemetry format) over the range of the time line', async () => {
+    api.getSessionTimeline.mockResolvedValue(timeline)
+    renderAt('/sessions?' + new URLSearchParams({ session_id: 'S1 half&x' }).toString())
+    const link = (await screen.findByText('Download (AiTelemetry JSONL)')).closest('a')!
+    expect(link.hasAttribute('download')).toBe(true)
+    const u = new URL(link.getAttribute('href')!, 'http://x')
+    expect(u.pathname).toBe('/api/sessions/export')
+    expect(u.searchParams.get('session_id')).toBe('S1 half&x')
+    expect(u.searchParams.get('start_time')).toBe(timeline.start_time)
+    expect(u.searchParams.get('end_time')).toBe(timeline.end_time)
+  })
+
   it('adds the performance track on request', async () => {
     api.getSessionTimeline.mockResolvedValue(timeline)
     renderAt('/sessions?session_id=S1')

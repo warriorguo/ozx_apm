@@ -4,7 +4,7 @@ import { Link, useSearchParams } from 'react-router-dom'
 import { TimeSeriesChart } from '../components/TimeSeriesChart'
 import { useDeviceSessions, useSessionTimeline } from '../hooks/useApi'
 import { formatDateTime, formatMs, formatNumber } from '../utils/format'
-import { deviceSessionsLink, exceptionDetailLink, formatSessionMs, kindStyles, utcClock } from '../utils/timeline'
+import { deviceSessionsLink, exceptionDetailLink, formatSessionMs, kindStyles, sessionExportLink, utcClock } from '../utils/timeline'
 import type { SessionTimeline, TimelineItem, TimelineType } from '../types/api'
 
 const typeLabels: Record<TimelineType, { label: string; className: string }> = {
@@ -289,9 +289,19 @@ function SessionHeader({ timeline: t }: { timeline: SessionTimeline }) {
   const s = t.session
   return (
     <div className="bg-white rounded-lg shadow p-6">
-      <h3 className="text-sm font-medium text-gray-700">
-        Session <span className="font-mono break-all">{s.session_id}</span>
-      </h3>
+      <div className="flex flex-wrap items-start justify-between gap-2">
+        <h3 className="text-sm font-medium text-gray-700">
+          Session <span className="font-mono break-all">{s.session_id}</span>
+        </h3>
+        <a
+          href={sessionExportLink(s.session_id, t.start_time, t.end_time)}
+          download
+          className="px-3 py-1 text-sm rounded bg-gray-100 text-gray-700 hover:bg-gray-200"
+          title="A zip of the session in OZX's AiTelemetry format (session.json, one JSONL file per channel, apm.jsonl), for scripts/ai_trace.py and verify-ticket"
+        >
+          Download (AiTelemetry JSONL)
+        </a>
+      </div>
       <div className="grid grid-cols-1 md:grid-cols-3 gap-x-6 gap-y-1 mt-2 text-xs text-gray-700">
         <p>
           <span className="text-gray-500">Version:</span> {s.app_version || '-'}
