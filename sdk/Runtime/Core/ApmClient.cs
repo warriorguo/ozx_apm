@@ -1346,9 +1346,9 @@ namespace OzxApm.Core
             var jank = client._jankDetector;
             if (jank != null)
             {
-                stats.JanksDetected = jank.Detected;
-                stats.JanksSent = jank.Sent;
-                stats.JanksDropped = jank.Dropped;
+                stats.JanksDetected = System.Threading.Interlocked.Read(ref jank.Detected);
+                stats.JanksSent = System.Threading.Interlocked.Read(ref jank.Sent);
+                stats.JanksDropped = System.Threading.Interlocked.Read(ref jank.Dropped);
                 stats.JankExpectedFrameMs = jank.ExpectedFrameMs;
                 stats.LastJankDurationMs = jank.LastDurationMs;
                 stats.LastJankMaxFrameMs = jank.LastMaxFrameMs;

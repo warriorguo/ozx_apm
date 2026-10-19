@@ -3733,8 +3733,10 @@ not change frame times).
   baseline (it is re-learnt from the next 15 frames); slowdowns under 1.5x
   (30 -> 23 fps) are never janks, the baseline follows them. A single very
   long frame (5 s or more) is one jank and leaves the baseline as it was.
-  Slow frames never enter the baseline, so a slowdown of a few seconds is
-  measured against the frame rate before it.
+  Slow frames never enter the baseline (except during the 15 warm-up
+  frames after a start or a reset, which take every frame: a stutter right
+  then raises the new baseline until normal frames replace it), so a
+  slowdown of a few seconds is measured against the frame rate before it.
 - **Not janks** (no detection, nothing taken into the baseline):
   - the first 2 frames and 500 ms after start, after a resume
     (`OnApplicationPause(false)`), and after focus comes back
@@ -3761,9 +3763,11 @@ not change frame times).
   - In the Editor, Unity's Pause button stops the player loop without a
     pause callback: the first frame after it is a jank (Editor data is
     `build_type` editor and not uploaded by default).
-- **Event**: `timestamp` = when the jank began (the first slow frame), not
-  when it was sent (up to 250 ms later, 5 s for a capped one); the game
-  context (APM-5) of the frame the jank began in, so a room switch's hitch
+- **Event**: `timestamp` = when the jank began (the wall time noted in
+  the frame of its first slow frame, minus that frame), not when it was sent
+  (up to 250 ms later, 5 s for a capped one, or after a scene load that
+  flushed it); the game context (APM-5) noted in that same frame (for a run
+  of several slow frames, the first one's, not the one that made it a jank), so a room switch's hitch
   carries the room it happened in; scene, session and the rest as every
   event. `recent_events` (APM-6, APM-1 P1 #9): the breadcrumbs (10) and
   warning/error lines (5) from 10 s before the jank began until it was sent,
@@ -3832,8 +3836,8 @@ text: redeploy the previous admin.
 ### Verified
 
 - SDK: compiles at C# 8 with and without `UNITY_2021_2_OR_NEWER`, for
-  Android and iOS defines. On Unity's Mono outside Unity 272 runtime tests
-  pass (was 239): `JankDetectorTests` has 36 tests (replacing 3), 34 of
+  Android and iOS defines. On Unity's Mono outside Unity 273 runtime tests
+  pass (was 239): `JankDetectorTests` has 37 tests (replacing 3), 35 of
   them pass here (steady 30 fps for 5 minutes on a
   90 Hz cadence, a single 150 / 200 ms frame at 30 and 60 fps with its own
   time as duration and max, the merge gap, consecutive and merged long
@@ -3859,6 +3863,16 @@ text: redeploy the previous admin.
   `jankref=1`, a log line per frame over 50 ms) compiles against this SDK;
   the device plan is `/tmp/claude-501/apm21/DEVICE_PLAN.md`.
 - No server change: server tests not re-run for this ticket.
+- A code review (another agent, reading the diff) found: the timestamp of
+  a jank flushed at a scene load was late by the load time (it was derived
+  at send time; now noted in the frame of the first slow frame); the
+  context of a multi-frame jank was the qualifying frame's, not the first
+  one's; the counters were read without `Interlocked` on 32-bit and a jank
+  flushed at Stop after consent was revoked counted as sent; the
+  warm-up exception to "slow frames never enter the baseline" was not
+  documented. All fixed (a test for the first two). Noted, not changed:
+  `JankExpectedFrameMs` read from another thread may be momentarily stale
+  while the baseline shifts (diagnostics only).
 
 ### Not verified
 

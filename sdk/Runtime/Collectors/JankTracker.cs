@@ -87,6 +87,13 @@ namespace OzxApm.Collectors
         /// <summary>True for the frame in which a jank began (the caller captures the context then).</summary>
         internal bool StartedThisFrame { get; private set; }
 
+        /// <summary>
+        /// True for the frame that began a run of slow frames (the first frame
+        /// of a possible jank): the caller notes the wall time and the context
+        /// then, used if the run becomes a jank.
+        /// </summary>
+        internal bool RunStartedThisFrame { get; private set; }
+
         /// <summary>Frames fed and frames ignored (grace, suspended, invalid), for tests and stats.</summary>
         internal long FramesSeen { get; private set; }
         internal long FramesIgnored { get; private set; }
@@ -187,6 +194,7 @@ namespace OzxApm.Collectors
         {
             episode = default;
             StartedThisFrame = false;
+            RunStartedThisFrame = false;
             FramesSeen++;
             // NaN fails the comparison; 0 happens in the very first frame.
             if (!(frameMs > 0f) || float.IsInfinity(frameMs))
@@ -234,6 +242,7 @@ namespace OzxApm.Collectors
                     _frames = 1;
                     _expectedAtStart = expected;
                     _state = State.Run;
+                    RunStartedThisFrame = true;
                     return Qualify(out episode);
 
                 case State.Run:

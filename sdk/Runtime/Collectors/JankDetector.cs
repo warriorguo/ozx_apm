@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Threading;
 using UnityEngine;
 using OzxApm.Core;
 using OzxApm.Models;
@@ -31,6 +32,12 @@ namespace OzxApm.Collectors
         // The game context when the jank in progress began (APM-5): a room
         // switch's hitch is reported with the room it happened in.
         private ContextSnapshot _startContext;
+        // When the jank in progress began (Unix ms), noted in the frame of its
+        // first slow frame (not when it is sent: a flush at a scene load comes
+        // after the load blocked, before that frame's time is known).
+        private long _startWallMs;
+        private ContextSnapshot _runStartContext;
+        private long _runStartWallMs;
 
         // Counters, read by ApmClient.GetStats (main thread writes, any thread reads).
         internal long Detected;
@@ -119,8 +126,18 @@ namespace OzxApm.Collectors
             }
 
             bool ended = _tracker.Frame(frameMs, out JankEpisode episode);
+            if (_tracker.RunStartedThisFrame)
+            {
+                // The first slow frame just ended: the possible jank began
+                // frameMs ago, in this context. Only slow frames get here.
+                _runStartContext = GameContext.Current;
+                _runStartWallMs = Timeline.NowMs() - (long)frameMs;
+            }
             if (_tracker.StartedThisFrame)
-                _startContext = GameContext.Current;
+            {
+                _startContext = _runStartContext;
+                _startWallMs = _runStartWallMs;
+            }
             if (ended)
                 ReportJank(episode);
         }
@@ -203,22 +220,26 @@ namespace OzxApm.Collectors
 
         private void ReportJank(in JankEpisode episode)
         {
-            Detected++;
+            Interlocked.Increment(ref Detected);
             LastDurationMs = episode.DurationMs;
             LastMaxFrameMs = episode.MaxFrameMs;
             LastFrames = episode.Frames;
             LastSlowFrames = episode.SlowFrames;
             var context = _startContext;
+            long startMs = _startWallMs;
             _startContext = null;
+            _runStartContext = null;
 
+            // Without technical consent (e.g. the flush at Stop when it was
+            // revoked) the event would be dropped at enqueue: not counted as sent.
+            if (_client != null && !_config.TechnicalAllowed)
+                return;
             if (!_budget.TryTake(_tracker.ClockMs, Math.Max(0, _config.MaxJanksPerMinute)))
             {
-                Dropped++;
+                Interlocked.Increment(ref Dropped);
                 return;
             }
 
-            // The tracker's clock runs with the frames: the jank began this long ago.
-            long startMs = Timeline.NowMs() - (long)Math.Max(0.0, _tracker.ClockMs - episode.StartMs);
             var (gcCount, gcAllocKb) = _client != null ? _client.GetMemoryStats() : (0, 0f);
 
             var evt = new JankEvent
@@ -236,7 +257,7 @@ namespace OzxApm.Collectors
                 _client.EnqueueEvent(evt);
             else
                 SentForTests?.Add(evt);
-            Sent++;
+            Interlocked.Increment(ref Sent);
 
             if (ApmClient.IsLogEnabled(LogLevel.Debug))
                 ApmClient.Log(LogLevel.Debug, $"Jank: {episode.DurationMs:F1} ms, max frame {episode.MaxFrameMs:F1} ms, {episode.SlowFrames}/{episode.Frames} frames slow, expected {episode.ExpectedFrameMs:F1} ms{(episode.Capped ? ", capped" : "")}");

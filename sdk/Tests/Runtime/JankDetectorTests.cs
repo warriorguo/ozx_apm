@@ -465,15 +465,42 @@ namespace OzxApm.Tests
                 Assert.AreEqual(150f, e.max_frame_ms);
                 Assert.IsTrue(e.ctx.TryGetValue("roomId", out string room));
                 Assert.AreEqual("r-1", room, "the context when the jank began");
-                // Sent at the 8th normal frame (267 ms >= the 250 ms merge gap): it
-                // began 150 ms + 8 frames before then (the test's frames take no real time).
-                long expected = now - (long)(150f + 8 * Fps30);
+                // Noted in the frame of the long frame: the wall time then minus
+                // the frame (the test's frames take no real time).
+                long expected = now - 150;
                 Assert.That(e.timestamp, NUnit.Framework.Is.InRange(expected - 50, expected + 50));
                 Assert.IsTrue(e.recent_events.Any(l => l.EndsWith("Scene: Arena", StringComparison.Ordinal)));
                 Assert.AreEqual(1, d.Detected);
                 Assert.AreEqual(1, d.Sent);
                 Assert.AreEqual(150f, d.LastDurationMs);
                 Assert.AreEqual(1, d.LastFrames);
+            }
+            finally
+            {
+                GameContext.ResetForTests();
+            }
+        }
+
+        [Test]
+        public void Detector_MultiFrameJank_HasTheContextAndTimeOfItsFirstSlowFrame()
+        {
+            GameContext.ResetForTests();
+            try
+            {
+                var d = NewDetector();
+                Frames(d, Fps60, 60, 60);
+                GameContext.Set("roomId", "r-1");
+                long before = Timeline.NowMs();
+                Frames(d, 30f, 1, 60);              // slow, not yet a jank
+                GameContext.Set("roomId", "r-2");   // between the two slow frames
+                Frames(d, 30f, 1, 60);              // now a jank (60 ms)
+                d.OnSceneLoaded();                  // flushed at a scene load
+                Assert.AreEqual(1, d.SentForTests.Count);
+                var e = d.SentForTests[0];
+                Assert.AreEqual(60f, e.duration_ms, 0.001f);
+                Assert.IsTrue(e.ctx.TryGetValue("roomId", out string room));
+                Assert.AreEqual("r-1", room, "the context of the first slow frame");
+                Assert.That(e.timestamp, NUnit.Framework.Is.InRange(before - 30 - 50, Timeline.NowMs() - 30 + 50));
             }
             finally
             {
