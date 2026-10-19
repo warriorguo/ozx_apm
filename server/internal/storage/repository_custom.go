@@ -213,7 +213,8 @@ type CustomGroup struct {
 
 // customColumns are the columns a distribution may group by (never user
 // input in the SQL text: only these names are).
-var customColumns = map[string]bool{"app_version": true, "platform": true, "device_model": true, "os_version": true, "build_type": true}
+var customColumns = map[string]bool{"app_version": true, "platform": true, "device_model": true, "os_version": true, "build_type": true,
+	"ram_class": true} // APM-9
 
 // ValidCustomColumn reports whether column may be grouped by.
 func ValidCustomColumn(column string) bool { return customColumns[column] }

@@ -55,7 +55,7 @@ func TestAdminWhere_ContextFiltersAreBound(t *testing.T) {
 }
 
 func TestContextSourcesAndMetrics(t *testing.T) {
-	for _, s := range []string{"", "all", "perf", "janks", "startups", "scene_loads", "exceptions", "crashes", "custom_events", "custom_metrics"} {
+	for _, s := range []string{"", "all", "perf", "janks", "startups", "scene_loads", "exceptions", "crashes", "custom_events", "custom_metrics", "runs"} {
 		if !ValidContextSource(s) {
 			t.Errorf("source %q", s)
 		}
@@ -63,10 +63,10 @@ func TestContextSourcesAndMetrics(t *testing.T) {
 	if ValidContextSource("apm_perf_samples") || ValidContextSource("perf; DROP") {
 		t.Error("invalid source accepted")
 	}
-	if tables, _ := contextSourceTables("all"); len(tables) != 8 {
+	if tables, _ := contextSourceTables("all"); len(tables) != 9 {
 		t.Errorf("all -> %v", tables)
 	}
-	for _, m := range []string{"fps", "frame_time", "janks", "startup", "scene_load", "exceptions", "crashes"} {
+	for _, m := range []string{"fps", "frame_time", "janks", "jank_rate", "startup", "scene_load", "exceptions", "crashes"} {
 		if !ValidContextMetric(m) {
 			t.Errorf("metric %q", m)
 		}

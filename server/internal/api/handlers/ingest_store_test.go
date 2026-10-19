@@ -34,6 +34,7 @@ type fakeEventStore struct {
 	crashes             []models.Crash
 	customs             []models.CustomEvent
 	metricRows          []models.CustomMetric
+	runs                []models.Run
 	failCustom          bool
 	ids                 map[string]map[string]bool
 	lookups             []storage.EventIDLookup
@@ -105,6 +106,13 @@ func (f *fakeEventStore) InsertCustomMetrics(_ context.Context, m []models.Custo
 	f.metricRows = append(f.metricRows, m...)
 	for _, x := range m {
 		f.remember(storage.TableCustomMetrics.Name, x.EventID)
+	}
+	return nil
+}
+func (f *fakeEventStore) InsertRuns(_ context.Context, r []models.Run) error {
+	f.runs = append(f.runs, r...)
+	for _, x := range r {
+		f.remember(storage.TableRuns.Name, x.EventID)
 	}
 	return nil
 }

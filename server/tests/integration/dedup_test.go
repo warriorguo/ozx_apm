@@ -52,9 +52,10 @@ func TestExistingEventIDs_RealClickHouse(t *testing.T) {
 		must(repo.InsertCrashes(ctx, []models.Crash{{Timestamp: ts, EventID: id, AppVersion: "9.9", Platform: "Android", Fingerprint: "F", SessionID: session, DeviceID: "d"}}))
 		must(repo.InsertCustomEvents(ctx, []models.CustomEvent{{Timestamp: ts, EventID: id, AppVersion: "9.9", Platform: "Android", Name: "N", SessionID: session, DeviceID: "d", Count: 1}}))
 		must(repo.InsertCustomMetrics(ctx, []models.CustomMetric{customMetricRow(ts, id, "9.9", "N", session, "d", 5)}))
+		must(repo.InsertRuns(ctx, []models.Run{{Timestamp: ts, EventID: id, AppVersion: "9.9", Platform: "Android", RunID: "r", EndReason: "end", SessionID: session, DeviceID: "d"}}))
 	}
 
-	keyFor := map[string]string{"platform": "Android", "scene": "S", "scene_name": "S", "fingerprint": "F", "name": "N"}
+	keyFor := map[string]string{"platform": "Android", "scene": "S", "scene_name": "S", "fingerprint": "F", "name": "N", "end_reason": "end"}
 	for _, table := range storage.EventTables {
 		q := storage.EventIDLookup{
 			Table:       table,

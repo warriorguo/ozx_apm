@@ -30,11 +30,13 @@ var (
 	// APM-6
 	TableCustomEvents  = EventTable{Name: "apm_custom_events", KeyColumn: "name"}
 	TableCustomMetrics = EventTable{Name: "apm_custom_metrics", KeyColumn: "name"}
+	// APM-9
+	TableRuns = EventTable{Name: "apm_runs", KeyColumn: "end_reason"}
 )
 
 // EventTables lists every event table.
 var EventTables = []EventTable{TablePerfSamples, TableJanks, TableStartups, TableSceneLoads, TableExceptions, TableCrashes,
-	TableCustomEvents, TableCustomMetrics}
+	TableCustomEvents, TableCustomMetrics, TableRuns}
 
 // EventIDLookup asks which of EventIDs are already stored in Table.
 //

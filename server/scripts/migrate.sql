@@ -30,6 +30,12 @@ CREATE TABLE IF NOT EXISTS apm_perf_samples (
     ram_class LowCardinality(String) DEFAULT '',
     net_type LowCardinality(String) DEFAULT '',
     ctx Map(LowCardinality(String), String),
+    interval_ms UInt32 DEFAULT 0,
+    mem_mono_heap_mb Float32 DEFAULT 0,
+    mem_alloc_mb Float32 DEFAULT 0,
+    mem_reserved_mb Float32 DEFAULT 0,
+    mem_gfx_mb Float32 DEFAULT 0,
+    mem_rss_mb Float32 DEFAULT 0,
     INDEX idx_event_id event_id TYPE bloom_filter(0.001) GRANULARITY 1,
     INDEX idx_session_id session_id TYPE bloom_filter(0.01) GRANULARITY 1
 ) ENGINE = ReplacingMergeTree()
@@ -262,13 +268,53 @@ PARTITION BY toYYYYMMDD(timestamp)
 ORDER BY (app_version, name, timestamp, event_id)
 TTL toDateTime(timestamp) + INTERVAL 30 DAY;
 
+CREATE TABLE IF NOT EXISTS apm_runs (
+    timestamp DateTime64(3),
+    app_version String,
+    platform String,
+    device_model String,
+    os_version String,
+    session_id String,
+    device_id String,
+    scene String,
+    run_id String,
+    end_reason LowCardinality(String),
+    result String,
+    crash_type LowCardinality(String),
+    duration_ms UInt64,
+    samples UInt32,
+    peak_mem_mb Float32,
+    peak_mono_heap_mb Float32,
+    peak_alloc_mb Float32,
+    peak_reserved_mb Float32,
+    peak_gfx_mb Float32,
+    peak_rss_mb Float32,
+    start_alloc_mb Float32,
+    start_rss_mb Float32,
+    end_alloc_mb Float32,
+    end_rss_mb Float32,
+    event_id String DEFAULT '',
+    seq UInt64 DEFAULT 0,
+    build_type LowCardinality(String) DEFAULT '',
+    gpu LowCardinality(String) DEFAULT '',
+    ram_class LowCardinality(String) DEFAULT '',
+    net_type LowCardinality(String) DEFAULT '',
+    ctx Map(LowCardinality(String), String),
+    INDEX idx_event_id event_id TYPE bloom_filter(0.001) GRANULARITY 1,
+    INDEX idx_session_id session_id TYPE bloom_filter(0.01) GRANULARITY 1
+) ENGINE = ReplacingMergeTree()
+PARTITION BY toYYYYMMDD(timestamp)
+ORDER BY (app_version, end_reason, timestamp, event_id)
+TTL toDateTime(timestamp) + INTERVAL 30 DAY;
+
 -- Additive column migrations for tables created by earlier releases
 -- (APM-2: event_id, seq; APM-5: build_type, gpu, ram_class, net_type, ctx;
 -- APM-4: the exception columns from client_fingerprint to breadcrumbs;
 -- APM-3: error_seq, session_ms, unhandled, ctx_merged; APM-7: the crash
--- columns from client_fingerprint to details). The APM-6 tables
--- (apm_custom_events, apm_custom_metrics) have had all their columns from
--- the start.
+-- columns from client_fingerprint to details; APM-9: the perf sample's
+-- memory columns from interval_ms to mem_rss_mb). The APM-6 tables
+-- (apm_custom_events, apm_custom_metrics) and APM-9's apm_runs have had all
+-- their columns from the start.
 -- Metadata only (existing parts are not rewritten), idempotent.
 ALTER TABLE apm_perf_samples ADD COLUMN IF NOT EXISTS event_id String DEFAULT '';
 ALTER TABLE apm_perf_samples ADD COLUMN IF NOT EXISTS seq UInt64 DEFAULT 0;
@@ -277,6 +323,12 @@ ALTER TABLE apm_perf_samples ADD COLUMN IF NOT EXISTS gpu LowCardinality(String)
 ALTER TABLE apm_perf_samples ADD COLUMN IF NOT EXISTS ram_class LowCardinality(String) DEFAULT '';
 ALTER TABLE apm_perf_samples ADD COLUMN IF NOT EXISTS net_type LowCardinality(String) DEFAULT '';
 ALTER TABLE apm_perf_samples ADD COLUMN IF NOT EXISTS ctx Map(LowCardinality(String), String);
+ALTER TABLE apm_perf_samples ADD COLUMN IF NOT EXISTS interval_ms UInt32 DEFAULT 0;
+ALTER TABLE apm_perf_samples ADD COLUMN IF NOT EXISTS mem_mono_heap_mb Float32 DEFAULT 0;
+ALTER TABLE apm_perf_samples ADD COLUMN IF NOT EXISTS mem_alloc_mb Float32 DEFAULT 0;
+ALTER TABLE apm_perf_samples ADD COLUMN IF NOT EXISTS mem_reserved_mb Float32 DEFAULT 0;
+ALTER TABLE apm_perf_samples ADD COLUMN IF NOT EXISTS mem_gfx_mb Float32 DEFAULT 0;
+ALTER TABLE apm_perf_samples ADD COLUMN IF NOT EXISTS mem_rss_mb Float32 DEFAULT 0;
 ALTER TABLE apm_janks ADD COLUMN IF NOT EXISTS event_id String DEFAULT '';
 ALTER TABLE apm_janks ADD COLUMN IF NOT EXISTS seq UInt64 DEFAULT 0;
 ALTER TABLE apm_janks ADD COLUMN IF NOT EXISTS build_type LowCardinality(String) DEFAULT '';
@@ -358,6 +410,13 @@ ALTER TABLE apm_custom_metrics ADD COLUMN IF NOT EXISTS gpu LowCardinality(Strin
 ALTER TABLE apm_custom_metrics ADD COLUMN IF NOT EXISTS ram_class LowCardinality(String) DEFAULT '';
 ALTER TABLE apm_custom_metrics ADD COLUMN IF NOT EXISTS net_type LowCardinality(String) DEFAULT '';
 ALTER TABLE apm_custom_metrics ADD COLUMN IF NOT EXISTS ctx Map(LowCardinality(String), String);
+ALTER TABLE apm_runs ADD COLUMN IF NOT EXISTS event_id String DEFAULT '';
+ALTER TABLE apm_runs ADD COLUMN IF NOT EXISTS seq UInt64 DEFAULT 0;
+ALTER TABLE apm_runs ADD COLUMN IF NOT EXISTS build_type LowCardinality(String) DEFAULT '';
+ALTER TABLE apm_runs ADD COLUMN IF NOT EXISTS gpu LowCardinality(String) DEFAULT '';
+ALTER TABLE apm_runs ADD COLUMN IF NOT EXISTS ram_class LowCardinality(String) DEFAULT '';
+ALTER TABLE apm_runs ADD COLUMN IF NOT EXISTS net_type LowCardinality(String) DEFAULT '';
+ALTER TABLE apm_runs ADD COLUMN IF NOT EXISTS ctx Map(LowCardinality(String), String);
 
 -- APM-19: bloom_filter skip index on event_id for the ingest-time duplicate
 -- lookup. Additive, idempotent, metadata only: new parts carry the index,
@@ -373,6 +432,7 @@ ALTER TABLE apm_exceptions ADD INDEX IF NOT EXISTS idx_event_id event_id TYPE bl
 ALTER TABLE apm_crashes ADD INDEX IF NOT EXISTS idx_event_id event_id TYPE bloom_filter(0.001) GRANULARITY 1;
 ALTER TABLE apm_custom_events ADD INDEX IF NOT EXISTS idx_event_id event_id TYPE bloom_filter(0.001) GRANULARITY 1;
 ALTER TABLE apm_custom_metrics ADD INDEX IF NOT EXISTS idx_event_id event_id TYPE bloom_filter(0.001) GRANULARITY 1;
+ALTER TABLE apm_runs ADD INDEX IF NOT EXISTS idx_event_id event_id TYPE bloom_filter(0.001) GRANULARITY 1;
 
 -- APM-15: bloom_filter skip index on session_id for the session time line.
 -- Additive, idempotent, metadata only, same privilege as above. To index
@@ -386,6 +446,7 @@ ALTER TABLE apm_exceptions ADD INDEX IF NOT EXISTS idx_session_id session_id TYP
 ALTER TABLE apm_crashes ADD INDEX IF NOT EXISTS idx_session_id session_id TYPE bloom_filter(0.01) GRANULARITY 1;
 ALTER TABLE apm_custom_events ADD INDEX IF NOT EXISTS idx_session_id session_id TYPE bloom_filter(0.01) GRANULARITY 1;
 ALTER TABLE apm_custom_metrics ADD INDEX IF NOT EXISTS idx_session_id session_id TYPE bloom_filter(0.01) GRANULARITY 1;
+ALTER TABLE apm_runs ADD INDEX IF NOT EXISTS idx_session_id session_id TYPE bloom_filter(0.01) GRANULARITY 1;
 
 -- Daily aggregations. They only see rows inserted after they were created.
 -- Need the CREATE VIEW privilege (not granted to the `apm` service account).

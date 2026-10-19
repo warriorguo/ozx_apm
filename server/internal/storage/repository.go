@@ -37,7 +37,8 @@ func (r *Repository) InsertPerfSamples(ctx context.Context, samples []models.Per
 		return nil
 	}
 
-	batch, err := r.newInsert(ctx, "INSERT INTO apm_perf_samples (timestamp, app_version, platform, device_model, os_version, session_id, device_id, scene, fps, frame_time_ms, main_thread_ms, gc_alloc_kb, mem_mb, event_id, seq, build_type, gpu, ram_class, net_type, ctx)")
+	batch, err := r.newInsert(ctx, "INSERT INTO apm_perf_samples (timestamp, app_version, platform, device_model, os_version, session_id, device_id, scene, fps, frame_time_ms, main_thread_ms, gc_alloc_kb, mem_mb, event_id, seq, build_type, gpu, ram_class, net_type, ctx, "+
+		"interval_ms, mem_mono_heap_mb, mem_alloc_mb, mem_reserved_mb, mem_gfx_mb, mem_rss_mb)")
 	if err != nil {
 		return fmt.Errorf("prepare batch: %w", err)
 	}
@@ -64,6 +65,12 @@ func (r *Repository) InsertPerfSamples(ctx context.Context, samples []models.Per
 			s.RAMClass,
 			s.NetType,
 			contextColumn(s.Context),
+			uint32(s.IntervalMs), // bounded by processor.NormalizePerfMemory
+			float32(s.MemMonoHeapMB),
+			float32(s.MemAllocMB),
+			float32(s.MemReservedMB),
+			float32(s.MemGfxMB),
+			float32(s.MemRssMB),
 		)
 		if err != nil {
 			return fmt.Errorf("append to batch: %w", err)

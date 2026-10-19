@@ -16,13 +16,14 @@ const (
 	TimelineJank         = "jank"
 	TimelineSceneLoad    = "scene_load"
 	TimelineStartup      = "startup"
+	TimelineRun          = "run"        // apm_runs (APM-9): a game run that ended, at its end
 	TimelineContext      = "context"    // a change of the game context, derived from consecutive rows
 	TimelineBreadcrumb   = "breadcrumb" // a line of the breadcrumbs exceptions, crashes and janks carry
 )
 
 // TimelineTypes lists the item types (also the keys of SessionTimeline.Counts).
 var TimelineTypes = []string{TimelineCustomEvent, TimelineCustomMetric, TimelineException, TimelineCrash, TimelineJank,
-	TimelineSceneLoad, TimelineStartup, TimelineContext, TimelineBreadcrumb}
+	TimelineSceneLoad, TimelineStartup, TimelineRun, TimelineContext, TimelineBreadcrumb}
 
 // Breadcrumb kinds, from the line's prefix (SDK Timeline.cs).
 const (
@@ -90,6 +91,14 @@ type TimelineItem struct {
 	Phase1Ms float64 `json:"phase1_ms,omitempty"`
 	Phase2Ms float64 `json:"phase2_ms,omitempty"`
 	TTIMs    float64 `json:"tti_ms,omitempty"`
+
+	// run (APM-9; DurationMs: its length; CrashType when it ended in a crash)
+	RunID       string  `json:"run_id,omitempty"`
+	EndReason   string  `json:"end_reason,omitempty"`
+	Result      string  `json:"result,omitempty"`
+	PeakRssMB   float64 `json:"peak_rss_mb,omitempty"`
+	PeakAllocMB float64 `json:"peak_alloc_mb,omitempty"`
+	PeakMemMB   float64 `json:"peak_mem_mb,omitempty"`
 
 	// context: what changed between the previous row that carried a context
 	// and this one (Source: the table of the row it was first seen on).

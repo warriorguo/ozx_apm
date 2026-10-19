@@ -44,6 +44,7 @@ func seedDevice(t *testing.T, client *storage.ClickHouseClient, device string, n
 	var crashes []models.Crash
 	var customs []models.CustomEvent
 	var metricRows []models.CustomMetric
+	var runs []models.Run
 	for i := 0; i < n; i++ {
 		id := fmt.Sprintf("%s-%d", device, i)
 		at := ts.Add(time.Duration(i) * time.Second)
@@ -56,6 +57,8 @@ func seedDevice(t *testing.T, client *storage.ClickHouseClient, device string, n
 		customs = append(customs, models.CustomEvent{Timestamp: at, EventID: id + "ce", AppVersion: "1.0", Platform: "Android", SessionID: "s-" + device, DeviceID: device, Scene: "A", Name: "room_enter", Count: 1,
 			Props: map[string]string{"roomId": "1"}})
 		metricRows = append(metricRows, customMetricRow(at, id+"cm", "1.0", "room_switch_ms", "s-"+device, device, 700))
+		runs = append(runs, models.Run{Timestamp: at, EventID: id + "r", AppVersion: "1.0", Platform: "Android", SessionID: "s-" + device, DeviceID: device, Scene: "A",
+			RunID: "run-" + id, EndReason: "end", PeakRssMB: 900})
 	}
 	must(t, repo.InsertPerfSamples(ctx, perf))
 	must(t, repo.InsertPerfSamples(ctx, perf[:1])) // duplicate in a second part
@@ -66,6 +69,7 @@ func seedDevice(t *testing.T, client *storage.ClickHouseClient, device string, n
 	must(t, repo.InsertCrashes(ctx, crashes))
 	must(t, repo.InsertCustomEvents(ctx, customs))
 	must(t, repo.InsertCustomMetrics(ctx, metricRows))
+	must(t, repo.InsertRuns(ctx, runs))
 	counts := map[string]uint64{}
 	for _, et := range storage.EventTables {
 		counts[et.Name] = uint64(n)

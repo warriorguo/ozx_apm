@@ -148,7 +148,7 @@ func parseGroup(q url.Values, metric bool) (storage.CustomGroup, string) {
 		return storage.CustomGroup{Kind: "prop", Key: prop}, ""
 	case by != "":
 		if !storage.ValidCustomColumn(by) {
-			return storage.CustomGroup{}, "by must be one of " + strings.Join([]string{"app_version", "platform", "device_model", "os_version", "build_type"}, ", ")
+			return storage.CustomGroup{}, "by must be one of " + strings.Join([]string{"app_version", "platform", "device_model", "os_version", "build_type", "ram_class"}, ", ")
 		}
 		return storage.CustomGroup{Kind: "column", Key: by}, ""
 	}

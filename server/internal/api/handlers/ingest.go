@@ -53,6 +53,7 @@ type EventStore interface {
 	InsertCrashes(ctx context.Context, crashes []models.Crash) error
 	InsertCustomEvents(ctx context.Context, events []models.CustomEvent) error
 	InsertCustomMetrics(ctx context.Context, rows []models.CustomMetric) error
+	InsertRuns(ctx context.Context, runs []models.Run) error
 	// ExistingEventIDs returns which of the looked-up event_ids are already stored.
 	ExistingEventIDs(ctx context.Context, q storage.EventIDLookup) (map[string]struct{}, error)
 }
@@ -249,6 +250,7 @@ func (h *IngestHandler) IngestEvents(w http.ResponseWriter, r *http.Request) {
 		crashes     []models.Crash
 		customs     []models.CustomEvent
 		metricRows  []models.CustomMetric
+		runs        []models.Run
 		errors      []string
 		rejected    int
 		hasEventIDs bool
@@ -307,6 +309,7 @@ func (h *IngestHandler) IngestEvents(w http.ResponseWriter, r *http.Request) {
 			}
 			event.Timestamp = timestamp
 			ctxStats.Add(processor.NormalizeEventContext(&event.EventContext, event.Platform))
+			processor.NormalizePerfMemory(&event.PerfMemory) // APM-9
 			event.Platform = h.enricher.NormalizePlatform(event.Platform)
 			event.DeviceModel = h.enricher.NormalizeDeviceModel(event.DeviceModel)
 			if err := h.validator.ValidatePerfSample(&event); err != nil {
@@ -438,6 +441,24 @@ func (h *IngestHandler) IngestEvents(w http.ResponseWriter, r *http.Request) {
 			}
 			metricRows = append(metricRows, event)
 
+		case models.EventTypeRun:
+			// APM-9: a game run that ended, with its peak memory.
+			var event models.Run
+			if err := json.Unmarshal(rawEvent, &event); err != nil {
+				reject(i, "invalid fields")
+				continue
+			}
+			event.Timestamp = timestamp
+			ctxStats.Add(processor.NormalizeEventContext(&event.EventContext, event.Platform))
+			processor.NormalizeRun(&event)
+			event.Platform = h.enricher.NormalizePlatform(event.Platform)
+			event.DeviceModel = h.enricher.NormalizeDeviceModel(event.DeviceModel)
+			if err := h.validator.ValidateRun(&event); err != nil {
+				reject(i, err.Error())
+				continue
+			}
+			runs = append(runs, event)
+
 		case models.EventTypeAssetLoad, models.EventTypeHTTP:
 			// Planned (asset loads, HTTP timings: APM-8), not stored yet:
 			// rejected with a reason, never silently dropped.
@@ -502,6 +523,9 @@ func (h *IngestHandler) IngestEvents(w http.ResponseWriter, r *http.Request) {
 	metricRows, d = dedupe(ctx, h.repo, h.logger, storage.TableCustomMetrics, metricRows,
 		func(e *models.CustomMetric) eventKey { return eventKey{e.EventID, e.AppVersion, e.Name, e.Timestamp} })
 	add(d)
+	runs, d = dedupe(ctx, h.repo, h.logger, storage.TableRuns, runs,
+		func(e *models.Run) eventKey { return eventKey{e.EventID, e.AppVersion, e.EndReason, e.Timestamp} })
+	add(d)
 	if dups.total() > 0 {
 		h.logger.Info("dropped duplicate events",
 			zap.Int("duplicates", dups.total()),
@@ -523,6 +547,7 @@ func (h *IngestHandler) IngestEvents(w http.ResponseWriter, r *http.Request) {
 	assignServerEventIDs(crashes, func(e *models.Crash) *string { return &e.EventID })
 	assignServerEventIDs(customs, func(e *models.CustomEvent) *string { return &e.EventID })
 	assignServerEventIDs(metricRows, func(e *models.CustomMetric) *string { return &e.EventID })
+	assignServerEventIDs(runs, func(e *models.Run) *string { return &e.EventID })
 
 	// Insert events into ClickHouse. Each table insert is retried here
 	// before answering. Only events whose insert succeeded count as accepted,
@@ -550,6 +575,7 @@ func (h *IngestHandler) IngestEvents(w http.ResponseWriter, r *http.Request) {
 	insert("crashes", len(crashes), func() error { return h.repo.InsertCrashes(ctx, crashes) })
 	insert("custom events", len(customs), func() error { return h.repo.InsertCustomEvents(ctx, customs) })
 	insert("custom metrics", len(metricRows), func() error { return h.repo.InsertCustomMetrics(ctx, metricRows) })
+	insert("runs", len(runs), func() error { return h.repo.InsertRuns(ctx, runs) })
 
 	if moreErrors > 0 {
 		errors = append(errors, "... and "+strconv.Itoa(moreErrors)+" more")

@@ -16,8 +16,9 @@ import (
 // privacy.go), the issue state and alert outbox tables (APM-8,
 // repository_alerts.go), and the symbol tables (APM-7). APM-6 added two
 // event tables (apm_custom_events, apm_custom_metrics) and their daily
-// views, APM-7 the crash columns; new tables are created by CREATE TABLE IF
-// NOT EXISTS, which the service account may run.
+// views, APM-7 the crash columns, APM-9 the perf sample's memory columns and
+// the apm_runs event table (no view); new tables are created by CREATE TABLE
+// IF NOT EXISTS, which the service account may run.
 //
 // The event tables are ReplacingMergeTree with event_id appended to the sort
 // key (APM-19 phase B): a re-sent event has the same timestamp, app_version
@@ -69,8 +70,27 @@ type eventTableSchema struct {
 // addedColumns are table-specific columns added after eventColumns, in the
 // order they were added; CREATE TABLE puts them last, as the ALTERs do.
 var addedColumns = map[string][]string{
-	TableExceptions.Name: append(append([]string{}, exceptionColumnsAPM4...), exceptionColumnsAPM3...),
-	TableCrashes.Name:    crashColumnsAPM7,
+	TableExceptions.Name:  append(append([]string{}, exceptionColumnsAPM4...), exceptionColumnsAPM3...),
+	TableCrashes.Name:     crashColumnsAPM7,
+	TablePerfSamples.Name: perfColumnsAPM9,
+}
+
+// perfColumnsAPM9 are the memory breakdown of a perf sample (APM-9; 0 on
+// rows of older SDKs and where a figure is not available): interval_ms is
+// the length of the sample's window (its play time), then the managed heap
+// reserved by the runtime (mem_mono_heap_mb; mem_mb stays the managed heap
+// in use, as before), Unity's native memory allocated and reserved
+// (Profiler.GetTotalAllocatedMemoryLong / GetTotalReservedMemoryLong), the
+// graphics memory Unity estimates (Gfx Used Memory) and the process's
+// resident memory (Android: RSS from /proc/self/statm; elsewhere Unity's
+// System Used Memory counter), all in MB.
+var perfColumnsAPM9 = []string{
+	"interval_ms UInt32 DEFAULT 0",
+	"mem_mono_heap_mb Float32 DEFAULT 0",
+	"mem_alloc_mb Float32 DEFAULT 0",
+	"mem_reserved_mb Float32 DEFAULT 0",
+	"mem_gfx_mb Float32 DEFAULT 0",
+	"mem_rss_mb Float32 DEFAULT 0",
 }
 
 // crashColumnsAPM7 describe a crash of the previous process that the SDK
@@ -263,6 +283,39 @@ var eventTableSchemas = []eventTableSchema{
 		"hist_keys Array(Int16)",
 		"hist_counts Array(UInt64)",
 		"ctx_merged UInt8",
+	}},
+	// APM-9: one game run (ApmClient.BeginRun / EndRun), sent when it ends:
+	// how it ended (end_reason: end, new_run, shutdown; crash and
+	// process_end for a run the process did not survive, reported at the
+	// next launch from the crash journal, crash_type then the APM-7 type),
+	// the game's result, its length, how many memory samples it had, the
+	// peak of each memory figure of the perf sample, and the native and
+	// resident memory at its start and end (MB). timestamp is the end.
+	{TableRuns, []string{
+		"timestamp DateTime64(3)",
+		"app_version String",
+		"platform String",
+		"device_model String",
+		"os_version String",
+		"session_id String",
+		"device_id String",
+		"scene String",
+		"run_id String",
+		"end_reason LowCardinality(String)",
+		"result String",
+		"crash_type LowCardinality(String)",
+		"duration_ms UInt64",
+		"samples UInt32",
+		"peak_mem_mb Float32",
+		"peak_mono_heap_mb Float32",
+		"peak_alloc_mb Float32",
+		"peak_reserved_mb Float32",
+		"peak_gfx_mb Float32",
+		"peak_rss_mb Float32",
+		"start_alloc_mb Float32",
+		"start_rss_mb Float32",
+		"end_alloc_mb Float32",
+		"end_rss_mb Float32",
 	}},
 }
 
@@ -692,9 +745,10 @@ func SchemaSQL() string {
 -- (APM-2: event_id, seq; APM-5: build_type, gpu, ram_class, net_type, ctx;
 -- APM-4: the exception columns from client_fingerprint to breadcrumbs;
 -- APM-3: error_seq, session_ms, unhandled, ctx_merged; APM-7: the crash
--- columns from client_fingerprint to details). The APM-6 tables
--- (apm_custom_events, apm_custom_metrics) have had all their columns from
--- the start.
+-- columns from client_fingerprint to details; APM-9: the perf sample's
+-- memory columns from interval_ms to mem_rss_mb). The APM-6 tables
+-- (apm_custom_events, apm_custom_metrics) and APM-9's apm_runs have had all
+-- their columns from the start.
 -- Metadata only (existing parts are not rewritten), idempotent.
 `)
 	for _, s := range eventTableSchemas {

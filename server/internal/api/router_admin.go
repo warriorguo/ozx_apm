@@ -71,6 +71,13 @@ func NewAdminRouter(cfg *config.Config, repo *storage.Repository, logger *zap.Lo
 		r.Get("/custom/metrics", customHandler.ListMetrics)
 		r.Get("/custom/metrics/distribution", customHandler.MetricDistribution)
 
+		// Memory, session health and funnels (APM-9)
+		analysisHandler := admin.NewAnalysisHandler(repo, logger)
+		r.Get("/memory/breakdown", analysisHandler.MemoryBreakdown)
+		r.Get("/memory/runs", analysisHandler.RunPeaks)
+		r.Get("/health/sessions", analysisHandler.Health)
+		r.Get("/funnel", analysisHandler.Funnel)
+
 		// Privacy deletion (APM-14). The rest of the admin API has no
 		// authentication (internal network only, RELEASE.md); these two
 		// destructive endpoints need a bearer token and are disabled (403)

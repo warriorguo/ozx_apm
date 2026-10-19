@@ -99,6 +99,7 @@ type PerfSample struct {
 	GCAllocKB    float32   `json:"gc_alloc_kb" ch:"gc_alloc_kb"`
 	MemMB        float32   `json:"mem_mb" ch:"mem_mb"`
 	EventContext
+	PerfMemory
 }
 
 // Jank represents a jank event

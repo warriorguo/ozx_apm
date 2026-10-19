@@ -42,7 +42,7 @@ func (h *ContextHandler) filterAndSource(w http.ResponseWriter, r *http.Request)
 	}
 	source := q.Get("source")
 	if !storage.ValidContextSource(source) {
-		http.Error(w, "source must be one of perf, janks, startups, scene_loads, exceptions, crashes, custom_events, custom_metrics, all", http.StatusBadRequest)
+		http.Error(w, "source must be one of perf, janks, startups, scene_loads, exceptions, crashes, custom_events, custom_metrics, runs, all", http.StatusBadRequest)
 		return f, "", false
 	}
 	return f, source, true
@@ -107,9 +107,11 @@ func (h *ContextHandler) ListValues(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, models.ContextValuesResponse{Key: key, Values: values})
 }
 
-// Distribution: GET /api/context/distribution?key=K&metric=M[&fingerprint=F]
+// Distribution: GET /api/context/distribution?key=K&metric=M[&fingerprint=F][&bucket=count]
 // -> the metric grouped by the value of K. M is fps, frame_time, janks,
-// startup, scene_load, exceptions or crashes.
+// jank_rate (janks per minute of play, APM-9), startup, scene_load,
+// exceptions or crashes. bucket=count (APM-9) groups numeric values into
+// count ranges (models.CountBucketLabels), e.g. for an alive enemy count.
 func (h *ContextHandler) Distribution(w http.ResponseWriter, r *http.Request) {
 	if h.repo == nil {
 		http.Error(w, "repository not configured", http.StatusInternalServerError)
@@ -122,7 +124,16 @@ func (h *ContextHandler) Distribution(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	metric := q.Get("metric")
 	if !storage.ValidContextMetric(metric) {
-		http.Error(w, "metric must be one of fps, frame_time, janks, startup, scene_load, exceptions, crashes", http.StatusBadRequest)
+		http.Error(w, "metric must be one of fps, frame_time, janks, jank_rate, startup, scene_load, exceptions, crashes", http.StatusBadRequest)
+		return
+	}
+	var bucket bool
+	switch q.Get("bucket") {
+	case "", "none":
+	case "count":
+		bucket = true
+	default:
+		http.Error(w, "bucket must be count or none", http.StatusBadRequest)
 		return
 	}
 	f, err := parseAdminFilter(q, contextDefaultRange)
@@ -130,7 +141,7 @@ func (h *ContextHandler) Distribution(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	dist, err := h.repo.GetContextDistribution(r.Context(), f, metric, key, q.Get("fingerprint"))
+	dist, err := h.repo.GetContextDistribution(r.Context(), f, metric, key, q.Get("fingerprint"), bucket)
 	if err != nil {
 		h.logger.Error("failed to get context distribution", zap.Error(err), zap.String("key", key), zap.String("metric", metric))
 		http.Error(w, "internal error", http.StatusInternalServerError)

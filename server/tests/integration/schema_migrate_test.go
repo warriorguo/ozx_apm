@@ -154,12 +154,12 @@ func queryUint(t *testing.T, client *storage.ClickHouseClient, query string, arg
 }
 
 // legacyEventTables are the event tables of the legacy schemas (the
-// fixture predates APM-6's apm_custom_events and apm_custom_metrics, which
-// Migrate creates with their TTL).
+// fixture predates APM-6's apm_custom_events and apm_custom_metrics and
+// APM-9's apm_runs, which Migrate creates with their TTL).
 func legacyEventTables() []storage.EventTable {
 	var out []storage.EventTable
 	for _, et := range storage.EventTables {
-		if et != storage.TableCustomEvents && et != storage.TableCustomMetrics {
+		if et != storage.TableCustomEvents && et != storage.TableCustomMetrics && et != storage.TableRuns {
 			out = append(out, et)
 		}
 	}

@@ -140,6 +140,16 @@ var sessionSources = []sessionSource{
 			it.Context = ctxMap(ctx)
 			return nil
 		}},
+	{TableRuns.Name, models.TimelineRun, "scene, run_id, end_reason, result, crash_type, toFloat64(duration_ms), " + finiteFloat("peak_rss_mb") + ", " + finiteFloat("peak_alloc_mb") + ", " + finiteFloat("peak_mem_mb") + ", ctx", SessionRowsPerType,
+		func(rows driver.Rows, it *models.TimelineItem, _ *[]string) error {
+			var ctx map[string]string
+			if err := rows.Scan(&it.Time, &it.EventID, &it.Seq, &it.Scene, &it.RunID, &it.EndReason, &it.Result, &it.CrashType,
+				&it.DurationMs, &it.PeakRssMB, &it.PeakAllocMB, &it.PeakMemMB, &ctx); err != nil {
+				return err
+			}
+			it.Context = ctxMap(ctx)
+			return nil
+		}},
 	{TableStartups.Name, models.TimelineStartup, finiteFloat("phase1_ms") + ", " + finiteFloat("phase2_ms") + ", " + finiteFloat("tti_ms") + ", ctx", SessionRowsPerType,
 		func(rows driver.Rows, it *models.TimelineItem, _ *[]string) error {
 			var ctx map[string]string
@@ -162,6 +172,7 @@ var ctxSources = []struct{ table, src, cond string }{
 	{TableJanks.Name, models.TimelineJank, ""},
 	{TableSceneLoads.Name, models.TimelineSceneLoad, ""},
 	{TableStartups.Name, models.TimelineStartup, ""},
+	{TableRuns.Name, models.TimelineRun, ""},
 }
 
 // sessionInfoQuery finds the session's span and its device and build (of

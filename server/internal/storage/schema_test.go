@@ -18,6 +18,7 @@ var eventTables = []string{
 	"apm_crashes",
 	"apm_custom_events",
 	"apm_custom_metrics",
+	"apm_runs",
 }
 
 // Existing deployments only get new columns through additive, idempotent

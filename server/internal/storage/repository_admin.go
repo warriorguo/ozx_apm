@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
@@ -831,6 +832,8 @@ var contextSources = map[string]string{
 	// APM-6
 	"custom_events":  "apm_custom_events",
 	"custom_metrics": "apm_custom_metrics",
+	// APM-9
+	"runs": "apm_runs",
 }
 
 // ValidContextSource reports whether source names a context source.
@@ -937,12 +940,128 @@ var contextMetrics = map[string]contextMetric{
 	"scene_load": {"apm_scene_loads", "count()", "load_ms", "ms"},
 	"exceptions": {"apm_exceptions", "sum(count)", "", ""},
 	"crashes":    {"apm_crashes", "count()", "", ""},
+	// APM-9: janks per minute of play (GetContextDistribution's own path).
+	"jank_rate": {"apm_janks", "count()", "", "janks/min"},
 }
 
 // ValidContextMetric reports whether metric is a GetContextDistribution metric.
 func ValidContextMetric(metric string) bool {
 	_, ok := contextMetrics[metric]
 	return ok
+}
+
+// contextValueExpr is the grouping value of a context key: ctx[key], or with
+// bucket its count range (models.CountBucketLabels) when it is a number. It
+// is used with the WITH clause contextValueWith, whose single argument is
+// the key; the expression itself has no argument.
+func contextValueExpr(bucket bool) string {
+	if !bucket {
+		return "raw_value"
+	}
+	var sb strings.Builder
+	sb.WriteString("multiIf(num_value IS NULL, raw_value")
+	for i, upper := range models.CountBucketUpper {
+		fmt.Fprintf(&sb, ", num_value < %g, '%s'", upper, models.CountBucketLabels[i])
+	}
+	fmt.Fprintf(&sb, ", '%s')", models.CountBucketLabels[len(models.CountBucketLabels)-1])
+	return sb.String()
+}
+
+// contextValueWith defines raw_value (the key's value, ” when not set) and
+// num_value (it as a number, NULL when it is not one); one argument: the key.
+const contextValueWith = "WITH ctx[?] AS raw_value, toFloat64OrNull(raw_value) AS num_value "
+
+// sortBucketRows orders rows by count range, then by count.
+func sortBucketRows(rows []models.ContextDistributionRow) {
+	sort.SliceStable(rows, func(a, b int) bool {
+		ra, rb := models.CountBucketRank(rows[a].Value), models.CountBucketRank(rows[b].Value)
+		if ra != rb {
+			return ra < rb
+		}
+		return rows[a].Count > rows[b].Count
+	})
+}
+
+// playMinutes is the play time of perf samples in minutes: their windows
+// (interval_ms, APM-9), or 1 s for rows of older SDKs (the default sampling
+// interval).
+const playMinutes = "sum(if(interval_ms > 0, interval_ms, 1000)) / 60000"
+
+// contextRateRowsLimit bounds the values read by each query of jank_rate
+// (the two are merged in Go before the top 50 are kept).
+const contextRateRowsLimit = 1000
+
+// getContextJankRate is GetContextDistribution for jank_rate: janks per
+// value from apm_janks, play time per value from apm_perf_samples, merged
+// by value; rows by play time.
+func (r *Repository) getContextJankRate(ctx context.Context, f models.AdminFilter, key string, bucket bool, dist *models.ContextDistribution) error {
+	value := contextValueExpr(bucket)
+	byValue := map[string]*models.ContextDistributionRow{}
+	row := func(v string) *models.ContextDistributionRow {
+		if rw, ok := byValue[v]; ok {
+			return rw
+		}
+		rw := &models.ContextDistributionRow{Value: v}
+		byValue[v] = rw
+		return rw
+	}
+	jWhere, jArgs := tableWhere(TableJanks.Name, f)
+	jq := fmt.Sprintf(contextValueWith+`SELECT %s AS value, toInt64(count()), toInt64(uniqExact(session_id)) FROM apm_janks %s GROUP BY value ORDER BY count() DESC LIMIT %d`,
+		value, jWhere, contextRateRowsLimit)
+	err := r.queryRows(ctx, jq, append([]interface{}{key}, jArgs...), func(rows driver.Rows) error {
+		var v string
+		var n, s int64
+		if err := rows.Scan(&v, &n, &s); err != nil {
+			return err
+		}
+		rw := row(v)
+		rw.Count, rw.Sessions = n, s
+		dist.Total += n
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("janks: %w", err)
+	}
+	pWhere, pArgs := tableWhere(TablePerfSamples.Name, f)
+	pq := fmt.Sprintf(contextValueWith+`SELECT %s AS value, %s FROM apm_perf_samples %s GROUP BY value ORDER BY count() DESC LIMIT %d`,
+		value, finiteFloat(playMinutes), pWhere, contextRateRowsLimit)
+	err = r.queryRows(ctx, pq, append([]interface{}{key}, pArgs...), func(rows driver.Rows) error {
+		var v string
+		var m float64
+		if err := rows.Scan(&v, &m); err != nil {
+			return err
+		}
+		row(v).Minutes = m
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("play time: %w", err)
+	}
+	rows := make([]models.ContextDistributionRow, 0, len(byValue))
+	for _, rw := range byValue {
+		if rw.Minutes > 0 {
+			rw.Rate = float64(rw.Count) / rw.Minutes
+		}
+		rows = append(rows, *rw)
+	}
+	sort.Slice(rows, func(a, b int) bool {
+		if rows[a].Minutes != rows[b].Minutes {
+			return rows[a].Minutes > rows[b].Minutes
+		}
+		if rows[a].Count != rows[b].Count {
+			return rows[a].Count > rows[b].Count
+		}
+		return rows[a].Value < rows[b].Value
+	})
+	if len(rows) > contextDistributionRows {
+		rows = rows[:contextDistributionRows]
+		dist.Truncated = true
+	}
+	if bucket {
+		sortBucketRows(rows)
+	}
+	dist.Rows = rows
+	return nil
 }
 
 // contextDistributionRows is the number of values returned; the rest is
@@ -957,22 +1076,37 @@ const contextDistributionRows = 50
 // merges occurrences in different contexts (ctx_merged, APM-3) and lacks the
 // key had several values for it: such occurrences are reported as Merged,
 // not under the empty value ("key not set"). Total includes them.
-func (r *Repository) GetContextDistribution(ctx context.Context, f models.AdminFilter, metric, key, fingerprint string) (*models.ContextDistribution, error) {
+//
+// bucket (APM-9): numeric values are grouped into count ranges
+// (contextValueExpr), e.g. for an alive enemy count. jank_rate: janks per
+// minute of play (getContextJankRate).
+func (r *Repository) GetContextDistribution(ctx context.Context, f models.AdminFilter, metric, key, fingerprint string, bucket bool) (*models.ContextDistribution, error) {
 	m, ok := contextMetrics[metric]
 	if !ok {
 		return nil, fmt.Errorf("unknown metric: %s", metric)
+	}
+	dist := &models.ContextDistribution{Key: key, Metric: metric, Unit: m.unit, Rows: []models.ContextDistributionRow{}}
+	if bucket {
+		dist.Bucket = "count"
+	}
+	if metric == "jank_rate" {
+		if err := r.getContextJankRate(ctx, f, key, bucket, dist); err != nil {
+			return nil, err
+		}
+		return dist, nil
 	}
 	whereClause, whereArgs := tableWhere(m.table, f)
 	if fingerprint != "" && m.value == "" {
 		whereClause += " AND fingerprint = ?"
 		whereArgs = append(whereArgs, fingerprint)
 	}
-	p50, p95 := "toFloat64(0)", "toFloat64(0)"
+	pct := [5]string{"toFloat64(0)", "toFloat64(0)", "toFloat64(0)", "toFloat64(0)", "toFloat64(0)"}
 	if m.value != "" {
-		p50, p95 = finiteFloat("quantile(0.5)("+m.value+")"), finiteFloat("quantile(0.95)("+m.value+")")
+		for i, level := range []string{"0.05", "0.5", "0.9", "0.95", "0.99"} {
+			pct[i] = finiteFloat("quantile(" + level + ")(" + m.value + ")")
+		}
 	}
 
-	dist := &models.ContextDistribution{Key: key, Metric: metric, Unit: m.unit, Rows: []models.ContextDistributionRow{}}
 	totalQuery := fmt.Sprintf(`SELECT toInt64(%s) FROM %s %s`, m.count, m.table, whereClause)
 	if err := r.client.conn.QueryRow(ctx, totalQuery, whereArgs...).Scan(&dist.Total); err != nil {
 		return nil, fmt.Errorf("total: %w", err)
@@ -989,17 +1123,17 @@ func (r *Repository) GetContextDistribution(ctx context.Context, f models.AdminF
 		rowsArgs = mergedArgs
 	}
 
-	query := fmt.Sprintf(`
-		SELECT ctx[?] AS value, toInt64(%s) AS cnt, toInt64(uniqExact(session_id)) AS sessions, %s AS p50, %s AS p95
+	query := fmt.Sprintf(contextValueWith+`
+		SELECT %s AS value, toInt64(%s) AS cnt, toInt64(uniqExact(session_id)) AS sessions, %s, %s, %s, %s, %s
 		FROM %s %s
 		GROUP BY value
 		ORDER BY cnt DESC, value
 		LIMIT %d
-	`, m.count, p50, p95, m.table, rowsWhere, contextDistributionRows+1)
+	`, contextValueExpr(bucket), m.count, pct[0], pct[1], pct[2], pct[3], pct[4], m.table, rowsWhere, contextDistributionRows+1)
 	args := append([]interface{}{key}, rowsArgs...)
 	err := r.queryRows(ctx, query, args, func(rows driver.Rows) error {
 		var row models.ContextDistributionRow
-		if err := rows.Scan(&row.Value, &row.Count, &row.Sessions, &row.P50, &row.P95); err != nil {
+		if err := rows.Scan(&row.Value, &row.Count, &row.Sessions, &row.P05, &row.P50, &row.P90, &row.P95, &row.P99); err != nil {
 			return err
 		}
 		if len(dist.Rows) == contextDistributionRows {
@@ -1011,6 +1145,9 @@ func (r *Repository) GetContextDistribution(ctx context.Context, f models.AdminF
 	})
 	if err != nil {
 		return nil, fmt.Errorf("rows: %w", err)
+	}
+	if bucket {
+		sortBucketRows(dist.Rows)
 	}
 	return dist, nil
 }

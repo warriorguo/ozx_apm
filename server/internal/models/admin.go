@@ -423,14 +423,22 @@ type ContextValuesResponse struct {
 
 // ContextDistributionRow is one value of the grouping key. Value is empty for
 // events without the key. Count is events (exceptions: the sum of count, i.e.
-// occurrences); P50/P95 are of the metric's value (Unit) and 0 for
-// exceptions and crashes.
+// occurrences); P05/P50/P90/P95/P99 are of the metric's value (Unit) and 0
+// for exceptions, crashes and jank_rate (P05, P90 and P99 since APM-9: for
+// fps the low percentiles are the slow moments). jank_rate (APM-9): Count is
+// janks, Minutes the play time of the value (the perf samples' windows) and
+// Rate janks per minute of play.
 type ContextDistributionRow struct {
 	Value    string  `json:"value"`
 	Count    int64   `json:"count"`
 	Sessions int64   `json:"sessions"`
+	P05      float64 `json:"p05"`
 	P50      float64 `json:"p50"`
+	P90      float64 `json:"p90"`
 	P95      float64 `json:"p95"`
+	P99      float64 `json:"p99"`
+	Minutes  float64 `json:"minutes,omitempty"`
+	Rate     float64 `json:"rate,omitempty"`
 }
 
 type ContextDistribution struct {
@@ -443,4 +451,28 @@ type ContextDistribution struct {
 	// Merged (exceptions, APM-3): occurrences whose value of the key is not
 	// known because the SDK merged them across contexts; not in Rows.
 	Merged int64 `json:"merged"`
+	// Bucket (APM-9): "count" when numeric values were grouped into the
+	// ranges of CountBucketLabels (rows then in range order).
+	Bucket string `json:"bucket,omitempty"`
+}
+
+// CountBucketLabels are the ranges a numeric context value (e.g. an alive
+// enemy count) is grouped into with bucket=count (APM-9). The SDK's
+// ApmClient.SetContextCount writes these labels itself (GameContext.cs,
+// CountBucket); both must change together. A value that is not a number (a
+// label already, or text) is kept as it is.
+var CountBucketLabels = []string{"0", "1-5", "6-10", "11-20", "21-30", "31-50", "51-100", "101-200", "201+"}
+
+// CountBucketUpper are the exclusive upper bounds of CountBucketLabels but the last.
+var CountBucketUpper = []float64{1, 6, 11, 21, 31, 51, 101, 201}
+
+// CountBucketRank is the position of a label in CountBucketLabels, or
+// len(CountBucketLabels) for any other value (sorted after the ranges).
+func CountBucketRank(label string) int {
+	for i, l := range CountBucketLabels {
+		if l == label {
+			return i
+		}
+	}
+	return len(CountBucketLabels)
 }
