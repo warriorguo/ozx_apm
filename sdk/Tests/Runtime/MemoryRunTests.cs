@@ -443,6 +443,44 @@ namespace OzxApm.Tests
         }
 
         [Test]
+        public void RunEventId_LiveAndJournalCopiesAreTheSame()
+        {
+            var runs = new RunTracker();
+            runs.Begin("run-77");
+            var j = new CrashJournal(_dir, Inputs(5151, 1_000_000, runs));
+            var record = JournalRecord.Parse(Encoding.UTF8.GetBytes(j.BuildText()));
+            var fromJournal = CrashReporter.BuildRun(record, null, null);
+            var live = runs.End(RunEvent.EndEnd, null);
+            string liveId = CrashReporter.EventId(DeviceId, 5151, 1_000_000, CrashReporter.RunKind(live.run_id, live.run_start_ms));
+            Assert.AreEqual(fromJournal.event_id, liveId, "the server keeps one of them");
+            runs.Begin("run-78");
+            var other = runs.End(RunEvent.EndEnd, null);
+            Assert.AreNotEqual(liveId, CrashReporter.EventId(DeviceId, 5151, 1_000_000, CrashReporter.RunKind(other.run_id, other.run_start_ms)));
+        }
+
+        [Test]
+        public void Sampler_FailedRssReadingIsNotKept()
+        {
+            string statm = Path.Combine(_dir, "statm");
+            File.WriteAllText(statm, "1000 2560 1 1 0 1 0\n");
+            var runs = new RunTracker();
+            var sampler = new MemorySampler(runs, null, statm, 1000);
+            sampler.Start(false);
+            Assert.IsTrue(sampler.ReadRssNow());
+            Assert.Greater(sampler.LastRssMb, 0);
+            File.WriteAllText(statm, "garbage\n");
+            Assert.IsFalse(sampler.ReadRssNow());
+            Assert.AreEqual(0, sampler.LastRssMb);
+            runs.Read(out var s);
+            Assert.AreEqual(0, s.Last.Rss);
+            Assert.Greater(s.ProcessPeakRss, 0, "the peak is kept");
+            var evt = new PerfSampleEvent();
+            sampler.Sample(evt, 10);
+            Assert.AreEqual(0, evt.mem_rss_mb, "not sent");
+            sampler.Dispose();
+        }
+
+        [Test]
         public void Report_BackgroundKillDuringARun_SendsTheRunOnly()
         {
             var runs = new RunTracker();

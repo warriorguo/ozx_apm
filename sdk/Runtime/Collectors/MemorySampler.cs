@@ -119,6 +119,8 @@ namespace OzxApm.Collectors
         private IMemorySource _source;
         private Thread _thread;
         private volatile bool _stop;
+        private int _generation;
+        private readonly object _readLock = new object();
         private readonly AutoResetEvent _wake = new AutoResetEvent(false);
         private ProcStatm _statm;
 
@@ -185,8 +187,10 @@ namespace OzxApm.Collectors
                 return; // tests call ReadRssNow
             try
             {
-                // A small stack: the loop holds a few locals.
-                var t = new Thread(Loop, 128 * 1024) { IsBackground = true, Name = "OzxApm.Memory" };
+                // A small stack: the loop holds a few locals. Its generation ends
+                // it even if Stop's join timed out and Start ran again meanwhile.
+                int generation = Interlocked.Increment(ref _generation);
+                var t = new Thread(() => Loop(generation), 128 * 1024) { IsBackground = true, Name = "OzxApm.Memory" };
                 _thread = t;
                 t.Start();
             }
@@ -201,6 +205,7 @@ namespace OzxApm.Collectors
         internal void Stop()
         {
             _stop = true;
+            Interlocked.Increment(ref _generation);
             _wake.Set();
             var t = _thread;
             _thread = null;
@@ -227,11 +232,11 @@ namespace OzxApm.Collectors
             _statm = null;
         }
 
-        private void Loop()
+        private void Loop(int generation)
         {
             try
             {
-                while (!_stop)
+                while (!_stop && generation == Volatile.Read(ref _generation))
                 {
                     ReadRssNow();
                     _wake.WaitOne(_paused ? PausedIntervalMs : _intervalMs);
@@ -252,10 +257,17 @@ namespace OzxApm.Collectors
             if (statm == null)
                 return false;
             long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
-            long bytes = statm.ReadRssBytes();
+            long bytes;
+            lock (_readLock) // ProcStatm is not thread-safe (an old reader thread may still be finishing)
+                bytes = statm.ReadRssBytes();
             LastRssReadTicks = System.Diagnostics.Stopwatch.GetTimestamp() - t0;
             if (bytes < 0)
+            {
+                // No stale figure: samples and run peaks get no RSS until a reading works again.
+                LastRssMb = 0;
+                _runs.ClearRss();
                 return false;
+            }
             float mb = bytes / (1024f * 1024f);
             LastRssMb = mb;
             Interlocked.Increment(ref RssReadings);

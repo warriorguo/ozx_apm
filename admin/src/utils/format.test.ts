@@ -6,7 +6,23 @@ import {
   formatDateTime,
   formatDate,
   formatTime,
+  requestError,
 } from './format'
+
+describe('requestError (APM-9)', () => {
+  it("adds the server's message for a 400 or 503, bounded", () => {
+    const e400 = { response: { status: 400, data: 'time range longer than 31 days: narrow it\n' } }
+    expect(requestError(e400, 'Could not load.')).toBe('Could not load. time range longer than 31 days: narrow it')
+    const long = { response: { status: 503, data: 'x'.repeat(500) } }
+    expect(requestError(long, 'F.').length).toBe('F. '.length + 201)
+  })
+  it('keeps the fallback otherwise', () => {
+    expect(requestError({ response: { status: 500, data: 'internal error' } }, 'F.')).toBe('F.')
+    expect(requestError(new Error('network'), 'F.')).toBe('F.')
+    expect(requestError(null, 'F.')).toBe('F.')
+    expect(requestError({ response: { status: 400, data: { a: 1 } } }, 'F.')).toBe('F.')
+  })
+})
 
 describe('formatNumber', () => {
   it('formats small numbers', () => {

@@ -158,7 +158,9 @@ func dedupe[T any](ctx context.Context, store EventStore, logger *zap.Logger, ta
 func lookupFor(table storage.EventTable, keys []eventKey, idx []int) storage.EventIDLookup {
 	q := storage.EventIDLookup{Table: table, EventIDs: make([]string, 0, len(idx)),
 		// APM-7: a re-sent crash may have another fingerprint (symbols uploaded meanwhile).
-		AnyKey: table == storage.TableCrashes}
+		// APM-9: a run reported live (EndRun, end_reason end) and again from the
+		// crash journal (crash / process_end) has one event id and another key.
+		AnyKey: table == storage.TableCrashes || table == storage.TableRuns}
 	versions := map[string]struct{}{}
 	values := map[string]struct{}{}
 	for n, i := range idx {
@@ -179,7 +181,8 @@ func lookupFor(table storage.EventTable, keys []eventKey, idx []int) storage.Eve
 			q.MaxTime = k.ts
 		}
 	}
-	if table == storage.TableCrashes {
+	if table == storage.TableCrashes || table == storage.TableRuns {
+		// APM-9: runs too (the journal's copy has the crash's time), and they are few.
 		// APM-7: an event id is one crash whatever its timestamp (an ANR the
 		// watchdog reported live, then again from the exit record's trace at the
 		// next launch; a crash re-sent by an older SDK with another time).

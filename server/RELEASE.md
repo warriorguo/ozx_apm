@@ -3281,8 +3281,15 @@ admin UI needs this server (it calls the new endpoints).
   journal: `end_reason` `crash` with `crash_type` (the exit's APM-7 type:
   `oom`, `killed`, `native`, ...), or `process_end` when the exit was not a
   crash (a background kill), with the journal's peaks, the crashed session's
-  fields and context, and an event id derived from the process (a re-report
-  is a duplicate). No crash schema change: `details` is the APM-7 map.
+  fields and context. Its event id is derived from the process, the run id
+  and the run's start, and a run ended live (`EndRun`, `new_run`,
+  `shutdown`) gets the same id where the journal runs (Android): should the
+  process die after the live event reached the disk but before the journal
+  was rewritten without the run, the server keeps the first copy (runs are
+  looked up by event id whatever their end reason, a week around their
+  time, like crashes); the live event also wakes the storage worker, so the
+  window in which a run could be lost is a few milliseconds. A re-report is
+  a duplicate. No crash schema change: `details` is the APM-7 map.
 - **Context slicing** (item 3): APM-5 already filters and groups perf
   samples and janks by any context key (`/api/context/distribution`, Context
   page). Added: `bucket=count` groups numeric values into count ranges `0`,
@@ -3475,8 +3482,9 @@ Server (estimated, not measured: the author's sandbox has no ClickHouse):
   names (`name` is the second sort key column: with `app_version` set,
   granules of other names are skipped), reading `session_id`, `timestamp`,
   `props` (only with property filters), then one row per session.
-- `jank_rate`: two queries (janks; perf samples' `interval_ms`), merged in Go
-  (at most 1000 values each).
+- `jank_rate`: three queries (the janks' total; janks and the perf samples'
+  `interval_ms` per value), merged in Go (at most 1000 values each; more:
+  `truncated`).
 - Bounds: at most 2 of these requests run at once across requests (a third
   waits; the time line keeps its own 4), each runs its queries one after the
   other on one pooled connection (of 10, shared with ingest), 25 s per
@@ -3521,8 +3529,9 @@ remove the table after a permanent rollback (admin): `DROP TABLE apm_runs`.
   integration tests now include `apm_runs` (duplicate lookup, privacy
   deletion, migration fixtures). **Written and compiled, not run here.**
 - SDK: compiles at C# 8 with and without `UNITY_2021_2_OR_NEWER`, for
-  Android and iOS defines; on Unity's Mono outside Unity 237 runtime tests
-  pass (16 new: statm parsing and re-reading, the run tracker, count ranges,
+  Android and iOS defines; on Unity's Mono outside Unity 239 runtime tests
+  pass (18 new: statm parsing and re-reading, a failed reading not kept, the
+  live and journal run ids equal, the run tracker, count ranges,
   the sampler with a fake engine source and with its thread, paused and
   resumed, the journal's memory/run lines, an OOM during a run reported with
   the memory in the details and the run, a background kill reporting the run
@@ -3531,7 +3540,21 @@ remove the table after a permanent rollback (admin): `DROP TABLE apm_runs`.
   runtime (among them the 9 new `RunApiTests`: BeginRun/EndRun through
   ApmClient, shutdown, consent, SetContextCount, no allocation on the
   sampling paths and the journal write).
-- Admin UI: `tsc`, vitest (170 tests, 22 new), `vite build`.
+- Admin UI: `tsc`, vitest (173 tests, 25 new), `vite build`.
+- A code review (another agent, reading the diff) found: the Health page
+  sending no crash types when every box was cleared (the server then counts
+  its defaults: now at least one stays checked); a run lost or stored twice
+  if the process died between the live run event and the journal rewrite
+  (now one event id for both copies, looked up whatever the end reason, and
+  the storage worker woken); a stale RSS repeated after the statm reader
+  failed (now 0, not sent); a second RSS reader thread after a timed-out
+  stop (now a generation token and a lock); the jank rate's total over the
+  listed values only (now its own count, `truncated` when a list was cut);
+  `BeginRun` silent when the context was full (now a warning); the pages
+  hiding the server's 400 message (now shown). All fixed, with tests. Noted,
+  not changed: by context key a session counts under every value it had;
+  `first_error=1` would narrow the health page's exception figures (the
+  page never sends it).
 - The test driver (`/tmp/claude-501/apm9/ApmTestDriver.cs`) compiles against
   this SDK; the device plan is `/tmp/claude-501/apm9/DEVICE_PLAN.md`.
 

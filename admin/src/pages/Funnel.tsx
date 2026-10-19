@@ -4,7 +4,7 @@ import { GlobalFilterBar } from '../components/FilterBar'
 import { Clipped } from '../components/GroupPicker'
 import { useFilters } from '../hooks/useFilters'
 import { isValidContextKey, useCustomEvents, useFunnel } from '../hooks/useApi'
-import { formatNumber, formatPercent } from '../utils/format'
+import { formatNumber, formatPercent, requestError } from '../utils/format'
 import type { FunnelSplit, FunnelStep } from '../types/api'
 
 export const maxSteps = 8
@@ -68,7 +68,7 @@ export function Funnel() {
   const [error, setError] = useState('')
   const [request, setRequest] = useState<{ steps: FunnelStep[]; windowSeconds: number; by: FunnelSplit } | null>(null)
   const events = useCustomEvents(queryParams)
-  const { data, isLoading, isError, isFetching } = useFunnel(request, queryParams)
+  const { data, isLoading, isError, isFetching, error: queryError } = useFunnel(request, queryParams)
   const eventNames = (events.data?.events ?? []).map((e) => e.name)
 
   const update = (i: number, f: (s: DraftStep) => DraftStep) => setDraft((prev) => prev.map((s, j) => (j === i ? f(s) : s)))
@@ -211,7 +211,7 @@ export function Funnel() {
       ) : isLoading ? (
         <div className="text-center py-8 text-gray-500">Loading...</div>
       ) : isError ? (
-        <div className="text-center py-8 text-red-500">Could not compute the funnel.</div>
+        <div className="text-center py-8 text-red-500">{requestError(queryError, 'Could not compute the funnel.')}</div>
       ) : (data?.groups ?? []).length === 0 ? (
         <div className="bg-white rounded-lg shadow p-6 text-center text-gray-500 text-sm">No session reached the first step.</div>
       ) : (

@@ -377,7 +377,8 @@ namespace OzxApm.Network
                 // While events are flowing the worker polls every PersistIntervalMs on
                 // its own; the main thread only signals (a kernel call) when the worker
                 // is in its long idle wait, or for exceptions/crashes.
-                wake = _workerLongWait || evt is ExceptionEvent || evt is CrashEvent;
+                // APM-9: a run too (rare; its journal entry is cleared at the same time).
+                wake = _workerLongWait || evt is ExceptionEvent || evt is CrashEvent || evt is RunEvent;
                 if (wake)
                     _workerLongWait = false;
                 _pending.Add(evt);

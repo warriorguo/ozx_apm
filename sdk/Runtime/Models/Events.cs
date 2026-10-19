@@ -102,6 +102,8 @@ namespace OzxApm.Models
         public float start_rss_mb;
         public float end_alloc_mb;
         public float end_rss_mb;
+        /// <summary>When the run began (Unix ms; the journal has it too): part of its event id.</summary>
+        [NonSerialized] internal long run_start_ms;
 
         public RunEvent()
         {

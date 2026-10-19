@@ -155,6 +155,15 @@ namespace OzxApm.Core
             }
         }
 
+        /// <summary>The RSS reader failed: the last reading is no longer current (peaks are kept).</summary>
+        internal void ClearRss()
+        {
+            lock (_lock)
+            {
+                _s.Last.Rss = 0;
+            }
+        }
+
         private bool MovedLocked()
         {
             if (Math.Abs(_s.Last.Rss - _notifiedRss) < JournalStepMb && Math.Abs(_s.Last.Alloc - _notifiedAlloc) < JournalStepMb)
@@ -214,6 +223,7 @@ namespace OzxApm.Core
                 start_rss_mb = _s.RunStartRss,
                 end_alloc_mb = _s.Last.Alloc,
                 end_rss_mb = _s.Last.Rss,
+                run_start_ms = _s.RunStartMs,
             };
             _s.RunId = null;
             _s.RunStartMs = 0;

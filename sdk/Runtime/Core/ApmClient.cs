@@ -561,8 +561,9 @@ namespace OzxApm.Core
                 }
                 var previous = runs.Begin(runId);
                 if (previous != null)
-                    client.EnqueueEvent(previous); // with the previous run's context
-                GameContext.Set(RunTracker.ContextKey, runId);
+                    client.EnqueueRun(previous); // with the previous run's context
+                if (!GameContext.Set(RunTracker.ContextKey, runId))
+                    Log(LogLevel.Warning, "BeginRun: the context key runId could not be set (context full); the run is tracked, its events lack runId");
                 CrashJournal.NotifyChanged();
                 return true;
             }
@@ -595,7 +596,7 @@ namespace OzxApm.Core
                 var evt = runs.End(RunEvent.EndEnd, result);
                 if (evt == null)
                     return false;
-                client.EnqueueEvent(evt);
+                client.EnqueueRun(evt);
                 if (GameContext.Current.TryGetValue(RunTracker.ContextKey, out string current) && current == evt.run_id)
                     GameContext.Remove(RunTracker.ContextKey);
                 CrashJournal.NotifyChanged();
@@ -1112,6 +1113,25 @@ namespace OzxApm.Core
             _memory = new MemorySampler(_runs, source, statm, intervalMs);
         }
 
+        /// <summary>
+        /// Enqueues a run that ended in this process. Where the crash journal
+        /// runs, its event id is derived from the process and the run (the id
+        /// the journal's report of the same run would get, should the process
+        /// die before the journal is rewritten without the run): the server
+        /// keeps one. Any thread.
+        /// </summary>
+        internal void EnqueueRun(RunEvent evt)
+        {
+            var crash = _crash;
+            if (crash != null && _sessionManager != null)
+            {
+                var inputs = crash.Inputs;
+                evt.event_id = CrashReporter.EventId(_sessionManager.DeviceId, inputs.Pid, inputs.ProcessStartMs,
+                    CrashReporter.RunKind(evt.run_id, evt.run_start_ms));
+            }
+            EnqueueEvent(evt);
+        }
+
         /// <summary>The perf sample's memory figures (PerformanceCollector, main thread).</summary>
         internal void SampleMemory(PerfSampleEvent evt)
         {
@@ -1548,7 +1568,7 @@ namespace OzxApm.Core
                 // marked clean (a clean journal's run would be lost).
                 var openRun = _runs?.End(RunEvent.EndShutdown, null);
                 if (openRun != null)
-                    EnqueueEvent(openRun);
+                    EnqueueRun(openRun);
                 _memory?.Dispose();
 
                 // Stop collectors (ExceptionCollector enqueues its pending repeats here)

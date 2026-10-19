@@ -3,7 +3,7 @@ import { GlobalFilterBar } from '../components/FilterBar'
 import { Clipped, GroupPicker, groupLabel } from '../components/GroupPicker'
 import { useFilters } from '../hooks/useFilters'
 import { useSessionHealth } from '../hooks/useApi'
-import { formatNumber, formatPercent } from '../utils/format'
+import { formatNumber, formatPercent, requestError } from '../utils/format'
 import type { AnalysisGroup, CrashTypeName, SessionHealthRow } from '../types/api'
 
 const crashTypes: { value: CrashTypeName; label: string; hint: string }[] = [
@@ -56,12 +56,12 @@ export function Health() {
   const [group, setGroup] = useState<AnalysisGroup>({ kind: 'by', key: 'app_version' })
   const [types, setTypes] = useState<CrashTypeName[]>(defaultCrashTypes)
   const [baseline, setBaseline] = useState('')
-  const { data, isLoading, isError } = useSessionHealth(group, types, queryParams)
+  const { data, isLoading, isError, error } = useSessionHealth(group, types, queryParams)
   const rows = data?.rows ?? []
   const base = rows.find((r) => rowKey(r) === baseline)
 
   const toggle = (t: CrashTypeName) =>
-    setTypes((prev) => (prev.includes(t) ? prev.filter((x) => x !== t) : [...prev, t].sort((a, b) => crashTypes.findIndex((c) => c.value === a) - crashTypes.findIndex((c) => c.value === b))))
+    setTypes((prev) => (prev.includes(t) ? (prev.length === 1 ? prev : prev.filter((x) => x !== t)) : [...prev, t].sort((a, b) => crashTypes.findIndex((c) => c.value === a) - crashTypes.findIndex((c) => c.value === b))))
 
   return (
     <div>
@@ -73,7 +73,14 @@ export function Health() {
           Counts as a crash:
           {crashTypes.map((c) => (
             <label key={c.value} className="flex items-center gap-1 text-gray-700" title={c.hint}>
-              <input type="checkbox" checked={types.includes(c.value)} onChange={() => toggle(c.value)} aria-label={`Count ${c.label}`} />
+              <input
+                type="checkbox"
+                checked={types.includes(c.value)}
+                // At least one type: with none the server would count its defaults.
+                disabled={types.length === 1 && types.includes(c.value)}
+                onChange={() => toggle(c.value)}
+                aria-label={`Count ${c.label}`}
+              />
               {c.label}
             </label>
           ))}
@@ -98,7 +105,7 @@ export function Health() {
       {isLoading ? (
         <div className="text-center py-8 text-gray-500">Loading...</div>
       ) : isError ? (
-        <div className="text-center py-8 text-red-500">Could not load the session health.</div>
+        <div className="text-center py-8 text-red-500">{requestError(error, 'Could not load the session health.')}</div>
       ) : rows.length === 0 ? (
         <div className="bg-white rounded-lg shadow p-6 text-center text-gray-500 text-sm">No sessions in this range.</div>
       ) : (

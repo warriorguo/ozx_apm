@@ -3,7 +3,7 @@ import { GlobalFilterBar } from '../components/FilterBar'
 import { Clipped, GroupPicker, groupLabel } from '../components/GroupPicker'
 import { useFilters } from '../hooks/useFilters'
 import { useMemoryBreakdown, useRunPeaks } from '../hooks/useApi'
-import { formatMs, formatNumber } from '../utils/format'
+import { formatMs, formatNumber, requestError } from '../utils/format'
 import type { AnalysisColumn, AnalysisGroup, MemoryFigureName, RunPeakMetric, RunPeakBucket } from '../types/api'
 
 const figures: { name: MemoryFigureName; label: string; hint: string }[] = [
@@ -67,7 +67,7 @@ export function Memory() {
         {breakdown.isLoading ? (
           <div className="text-center py-6 text-gray-500">Loading...</div>
         ) : breakdown.isError ? (
-          <div className="text-center py-6 text-red-500">Could not load the memory breakdown.</div>
+          <div className="text-center py-6 text-red-500">{requestError(breakdown.error, 'Could not load the memory breakdown.')}</div>
         ) : rows.length === 0 ? (
           <div className="text-center py-6 text-gray-500 text-sm">No perf samples in this range.</div>
         ) : (
@@ -146,7 +146,7 @@ export function Memory() {
         {peaks.isLoading ? (
           <div className="text-center py-6 text-gray-500">Loading...</div>
         ) : peaks.isError ? (
-          <div className="text-center py-6 text-red-500">Could not load the run peaks.</div>
+          <div className="text-center py-6 text-red-500">{requestError(peaks.error, 'Could not load the run peaks.')}</div>
         ) : peakRows.length === 0 ? (
           <div className="text-center py-6 text-gray-500 text-sm">
             No runs in this range. Runs are sent once the game calls ApmClient.BeginRun / EndRun (SDK with APM-9).

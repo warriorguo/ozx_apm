@@ -37,6 +37,18 @@ export function formatDate(isoString: string): string {
   }
 }
 
+// The reason a request failed, for the analysis pages (APM-9): the server's
+// own message for a 400 (e.g. "time range longer than 31 days") or 503
+// ("the query took too long"), cut to 200 characters; rendered as text.
+export function requestError(err: unknown, fallback: string): string {
+  const r = (err as { response?: { status?: number; data?: unknown } } | null)?.response
+  if (r && (r.status === 400 || r.status === 503) && typeof r.data === 'string' && r.data.trim() !== '') {
+    const msg = r.data.trim()
+    return `${fallback} ${msg.length > 200 ? msg.slice(0, 200) + '…' : msg}`
+  }
+  return fallback
+}
+
 export function formatTime(isoString: string): string {
   try {
     return format(parseISO(isoString), 'HH:mm')

@@ -101,4 +101,14 @@ func TestIngest_RunsAndPerfMemory(t *testing.T) {
 	if resp.Duplicates != 1 || len(store.runs) != 2 {
 		t.Errorf("resend: %+v, %d runs", resp, len(store.runs))
 	}
+	// The journal's copy of a run (end_reason crash, the crash's time) has the
+	// live copy's id: looked up whatever its end reason, a week around.
+	last := store.lookups[len(store.lookups)-1]
+	if last.Table.Name != "apm_runs" || !last.AnyKey || last.MaxTime.Sub(last.MinTime) < 13*24*time.Hour {
+		t.Errorf("lookup %+v", last)
+	}
+	_, resp = postBatch(t, h, batchOf(sdkEventJSON("run", "r1", 9, `,"run_id":"run-42","end_reason":"crash","crash_type":"oom"`)), nil)
+	if resp.Duplicates != 1 || len(store.runs) != 2 {
+		t.Errorf("journal copy: %+v, %d runs", resp, len(store.runs))
+	}
 }

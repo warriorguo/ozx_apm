@@ -706,7 +706,7 @@ namespace OzxApm.Core
                 end_reason = crash != null ? RunEvent.EndCrash : RunEvent.EndProcessEnd,
                 crash_type = crash?.crash_type,
                 timestamp = ts,
-                event_id = EventId(j, "run"),
+                event_id = EventId(j, RunKind(j.RunId, j.RunStartMs)),
                 app_version = j.AppVersion,
                 platform = j.Platform,
                 device_model = j.DeviceModel,
@@ -766,6 +766,15 @@ namespace OzxApm.Core
 
         /// <summary>The id of another event of the process (kind "anr": an ANR it survived).</summary>
         internal static string EventId(JournalRecord j, string kind) => EventId(j.DeviceId, j.Pid, j.StartMs, kind);
+
+        /// <summary>
+        /// The kind of a run's event id (APM-9): the run id and its start. The
+        /// live EndRun event and the journal's report of the same run (the
+        /// process died before the live one reached the disk's journal state)
+        /// get the same id; the server keeps the first.
+        /// </summary>
+        internal static string RunKind(string runId, long runStartMs) =>
+            "run|" + runId + "|" + runStartMs.ToString(CultureInfo.InvariantCulture);
 
         internal static string EventId(string deviceId, int pid, long startMs, string kind)
         {

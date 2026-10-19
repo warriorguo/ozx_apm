@@ -85,6 +85,20 @@ describe('Health page (APM-9)', () => {
     await waitFor(() => expect(api.getSessionHealth).toHaveBeenLastCalledWith({ kind: 'key', key: 'dataVersion' }, expect.anything(), expect.anything()))
   })
 
+  it('keeps at least one crash type (none would make the server count its defaults)', async () => {
+    api.getSessionHealth.mockResolvedValue({ group_by: 'app_version', crash_types: [], truncated: false, rows: [row('3.1', 0.99, 0)] })
+    render(<Health />, { wrapper })
+    await screen.findByText('99.00%')
+    for (const t of ['Native', 'Java', 'OOM', 'Killed']) {
+      const box = screen.queryByLabelText(`Count ${t}`) as HTMLInputElement | null
+      if (box && box.checked && !box.disabled) fireEvent.click(box)
+    }
+    const checked = screen.getAllByRole('checkbox').filter((b) => (b as HTMLInputElement).checked) as HTMLInputElement[]
+    expect(checked).toHaveLength(1)
+    expect(checked[0].disabled).toBe(true)
+    await waitFor(() => expect(api.getSessionHealth).toHaveBeenLastCalledWith(expect.anything(), [expect.any(String)], expect.anything()))
+  })
+
   it('renders game text as text and an older server row without crashes_by_type', async () => {
     const old = row('<script>alert(1)</script>', 1, 0) as Partial<SessionHealthRow>
     delete old.crashes_by_type

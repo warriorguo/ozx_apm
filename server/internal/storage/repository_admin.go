@@ -1006,6 +1006,11 @@ func (r *Repository) getContextJankRate(ctx context.Context, f models.AdminFilte
 		return rw
 	}
 	jWhere, jArgs := tableWhere(TableJanks.Name, f)
+	// The total over every value, not only the listed ones.
+	if err := r.client.conn.QueryRow(ctx, "SELECT toInt64(count()) FROM apm_janks "+jWhere, jArgs...).Scan(&dist.Total); err != nil {
+		return fmt.Errorf("total: %w", err)
+	}
+	listed, played := 0, 0
 	jq := fmt.Sprintf(contextValueWith+`SELECT %s AS value, toInt64(count()), toInt64(uniqExact(session_id)) FROM apm_janks %s GROUP BY value ORDER BY count() DESC LIMIT %d`,
 		value, jWhere, contextRateRowsLimit)
 	err := r.queryRows(ctx, jq, append([]interface{}{key}, jArgs...), func(rows driver.Rows) error {
@@ -1016,7 +1021,7 @@ func (r *Repository) getContextJankRate(ctx context.Context, f models.AdminFilte
 		}
 		rw := row(v)
 		rw.Count, rw.Sessions = n, s
-		dist.Total += n
+		listed++
 		return nil
 	})
 	if err != nil {
@@ -1032,10 +1037,16 @@ func (r *Repository) getContextJankRate(ctx context.Context, f models.AdminFilte
 			return err
 		}
 		row(v).Minutes = m
+		played++
 		return nil
 	})
 	if err != nil {
 		return fmt.Errorf("play time: %w", err)
+	}
+	// More values than either query lists: the lists may not cover the same
+	// values (a row can lack its janks or its play time), so say so.
+	if listed >= contextRateRowsLimit || played >= contextRateRowsLimit {
+		dist.Truncated = true
 	}
 	rows := make([]models.ContextDistributionRow, 0, len(byValue))
 	for _, rw := range byValue {
