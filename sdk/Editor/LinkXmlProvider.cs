@@ -14,9 +14,15 @@ namespace OzxApm.Editor
     /// </summary>
     internal sealed class LinkXmlProvider : IUnityLinkerProcessor
     {
+        // Same content as Runtime/link.xml (LinkXmlTests compares them). TextAsset:
+        // the engine's MonoScript class (ID 115), needed by AddComponent<ApmClient>,
+        // stays under "Strip Engine Code" only while the managed TextAsset type does.
         internal const string LinkXml =
             "<linker>\n" +
             "  <assembly fullname=\"OzxApm\" preserve=\"all\"/>\n" +
+            "  <assembly fullname=\"UnityEngine.CoreModule\">\n" +
+            "    <type fullname=\"UnityEngine.TextAsset\" preserve=\"all\"/>\n" +
+            "  </assembly>\n" +
             "</linker>\n";
 
         public int callbackOrder => 0;

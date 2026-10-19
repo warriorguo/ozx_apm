@@ -8,7 +8,18 @@
   version, so OzxApm.Editor.LinkXmlProvider also hands this content to the
   linker (IUnityLinkerProcessor); a copy in the game's Assets folder is not
   needed. Cost: the SDK's own code is kept whole (about 100 KB of IL).
+
+  UnityEngine.TextAsset: ApmClient adds its component at run time
+  (AddComponent<ApmClient> on a new GameObject), which needs the engine's
+  MonoScript class (class ID 115). With "Strip Engine Code", the linker keeps
+  that native class only while the managed TextAsset type (MonoScript's base
+  in the player) survives; a game whose scenes hold no script component and
+  no TextAsset lost it (APM-7 test app: "Could not produce class with ID
+  115" 118 times at startup). Keeping the type keeps MonoScript registered.
 -->
 <linker>
   <assembly fullname="OzxApm" preserve="all"/>
+  <assembly fullname="UnityEngine.CoreModule">
+    <type fullname="UnityEngine.TextAsset" preserve="all"/>
+  </assembly>
 </linker>
