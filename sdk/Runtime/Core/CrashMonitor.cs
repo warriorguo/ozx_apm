@@ -77,7 +77,11 @@ namespace OzxApm.Core
 
         private void StartReport()
         {
-            _reporter = new CrashReporter(_dir, _source, _enqueue, _allowed, _waitPersisted) { CurrentDeviceId = _inputs.DeviceId };
+            _reporter = new CrashReporter(_dir, _source, _enqueue, _allowed, _waitPersisted)
+            {
+                CurrentDeviceId = _inputs.DeviceId,
+                UnityTombstoneDir = _inputs.UnityTombstoneDir,
+            };
             if (!_useThreads)
             {
                 _reporter.ProcessPrevious(_inputs.Pid, _inputs.ProcessStartMs);

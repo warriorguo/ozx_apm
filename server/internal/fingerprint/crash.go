@@ -1,6 +1,7 @@
 package fingerprint
 
 import (
+	"path"
 	"strconv"
 	"strings"
 )
@@ -54,8 +55,9 @@ import (
 // across builds, coarser but stable, until symbols name them (crash_site
 // still shows the address).
 // Java frames are keyed by their method. In-app: native frames of the app's
-// own libraries (no leading '/' or '['), Java frames outside the Android,
-// Java, Kotlin and Unity player packages.
+// own libraries (no leading '/' or '['; not the app's ART-compiled Java code,
+// base.vdex/.odex/.oat), Java frames outside the Android, Java, Kotlin and
+// Unity player packages.
 
 // Crash types as sent by the SDK.
 const (
@@ -367,7 +369,17 @@ func nativeInApp(module string) bool {
 	if module == "" || strings.HasPrefix(module, "/") || strings.HasPrefix(module, "[") {
 		return false
 	}
-	return !systemLibraries[ModuleBaseName(module)]
+	base := ModuleBaseName(module)
+	// The app's Java code compiled by ART (base.vdex, base.odex, ...) is
+	// not native app code: the Java frames of the Unity player below the
+	// game loop. Counted, it made a 16-frame backtrace (Unity's own
+	// tombstone, which stops before them) and the full system tombstone of
+	// the same crash two groups.
+	switch path.Ext(base) {
+	case ".vdex", ".odex", ".oat", ".art", ".dex", ".jar", ".apk":
+		return false
+	}
+	return !systemLibraries[base]
 }
 
 var javaSystemPrefixes = []string{

@@ -64,8 +64,10 @@ namespace OzxApm.Utils
             public readonly List<Thread> Threads = new List<Thread>();
             /// <summary>The normalized stack text (empty without frames).</summary>
             public string Stack = "";
-            /// <summary>"proto", "text" or "anr": what was parsed.</summary>
+            /// <summary>"proto", "text", "anr" or "unity" (Unity's own tombstone file): what was parsed.</summary>
             public string Format = "";
+            /// <summary>The crash time the file states (Unity's tombstone: "Timestamp:"), Unix ms; 0 unknown.</summary>
+            public long TimestampMs;
         }
 
         // ------------------------------------------------------------------
@@ -331,6 +333,117 @@ namespace OzxApm.Utils
             }
             if (pos > end)
                 throw new FormatException("field beyond the message");
+        }
+
+        // ------------------------------------------------------------------
+        // Unity's own tombstone file
+        // ------------------------------------------------------------------
+
+        /// <summary>Format of a result parsed from Unity's tombstone file.</summary>
+        internal const string UnityFormat = "unity";
+
+        /// <summary>
+        /// Parses the tombstone Unity's crash handler writes to
+        /// persistentDataPath ("tombstone_00".."tombstone_02", rotated) before
+        /// it forwards the signal: the same text as its "CRASH" log lines,
+        ///   *** *** *** ...
+        ///   Version '2022.3.62f3 (...)', Build type 'Release', Scripting Backend 'il2cpp', CPU 'arm64-v8a'
+        ///   Build fingerprint: '...'
+        ///   Timestamp: 2026-10-19 21:40:44.166997256+0800
+        ///   pid: 32664, tid: 32679, name: UnityMain  >>> com.ozx.apmtest <<<
+        ///   signal 11 (SIGSEGV), code -6 (SI_TKILL), fault addr --------
+        ///   (registers)
+        ///   backtrace:
+        ///         #00 pc 00000000000d0148  /apex/.../libc.so (tgkill+8) (BuildId: ...)
+        ///   (then memory maps and more: never read)
+        /// Only the text up to the end of the backtrace is parsed (the caller
+        /// reads a bounded prefix); registers are not kept. Null without a
+        /// crashed thread or pid.
+        /// </summary>
+        internal static Result ParseUnityTombstone(byte[] data, int length)
+        {
+            if (data == null || length <= 0)
+                return null;
+            try
+            {
+                length = Math.Min(length, data.Length);
+                var text = new UTF8Encoding(false, false).GetString(data, 0, length);
+                var head = new StringBuilder(Math.Min(text.Length, 16 * 1024));
+                long timestamp = 0;
+                bool inBacktrace = false;
+                foreach (var raw in ReadLines(text, 4000))
+                {
+                    string line = raw.Trim();
+                    if (inBacktrace && !line.StartsWith("#", StringComparison.Ordinal))
+                        break; // the end of the backtrace: nothing after it is read
+                    if (line == "backtrace:")
+                        inBacktrace = true;
+                    if (line.StartsWith("Timestamp: ", StringComparison.Ordinal) && timestamp == 0)
+                        timestamp = ParseTimestamp(line.Substring(11).Trim());
+                    head.Append(line).Append('\n');
+                }
+                var r = ParseTextTombstone(head.ToString());
+                if (r == null || r.Pid <= 0 || r.Threads.Count == 0 || r.Threads[0].Frames.Count == 0)
+                    return null;
+                r.TimestampMs = timestamp;
+                return Finish(r, UnityFormat);
+            }
+            catch
+            {
+                return null; // unreadable: no stack
+            }
+        }
+
+        /// <summary>
+        /// "2026-10-19 21:40:44.166997256+0800" (debuggerd's format: local time,
+        /// nanoseconds, UTC offset) to Unix ms; 0 when it does not parse.
+        /// </summary>
+        internal static long ParseTimestamp(string s)
+        {
+            if (s == null || s.Length < 19)
+                return 0;
+            if (!DateTime.TryParseExact(s.Substring(0, 19), "yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture,
+                    DateTimeStyles.None, out var local))
+                return 0;
+            int i = 19;
+            long ms = 0;
+            if (i < s.Length && s[i] == '.')
+            {
+                i++;
+                int digits = 0;
+                while (i < s.Length && s[i] >= '0' && s[i] <= '9')
+                {
+                    if (digits < 3)
+                        ms = ms * 10 + (s[i] - '0');
+                    digits++;
+                    i++;
+                }
+                for (; digits < 3; digits++)
+                    ms *= 10;
+            }
+            var offset = TimeSpan.Zero;
+            if (i < s.Length && (s[i] == '+' || s[i] == '-'))
+            {
+                string o = s.Substring(i + 1).Replace(":", "");
+                if (o.Length < 4 || !int.TryParse(o.Substring(0, 2), NumberStyles.None, CultureInfo.InvariantCulture, out int hh) ||
+                    !int.TryParse(o.Substring(2, 2), NumberStyles.None, CultureInfo.InvariantCulture, out int mm) || hh > 14 || mm > 59)
+                    return 0;
+                offset = new TimeSpan(hh, mm, 0);
+                if (s[i] == '-')
+                    offset = -offset;
+            }
+            else if (i < s.Length && s[i] != 'Z' && s[i] != ' ')
+            {
+                return 0;
+            }
+            try
+            {
+                return new DateTimeOffset(local, offset).ToUnixTimeMilliseconds() + ms;
+            }
+            catch (ArgumentException)
+            {
+                return 0;
+            }
         }
 
         // Text tombstone (Android before 12, or a text copy):

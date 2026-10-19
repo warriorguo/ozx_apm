@@ -33,6 +33,8 @@ namespace OzxApm.Core
         public Func<string> DeviceId;
         public Timeline Timeline;
         public PerformanceCollector Perf;
+        /// <summary>Where Unity's crash handler writes tombstone_NN (persistentDataPath; read by CrashReporter), null: none.</summary>
+        public string UnityTombstoneDir;
     }
 
     /// <summary>

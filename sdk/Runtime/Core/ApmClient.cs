@@ -915,16 +915,20 @@ namespace OzxApm.Core
                 return;
             IExitInfoSource source;
             int pid;
+            string unityTombstones;
             if (ExitInfoForTests != null || CrashDirForTests != null)
             {
                 source = ExitInfoForTests;
                 pid = PidForTests;
+                unityTombstones = UnityTombstoneDirForTests;
             }
             else if (Application.platform == RuntimePlatform.Android)
             {
                 var android = AndroidExitInfo.Capture();
                 source = android;
                 pid = android.Pid;
+                // Unity's crash handler writes tombstone_NN there (main thread only: read here).
+                unityTombstones = Application.persistentDataPath;
             }
             else
             {
@@ -947,6 +951,7 @@ namespace OzxApm.Core
                 Clock = _sessionManager.Clock,
                 DeviceId = () => _sessionManager.DeviceId,
                 Timeline = _timeline,
+                UnityTombstoneDir = unityTombstones,
             };
             var storage = _offlineStorage;
             bool threads = StoragePathForTests == null;
@@ -1157,6 +1162,7 @@ namespace OzxApm.Core
         /// <summary>APM-7: crash journal directory, exit records and pid for the next Initialize (enables crash reporting off Android).</summary>
         internal static string CrashDirForTests;
         internal static IExitInfoSource ExitInfoForTests;
+        internal static string UnityTombstoneDirForTests;
         internal static int PidForTests = 4242;
         internal CrashMonitor CrashMonitorForTests => _crash;
         internal OfflineStorage StorageForTests => _offlineStorage;
@@ -1189,6 +1195,7 @@ namespace OzxApm.Core
             StoragePathForTests = null;
             CrashDirForTests = null;
             ExitInfoForTests = null;
+            UnityTombstoneDirForTests = null;
             PidForTests = 4242;
         }
 

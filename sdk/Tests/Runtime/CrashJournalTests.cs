@@ -334,6 +334,166 @@ namespace OzxApm.Tests
             StringAssert.Contains("\"ctx\":{\"roomId\":\"r-12\"}", json);
         }
 
+        // ------------------------------------------------------------------
+        // Unity's own tombstone (native crash recorded as REASON_CRASH)
+        // ------------------------------------------------------------------
+
+        // The A33 run: Unity's tombstone at 21:40:44.166 (+0800), the kill (exit record) 546 ms later.
+        private static readonly long UnityCrashMs = new DateTimeOffset(2026, 10, 19, 13, 40, 44, 166, TimeSpan.Zero).ToUnixTimeMilliseconds();
+        private const int UnityPid = 32664;
+
+        private string UnityDir()
+        {
+            string d = Path.Combine(_dir, "persistent");
+            Directory.CreateDirectory(d);
+            return d;
+        }
+
+        private string WriteUnityTombstone(string dir, string name, int pid = UnityPid, string timestamp = "2026-10-19 21:40:44.166997256+0800", long writtenMs = 0)
+        {
+            string path = Path.Combine(dir, name);
+            File.WriteAllBytes(path, CrashTraceParserTests.UnityTombstone(pid, timestamp));
+            File.SetLastWriteTimeUtc(path, DateTimeOffset.FromUnixTimeMilliseconds(writtenMs > 0 ? writtenMs : UnityCrashMs + 175).UtcDateTime);
+            return path;
+        }
+
+        private List<CrashEvent> ReportCrashExit(string unityDir, int reason = ExitReasons.Crash, long exitMs = 0, int journalPid = UnityPid,
+            long startMs = 0, bool foreground = true, bool withExit = true)
+        {
+            PreviousProcess(journalPid, startMs > 0 ? startMs : UnityCrashMs - 7141, foreground);
+            var exits = new FakeExits();
+            if (withExit)
+                exits.Records.Add(new ExitRecord { Pid = journalPid, TimestampMs = exitMs > 0 ? exitMs : UnityCrashMs + 546, Reason = reason, Status = 0, Importance = 100, Description = "crash" });
+            var sink = new List<CrashEvent>();
+            var reporter = new CrashReporter(_dir, withExit ? exits : null, sink.Add, () => true, ms => true) { UnityTombstoneDir = unityDir };
+            reporter.ProcessPrevious(1, 1);
+            return sink;
+        }
+
+        [Test]
+        public void Report_CrashExitWithUnityTombstone_IsTheNativeCrash()
+        {
+            string unity = UnityDir();
+            string ours = WriteUnityTombstone(unity, "tombstone_01");
+            string older = WriteUnityTombstone(unity, "tombstone_00", 32000, "2026-10-19 21:38:40.100000000+0800", UnityCrashMs - 124_000);
+            var sink = ReportCrashExit(unity);
+
+            Assert.AreEqual(1, sink.Count);
+            var e = sink[0];
+            Assert.AreEqual("native", e.crash_type, "Unity's handler saw a fatal signal of this process");
+            Assert.AreEqual("CRASH", e.exit_reason, "Android's record is kept as it is");
+            Assert.AreEqual("SIGSEGV", e.signal);
+            Assert.AreEqual("SI_TKILL", e.signal_code);
+            StringAssert.StartsWith("Thread \"UnityMain\" tid=32679 crashed\n#00 pc 00000000000d0148 /apex/com.android.runtime/lib64/bionic/libc.so (tgkill+8)", e.stack);
+            StringAssert.Contains("#02 pc 000000000056a030 libil2cpp.so (BuildId: 96f86f45846548bd6b2d1f50893e95ab4a9408a2)", e.stack);
+            Assert.AreEqual(UnityCrashMs + 546, e.timestamp);
+            var details = ToDict(e.details);
+            Assert.AreEqual("exit_info+unity_tombstone", details["detected_by"]);
+            Assert.AreEqual("unity", details["trace"]);
+            // Unity's files are only read.
+            Assert.IsTrue(File.Exists(ours));
+            Assert.IsTrue(File.Exists(older));
+            Assert.AreEqual(2, Directory.GetFiles(unity).Length);
+        }
+
+        [Test]
+        public void Report_CrashExitWithoutAMatchingUnityTombstone_StaysJava()
+        {
+            string unity = UnityDir();
+            // Another process's tombstone.
+            WriteUnityTombstone(unity, "tombstone_00", pid: 31000);
+            Assert.AreEqual("java", ReportCrashExit(unity)[0].crash_type, "another pid");
+            TearDown();
+            SetUp();
+
+            // The same pid, written before this process started (an earlier process with that pid).
+            unity = UnityDir();
+            WriteUnityTombstone(unity, "tombstone_00", timestamp: "2026-10-19 21:40:30.000000000+0800");
+            Assert.AreEqual("java", ReportCrashExit(unity)[0].crash_type, "pid reuse: before the process start");
+            TearDown();
+            SetUp();
+
+            // The same pid, but long after the exit.
+            unity = UnityDir();
+            WriteUnityTombstone(unity, "tombstone_00", timestamp: "2026-10-19 21:41:44.000000000+0800", writtenMs: UnityCrashMs + 60_000);
+            Assert.AreEqual("java", ReportCrashExit(unity)[0].crash_type, "after the exit");
+            TearDown();
+            SetUp();
+
+            // Not a Unity tombstone name; no directory set; a missing directory.
+            unity = UnityDir();
+            WriteUnityTombstone(unity, "tombstone_01.txt");
+            WriteUnityTombstone(unity, "my_tombstone_01");
+            Assert.AreEqual("java", ReportCrashExit(unity)[0].crash_type, "names");
+            TearDown();
+            SetUp();
+            Assert.AreEqual("java", ReportCrashExit(null)[0].crash_type, "no directory");
+            TearDown();
+            SetUp();
+            Assert.AreEqual("java", ReportCrashExit(Path.Combine(_dir, "missing"))[0].crash_type, "missing directory");
+        }
+
+        [Test]
+        public void Report_NoExitRecord_UnityTombstoneMakesANativeCrash_EvenInTheBackground()
+        {
+            string unity = UnityDir();
+            WriteUnityTombstone(unity, "tombstone_02");
+            // The journal was written now (well after the test's crash time): no exit record, so the
+            // window is the process start to a minute after the journal's last write.
+            var sink = ReportCrashExit(unity, withExit: false, foreground: false);
+            Assert.AreEqual(1, sink.Count);
+            Assert.AreEqual("native", sink[0].crash_type);
+            Assert.AreEqual("journal+unity_tombstone", ToDict(sink[0].details)["detected_by"]);
+            Assert.AreEqual("", sink[0].exit_reason ?? "");
+        }
+
+        [Test]
+        public void Report_NativeExitWithItsOwnTombstone_IgnoresUnitysFile()
+        {
+            string unity = UnityDir();
+            WriteUnityTombstone(unity, "tombstone_01", pid: 12345, timestamp: "2026-10-19 21:40:44.166997256+0800");
+            PreviousProcess(12345, UnityCrashMs - 5000, true);
+            var exits = new FakeExits();
+            exits.Records.Add(new ExitRecord { Pid = 12345, TimestampMs = UnityCrashMs + 500, Reason = ExitReasons.CrashNative, Status = 11, Importance = 100 });
+            exits.Traces[12345] = CrashTraceParserTests.NativeTombstone();
+            var sink = new List<CrashEvent>();
+            new CrashReporter(_dir, exits, sink.Add, () => true, ms => true) { UnityTombstoneDir = unity }.ProcessPrevious(1, 1);
+            Assert.AreEqual("proto", ToDict(sink[0].details)["trace"]);
+            Assert.AreEqual("exit_info", ToDict(sink[0].details)["detected_by"]);
+            StringAssert.StartsWith("Thread \"UnityMain\" tid=12380 crashed", sink[0].stack);
+        }
+
+        [Test]
+        public void Report_AnOomOrAnrExit_DoesNotLookAtUnitysFiles()
+        {
+            string unity = UnityDir();
+            WriteUnityTombstone(unity, "tombstone_01");
+            Assert.AreEqual("oom", ReportCrashExit(unity, ExitReasons.LowMemory)[0].crash_type);
+        }
+
+        [Test]
+        public void Report_UnityTombstone_WithoutConsent_NothingReadOrReported()
+        {
+            string unity = UnityDir();
+            string path = WriteUnityTombstone(unity, "tombstone_01");
+            PreviousProcess(UnityPid, UnityCrashMs - 7141, true);
+            var exits = new FakeExits();
+            exits.Records.Add(new ExitRecord { Pid = UnityPid, TimestampMs = UnityCrashMs + 546, Reason = ExitReasons.Crash });
+            var sink = new List<CrashEvent>();
+            new CrashReporter(_dir, exits, sink.Add, () => false, ms => true) { UnityTombstoneDir = unity }.ProcessPrevious(1, 1);
+            Assert.AreEqual(0, sink.Count);
+            Assert.IsTrue(File.Exists(path));
+        }
+
+        [Test]
+        public void UnityTombstoneNames()
+        {
+            foreach (var n in new[] { "tombstone_00", "tombstone_1", "tombstone_0123" })
+                Assert.IsTrue(CrashReporter.IsUnityTombstoneName(n), n);
+            foreach (var n in new[] { null, "", "tombstone_", "tombstone_01234", "tombstone_0a", "tombstone_01.txt", "Tombstone_01", "x_tombstone_01" })
+                Assert.IsFalse(CrashReporter.IsUnityTombstoneName(n), n ?? "null");
+        }
+
         private static Dictionary<string, string> ToDict(string[] pairs)
         {
             var d = new Dictionary<string, string>();

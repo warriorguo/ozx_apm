@@ -2539,6 +2539,50 @@ once technical consent is granted, for the journals of earlier processes
   kills, `EXIT_SELF`, permission and package changes are not crashes.
   Without an exit record (Android 10 and older, or Android kept none) a
   journal that says foreground is reported as `unknown`.
+- **A native crash recorded as a Java crash (race on Android 16).** On the
+  A33 (Android 16, One UI), ForceCrash(AccessViolation) 5 times: 3 exits
+  were `CRASH_NATIVE` (status 11, protobuf tombstone), 2 were `CRASH`
+  ("APP CRASH(EXCEPTION)", status 0, **no trace**), with no Java exception
+  at all. Logcat of such a run: Unity's handler logs its backtrace (tag
+  `CRASH`) and writes `<persistentDataPath>/tombstone_01`, forwards the
+  signal; debuggerd writes the system tombstone and tells ActivityManager
+  (`ActivityManager: crash : com.ozx.apmtest`), which shows the crash
+  dialog and kills the process (`Killing ... crash`, 546 ms after Unity's
+  timestamp) before the signal ends it, so the exit is `CRASH`. Before
+  this change the SDK sent those as `java` "Java crash: crash" without a
+  stack: a second group. Now, when an exit has no trace (`CRASH`;
+  `CRASH_NATIVE` without a tombstone, Android 11; `SIGNALED`, `UNKNOWN`,
+  `OTHER`; no exit record at all), the report thread looks at Unity's own
+  tombstone files (`tombstone_` + 1-4 digits in `persistentDataPath`;
+  Unity rotates `tombstone_00`..`_02`, ~390 KB each, mode 600):
+  - only files modified after the process started are opened, at most 8,
+    each read up to 64 KB and parsed up to the end of the backtrace
+    (header: pid, `Timestamp:`, signal; then the backtrace). Registers,
+    the memory map and everything after the backtrace are never kept or
+    sent; install paths are reduced like the system tombstone's;
+  - it must be the journal's pid and its `Timestamp` must be after the
+    process start (an older process with the same pid: rejected) and
+    between 60 s before and 5 s after the exit (no exit record: up to 60 s
+    after the journal's last write; the journal is rewritten every 5 s);
+  - a match is reported as `native` (signal, code, the crashed thread's
+    stack; `exit_reason` stays Android's `CRASH`), `details.detected_by`
+    `exit_info+unity_tombstone` (or `journal+unity_tombstone`),
+    `details.trace` `unity`. Its fingerprint equals the `CRASH_NATIVE` runs'
+    (tested with the stacks of this run's logcat: Unity's 16 frames, the
+    system tombstone's 31 + main), with and without symbols. For that the
+    server no longer counts the app's ART-compiled Java code (`base.vdex`,
+    `.odex`, `.oat`, ...) as in-app native frames (it made the longer
+    system stack's third frame key differ); groups of native crashes whose
+    first three distinct in-app keys included such a frame get a new
+    fingerprint once (APM-7 is not released yet);
+  - Unity's files are only read, never changed or deleted (they are
+    Unity's; Unity overwrites them in rotation). Withdrawn or denied
+    consent: nothing is read (the report does not run). A real Java crash
+    (uncaught exception: no Unity tombstone of that pid) stays `java`
+    without a stack: Android keeps no trace for `CRASH`, and catching it in
+    the process would need a Java `UncaughtExceptionHandler` (a Java
+    plugin or an `AndroidJavaProxy` running C# in the dying process): not
+    done.
 - The event keeps the crashed process's fields (session, version, scene,
   device, build type, context, breadcrumbs), the exit's time, Android's
   reason, status, description, importance and PSS/RSS, the ABI, the time

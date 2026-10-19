@@ -86,6 +86,18 @@ namespace OzxApm.Core
     /// Never reported: EXIT_SELF (the app quit), permission/package changes, a
     /// clean shutdown (its journal was deleted).
     ///
+    /// Unity's own tombstone: Unity's crash handler writes the crashed
+    /// thread's backtrace to persistentDataPath/tombstone_NN before it forwards
+    /// the signal. On Android 16 (A33) ActivityManager, told of the native
+    /// crash by debuggerd, sometimes kills the process before the signal ends
+    /// it: the exit is then REASON_CRASH with no trace, like a Java crash (2 of
+    /// 5 runs). When an exit has no trace (CRASH; CRASH_NATIVE without a
+    /// tombstone, Android 11; SIGNALED, UNKNOWN, OTHER; no exit record), a
+    /// Unity tombstone of the same pid written during that process (its
+    /// Timestamp from the process start to a few seconds after the exit) makes
+    /// it a native crash with that stack. Unity's files are only read (a
+    /// bounded prefix: header and backtrace), never changed or deleted.
+    ///
     /// Runs on a background thread at startup; the crash events keep the
     /// crashed session's fields, get an event id derived from the process (a
     /// re-report after a failed write is a duplicate the server drops), and the
@@ -98,6 +110,16 @@ namespace OzxApm.Core
         internal const int MaxAnrChars = 8 * 1024 * 1024;
         internal const int PersistTimeoutMs = 3000;
         internal const string TracePrefix = "trace-";
+        /// <summary>Bytes read from a Unity tombstone (header, registers, backtrace; the memory maps after it are not read).</summary>
+        internal const int MaxUnityTombstoneBytes = 64 * 1024;
+        /// <summary>Unity tombstone files looked at (Unity rotates three).</summary>
+        internal const int MaxUnityTombstoneFiles = 8;
+        /// <summary>A Unity tombstone may be this much later than the exit record (the kill follows the crash).</summary>
+        internal const long UnityTombstoneAfterExitMs = 5000;
+        /// <summary>... and at most this much earlier (the crash precedes the kill by well under a second).</summary>
+        internal const long UnityTombstoneBeforeExitMs = 60000;
+        /// <summary>Without an exit record: at most this long after the journal's last write (it is rewritten every 5 s).</summary>
+        internal const long UnityTombstoneAfterJournalMs = 60000;
 
         private readonly string _dir;
         private readonly IExitInfoSource _source;
@@ -110,6 +132,12 @@ namespace OzxApm.Core
         /// ResetDeviceId) is deleted, never reported. Null: no check (tests).
         /// </summary>
         internal Func<string> CurrentDeviceId;
+
+        /// <summary>
+        /// Where Unity's crash handler writes its tombstones
+        /// (Application.persistentDataPath); null: not looked at.
+        /// </summary>
+        internal string UnityTombstoneDir;
 
         /// <summary>Crash events enqueued, journals without a crash, journals kept for a retry.</summary>
         internal int Reported, NotCrashes, Kept;
@@ -229,6 +257,8 @@ namespace OzxApm.Core
                     trace = ReadTrace(exit);
                     TryDelete(exit.TracePath);
                 }
+                if (trace == null && MayBeNativeWithoutTrace(exit))
+                    trace = FindUnityTombstone(j, exit);
                 var evt = Build(j, exit, trace);
                 if (evt == null)
                 {
@@ -260,6 +290,114 @@ namespace OzxApm.Core
                     best = e;
             }
             return best;
+        }
+
+        // Exits after which a Unity tombstone of the process is looked for.
+        private static bool MayBeNativeWithoutTrace(ExitRecord e)
+        {
+            if (e == null)
+                return true;
+            switch (e.Reason)
+            {
+                case ExitReasons.Crash:
+                case ExitReasons.CrashNative:
+                case ExitReasons.Signaled:
+                case ExitReasons.Unknown:
+                case ExitReasons.Other:
+                    return true;
+                default:
+                    return false;
+            }
+        }
+
+        /// <summary>
+        /// Unity's tombstone of the journal's process: same pid, written from
+        /// the process start up to shortly after the exit (or the journal's
+        /// last write without an exit record). The newest such; null without.
+        /// </summary>
+        internal CrashTraceParser.Result FindUnityTombstone(JournalRecord j, ExitRecord exit)
+        {
+            if (string.IsNullOrEmpty(UnityTombstoneDir))
+                return null;
+            long from = j.StartMs - 1000; // a tombstone before the process started is another process's (pid reuse)
+            long to;
+            if (exit != null && exit.TimestampMs > 0)
+            {
+                from = Math.Max(from, exit.TimestampMs - UnityTombstoneBeforeExitMs);
+                to = exit.TimestampMs + UnityTombstoneAfterExitMs;
+            }
+            else
+            {
+                to = Math.Max(j.WrittenMs, j.StartMs) + UnityTombstoneAfterJournalMs;
+            }
+            try
+            {
+                if (!Directory.Exists(UnityTombstoneDir))
+                    return null;
+                CrashTraceParser.Result best = null;
+                int looked = 0;
+                foreach (var path in Directory.GetFiles(UnityTombstoneDir, "tombstone_*"))
+                {
+                    if (!IsUnityTombstoneName(Path.GetFileName(path)))
+                        continue;
+                    if (++looked > MaxUnityTombstoneFiles)
+                        break;
+                    long written = new DateTimeOffset(File.GetLastWriteTimeUtc(path)).ToUnixTimeMilliseconds();
+                    if (written < from)
+                        continue; // older than the process: not read
+                    var r = ReadUnityTombstone(path);
+                    if (r == null || r.Pid != j.Pid)
+                        continue;
+                    long at = r.TimestampMs > 0 ? r.TimestampMs : written;
+                    if (at < from || at > to)
+                        continue;
+                    if (r.TimestampMs <= 0)
+                        r.TimestampMs = written;
+                    if (best == null || r.TimestampMs > best.TimestampMs)
+                        best = r;
+                }
+                return best;
+            }
+            catch (Exception ex)
+            {
+                ApmClient.ReportInternalError("CrashReporter.UnityTombstone", ex);
+                return null;
+            }
+        }
+
+        // "tombstone_" and 1 to 4 digits (Unity: tombstone_00 .. tombstone_02).
+        internal static bool IsUnityTombstoneName(string name)
+        {
+            const string prefix = "tombstone_";
+            if (name == null || !name.StartsWith(prefix, StringComparison.Ordinal))
+                return false;
+            int n = name.Length - prefix.Length;
+            if (n < 1 || n > 4)
+                return false;
+            for (int i = prefix.Length; i < name.Length; i++)
+            {
+                if (name[i] < '0' || name[i] > '9')
+                    return false;
+            }
+            return true;
+        }
+
+        private static CrashTraceParser.Result ReadUnityTombstone(string path)
+        {
+            byte[] data;
+            int read = 0;
+            using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            {
+                data = new byte[(int)Math.Min(fs.Length, MaxUnityTombstoneBytes)];
+                while (read < data.Length)
+                {
+                    int r = fs.Read(data, read, data.Length - read);
+                    if (r <= 0)
+                        break;
+                    read += r;
+                }
+            }
+            return CrashTraceParser.ParseUnityTombstone(data, read);
         }
 
         private static CrashTraceParser.Result ReadTrace(ExitRecord exit)
@@ -326,6 +464,9 @@ namespace OzxApm.Core
         internal static CrashEvent Build(JournalRecord j, ExitRecord e, CrashTraceParser.Result trace)
         {
             string type = Classify(j, e, out bool foreground);
+            bool unity = trace != null && trace.Format == CrashTraceParser.UnityFormat;
+            if (unity)
+                type = "native"; // Unity's handler wrote the backtrace of a fatal signal of this process
             if (type == null)
                 return null;
             var evt = new CrashEvent
@@ -373,7 +514,7 @@ namespace OzxApm.Core
 
             var details = new List<string>
             {
-                "detected_by", e != null ? "exit_info" : "journal",
+                "detected_by", (e != null ? "exit_info" : "journal") + (unity ? "+unity_tombstone" : ""),
                 "journal_age_ms", Math.Max(0, evt.timestamp - j.WrittenMs).ToString(CultureInfo.InvariantCulture),
                 "uptime_ms", Math.Max(0, evt.timestamp - j.StartMs).ToString(CultureInfo.InvariantCulture),
                 "trace", trace != null ? trace.Format : (e != null && (e.Reason == ExitReasons.CrashNative || e.Reason == ExitReasons.Anr) ? "none" : "n/a"),
