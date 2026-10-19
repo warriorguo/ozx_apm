@@ -543,7 +543,7 @@ namespace OzxApm.Core
         {
             foreground = j.Foreground || (e != null && e.Importance > 0 && e.Importance <= 200);
             if (j.Clean)
-                return null; // Shutdown/quit: whatever Android recorded (SIGNALED at quit), not a crash
+                return e != null && e.Reason == ExitReasons.Anr ? "anr" : null; // Shutdown/quit: not a crash (SIGNALED at quit), but an ANR is one
             if (e == null)
                 return j.Foreground ? "unknown" : null;
             switch (e.Reason)

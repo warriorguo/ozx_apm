@@ -671,6 +671,11 @@ namespace OzxApm.Tests
                 Assert.AreEqual(c.want, got, ExitReasons.Name(c.reason) + " fg=" + c.fg + " importance=" + c.importance);
             }
             Assert.AreEqual("unknown", CrashReporter.Classify(new JournalRecord { Foreground = true }, null, out _));
+            // A clean quit: nothing but an ANR is a crash.
+            Assert.IsNull(CrashReporter.Classify(new JournalRecord { Foreground = true, Clean = true }, null, out _));
+            Assert.IsNull(CrashReporter.Classify(new JournalRecord { Foreground = true, Clean = true }, new ExitRecord { Reason = ExitReasons.Signaled, Importance = 100 }, out _));
+            Assert.IsNull(CrashReporter.Classify(new JournalRecord { Foreground = true, Clean = true }, new ExitRecord { Reason = ExitReasons.LowMemory, Importance = 100 }, out _));
+            Assert.AreEqual("anr", CrashReporter.Classify(new JournalRecord { Clean = true }, new ExitRecord { Reason = ExitReasons.Anr, Importance = 400 }, out _));
             Assert.IsNull(CrashReporter.Classify(new JournalRecord { Foreground = false }, null, out _));
         }
 
