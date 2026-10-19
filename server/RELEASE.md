@@ -3967,3 +3967,317 @@ text: redeploy the previous admin.
 - How often real games hit the 20-a-minute limit, and whether 1.5x / +8 ms
   and the 250 ms gap match what players perceive: to be reviewed with
   production data.
+
+## APM-10: session export in OZX's AiTelemetry format, the game clock (t, frame), typed custom event properties (additive schema change)
+
+Deploy order: **server (apps 36 and 38), then admin UI; SDK builds at any
+time.** Every step works without the others: an older server ignores the
+SDK's `t` / `frame` and stores typed properties as text (as it always did
+for a JSON number in `props`), so nothing the new SDK sends is lost, only
+the types and the clock of those rows; the previous admin UI works with
+this server; the new admin UI's Download link needs this server (404
+before).
+
+### What the export is, and why a directory
+
+OZX's offline tools do not read one JSONL stream: `scripts/ai_trace.py`
+opens a session **directory** (`session.json`, `playermovement.jsonl`,
+`encounter.jsonl`, `room<NN>_<roomId>/<enemy>_<id>-wave<k>_event.jsonl`),
+and the verify-ticket skill reads `session.json` (`gitCommit`), `level.json`,
+`runstart.jsonl`, `loot.jsonl`, `placement.jsonl` ... by name
+(`Documents/Shared/AITelemetry.md`). So the export is that directory, zipped:
+
+```
+<YYYY-MM-DD_HHMMSS>_<session id>/      the session's start (UTC); the id reduced to [A-Za-z0-9_-]
+  session.json        AiTelemetry's keys APM knows (below) + "apm"
+  <channel>.jsonl     custom events named "<channel>.<ev>": playermovement.jsonl, encounter.jsonl,
+                      runstart.jsonl, loot.jsonl, progression.jsonl, ... whatever OZX sends
+  custom.jsonl        custom events without a channel in their name (room_enter, run_start, ...)
+  apm.jsonl           APM's own events, and everything without the client's game clock
+```
+
+`GET /api/sessions/export?session_id=S[&at=T][&start_time&end_time]` returns
+it (`application/zip`, `Content-Disposition: attachment;
+filename="<dir>.zip"`); the admin's session time line has a **Download
+(AiTelemetry JSONL)** link over the range the time line was read with. Then:
+
+```bash
+unzip 2026-10-20_090000_1761000000000_a10a10a1.zip -d /tmp/x
+python3 scripts/ai_trace.py /tmp/x/2026-10-20_090000_1761000000000_a10a10a1
+```
+
+Not exported, because APM does not record them (AITelemetry.md lists the
+files as optional; their absence is "expected" for the verify-ticket skill):
+`level.json` (the generated level document), the per-enemy files and room
+directories (AI state machine telemetry is Editor-only), `sampleHz` /
+`unityVersion` / `maxRetainedSessions` in session.json. ai_trace.py's enemy
+sections are then empty; its overview, player deaths and death slices work.
+
+### Line format
+
+Every line of a channel file and of `custom.jsonl` is AiTelemetry's: the
+leading fields **`t`** (4 decimals), **`frame`**, **`run`**, **`ev`**, then
+the event's properties, keys sorted:
+
+```json
+{"t":6.6600,"frame":378,"run":1,"ev":"damaged","amount":34.322,"damageType":"Physical","hitDirection":{"x":0.347,"y":-0.938},"hitPosition":{"x":4.972,"y":1.290},"isCrit":false,"pos":{"x":4.990,"y":1.021},"rawAmount":70.000,"remainingHp":1372.178,"roomId":"f0_room_0_0","srcId":"rail_heavy","srcInstanceId":2,"srcKind":"EnemyProjectile","srcTypeId":"rail_heavy"}
+```
+
+- `t` and `frame` are **the client's** (below). A row without them (an SDK
+  before APM-10, a count of calls beyond the budget, a metric window, a
+  crash reported at the next launch) is **never** written to a channel file:
+  it goes to `apm.jsonl` without `t` / `frame`. The server never derives
+  them (not from the wall clock, not by interpolation). session.json's
+  `apm.linesWithoutGameClock` counts them.
+- `run`: AiTelemetry's run number in the session: 1 for the first distinct
+  value of the game context key `runId` (APM-9 `BeginRun`) in the session's
+  time order, 2 for the second, ...; 0 for rows without a run. The ids are in
+  session.json (`apm.runs: [{"run":1,"runId":"..."}]`). An APM session (a
+  foreground session of the SDK, split after a long background) is the
+  export's unit: a run that spans two APM sessions is run 1 in the second
+  one's export too.
+- `ev`: the part of the custom event name after the first `.` (channel
+  files), the whole name (`custom.jsonl`).
+- Properties: numbers and booleans sent with `ApmClient.Event` are written
+  as JSON numbers and booleans, **with the client's text** (`70.000`, as
+  AiTelemetry's `Num` writes it); a pair of numbers `<k>.x` / `<k>.y` is
+  written as `"<k>":{"x":..,"y":..}` (AiTelemetry's `Vec`), unless `<k>` is a
+  property itself; everything else is a string (TrackEvent's properties,
+  old SDKs). Properties named `t`, `frame`, `run` or `ev` are left out
+  (counted in `apm.droppedProps`).
+- Lines of one file are in time order (the event's wall-clock time, then the
+  SDK's sequence number), i.e. the order the game recorded them.
+- The channel is `[a-z0-9][a-z0-9_]{0,47}`; `apm`, `custom`, `session` and
+  `level` are reserved: such names, uppercase, `-` or nothing before the dot
+  make the event a `custom.jsonl` line. File names come only from that rule
+  (no path from the client reaches the archive).
+
+`apm.jsonl` (APM-only, new `ev` names; ai_trace.py does not read it): every
+line has `run`, `ev`, `ts` (the event's time, UTC, ms) and `t` / `frame`
+when the client sent them, then:
+
+| `ev` | fields |
+|---|---|
+| `apm_exception` | scene, fingerprint, exceptionType, logType, message (2000 chars), throwSite, callSite, count, errorSeq, unhandled, ctxMerged, stack (4000 chars) |
+| `apm_crash` | scene, crashType, fingerprint, summary, exitReason, foreground, stack (4000 chars) |
+| `apm_jank` | scene, durationMs, maxFrameMs, recentGcCount, recentGcAllocKb |
+| `apm_scene_load` / `apm_startup` | sceneName, loadMs, activateMs / phase1Ms, phase2Ms, ttiMs |
+| `apm_run` | scene, runId, endReason, result, crashType, durationMs, samples, peakMemMb, peakAllocMb, peakReservedMb, peakGfxMb, peakRssMb (APM-9; `run` from its own run_id) |
+| `apm_custom_metric` | scene, name, unit, count, sum, min, max, windowMs, ctxMerged |
+| `apm_perf_sample` | scene, fps, frameMs, mainMs, gcAllocKb, memMb, memAllocMb, memRssMb |
+| `apm_custom_event` | name, count, aggregated, ctxMerged, props (typed, as above): custom events without the clock |
+
+`session.json`: `startedAt` (the session's start, from an exception's
+`session_ms`, else its first row; UTC, ISO 8601), `scene` (the first row's
+scene), `gitCommit` (the game context key `gitCommit`, `null` when not set),
+`dataSource` / `dataPackVersion` / `dataPackSha256` (the context keys of
+those names, when set), `timeBase` (what `t` is), `source: "ozx-apm"`, and
+`apm`: format version, session/device id, version, platform, device, OS,
+build type, first/last row, export time, runs, lines per file, lines
+without the clock, dropped properties, `truncated` (below).
+
+Untrusted text (names, properties, messages, stacks, context values) is
+written with Go's JSON encoder: quotes, backslashes, newlines and every
+control character escaped, U+2028/U+2029 escaped, invalid UTF-8 replaced:
+each line is exactly one JSON object whatever the game logged (tested with
+newlines, NUL, `"},{"ev":"x`, emoji, invalid bytes, through ClickHouse too).
+
+### The game clock: `t` and `frame` (SDK)
+
+AiTelemetry's `t` is `Time.time` (scaled game time: it stops when the game
+is paused or `timeScale` is 0) relative to the recording's start, `frame` is
+`Time.frameCount`. The SDK sends (`Core/GameClock.cs`):
+
+- `t` = `Time.timeAsDouble` (Unity 2020.2+; `Time.time` before): the scaled
+  game time **since the player started** (in a player build the recording
+  start of AiTelemetry is the same moment within the first frames; the
+  export's `session.json` says so in `timeBase`). `frame` = `Time.frameCount`.
+- Read live on the main thread (constant within a frame). Unity's Time API
+  is main-thread only: on another thread the values are those of the last
+  frame the SDK saw (`GameClock.Tick`, first thing in `ApmClient.Update`,
+  i.e. the frame running while that thread records). Before the first frame
+  (or outside Unity) there is none.
+- Which events carry it: custom events sent one by one (the call's clock),
+  exceptions (their first occurrence's, repeat counts the first repeat's),
+  and events enqueued when they happen (perf samples, janks: the frame the
+  jank was reported in, scene loads, startup, runs: EndRun's). Not: counts
+  of calls beyond the budget and metric windows (they span many moments),
+  crashes reported at the next launch.
+- Cost (Unity's Mono outside Unity, M-series Mac, the engine read replaced
+  by a delegate): `Tick` 0.021 us per frame, `Now` 0.007 us (main thread) /
+  0.021 us (other thread, an uncontended lock), 0 bytes; writing `t`/`frame`
+  0.1 us, 0 bytes. The two engine properties themselves (`Time.timeAsDouble`,
+  `Time.frameCount`) are internal calls of tens of ns, not measured here.
+
+Wire: `"t":12.4098,"frame":704` after the common fields; absent when there
+is none. Server: validated into `game_t Nullable(Float64)` / `frame
+Nullable(Int64)` (`processor.NormalizeGameClock`): `t` a finite number in
+[0, 1e9), `frame` an integer in [0, 2^31); both or neither; a value of the
+wrong shape never fails the event (NULL).
+
+### Typed properties: `ApmClient.Event` (SDK)
+
+```csharp
+ApmClient.Event("playermovement.damaged")
+    .Num("amount", amount).Num("rawAmount", raw).Num("remainingHp", hp)
+    .Str("srcId", srcId).Str("srcKind", kind.ToString()).Str("srcTypeId", typeId).Int("srcInstanceId", instanceId)
+    .Str("damageType", type).Bool("isCrit", crit)
+    .Vec("hitDirection", dir.x, dir.y).Vec("hitPosition", hit.x, hit.y).Vec("pos", pos.x, pos.y).Str("roomId", roomId)
+    .Send();
+```
+
+- `Str`, `Int`, `Num(key, value, decimals = 3)` (fixed decimals, half away
+  from zero, as AiTelemetry's `Num`; NaN/infinity left out with a warning),
+  `Bool`, `Vec(key, x, y)` (two numbers `key.x` / `key.y`, 3 decimals).
+  A value type (`ApmEvent`), built in a per-thread buffer: build and send on
+  one thread; starting another event on the same thread abandons the first
+  (its `Send` returns false). Not collecting (before Initialize, no technical
+  consent, custom events off): every call is a no-op without allocation.
+- Everything else is `TrackEvent`'s (APM-6): name and key rules, 64
+  properties, 256 characters per value, ~4 KB, the per-minute budget, the
+  breadcrumb time line (`Event: playermovement.damaged amount=34.322 ...`),
+  the game context.
+- Wire: the values unquoted in `props` (`"amount":34.322,"isCrit":false,
+  "pos.x":4.990`). Server: `props` keeps every value as its text (as before:
+  funnels, distributions, the time line read it unchanged), the new
+  `prop_types Map(LowCardinality(String), UInt8)` has 1 for a number (that
+  parses as a finite float64) and 2 for a boolean.
+- `ApmConfig.MaxCustomEventsPerNamePerMinute` (default 10, as before; was a
+  constant): with `MaxCustomEventsPerMinute` (default 60) it decides how many
+  calls are sent one by one. **Beyond the budget, calls are counted without
+  properties and without the clock: they are not AiTelemetry lines** (one
+  `apm_custom_event` count per name, context and minute in `apm.jsonl`). A
+  game that wants complete channel files raises both for the channels it
+  sends (cost: about 150-900 bytes per event on the wire and on disk).
+- Cost (same bench): `Event` with two strings and a vector, sent: 0.44 us,
+  400 B; the damage line above (15 fields): 1.6 us, 896 B; beyond the budget
+  0.2-0.4 us, 88-184 B (the properties still go onto the time line);
+  `TrackEvent(name, k, v)`: 0.16 us, 264 B (APM-6 measured 240 B; the event is 24 bytes larger: the clock and the property types). Writing the
+  typed damage event (storage worker): 0.8 us, 0 B. Per call, never per
+  frame unless the game sends per frame.
+
+### OZX integration (OZX-1277): what OZX must send
+
+One event definition for AiTelemetry and APM: OZX's emitter writes each
+overlapping line to AiTelemetry (Editor) and, in players, to APM with the
+same channel, `ev` and field names:
+
+| AiTelemetry | APM call |
+|---|---|
+| `runstart` `run` | `ApmClient.BeginRun(runId)` **then** `ApmClient.Event("runstart.run").Send()` (the run number comes from the context key runId) |
+| `runstart` `death` / `revive` / `end` | `Event("runstart.death")` ... ; `end` **before** `ApmClient.EndRun(reason)` (EndRun removes runId from the context) |
+| `playermovement` `room_enter` / `room_exit` / `damaged` / `died` / `revived` / `healed` | `Event("playermovement.<ev>")` with `roomId`, `pos` (Vec), `killerId`, `killerTypeId`, `hit0T` ... |
+| `encounter` `room_ready` / `room_cleared` / `room_exit` | `Event("encounter.<ev>")` with `roomId`, `folder`, `isCave` (Bool) |
+| `loot` `drop` | `Event("loot.drop")` with `item`, `src`, `table`, `enemy`, `room`, `stage`, `pos`, `pin` (Bool) |
+
+Rules: field types as AiTelemetry writes them (`Num`/`Int` -> `Num`/`Int`,
+`Bool` -> `Bool`, `Vec` -> `Vec`, strings -> `Str`; omit a field rather than
+sending an empty string); `t`, `frame`, `run`, `ev` are never properties (the
+SDK and the export provide them); no personal data in any field
+(APM-6 rule); the `hit<N>T` times of `died` are AiTelemetry `t` values: send
+them from the same clock (`Time.timeAsDouble`). Arrays (`placement.cells`,
+`grant` lists) have no APM type: send them as strings or not at all.
+Channels with many lines per minute (damage, move samples) exceed the
+default budget: raise it for them or leave them out (AiTelemetry's `move`
+samples at 10 Hz are not meant for APM).
+
+### Schema
+
+`Migrate` adds (also in `scripts/migrate.sql`; `ALTER TABLE ... ADD COLUMN IF
+NOT EXISTS`, metadata only, within the `apm` account's grant, idempotent):
+
+- every event table (perf samples, janks, startups, scene loads,
+  exceptions, crashes, custom events, custom metrics, runs): `game_t
+  Nullable(Float64)`, `frame Nullable(Int64)`, last;
+- `apm_custom_events`: `prop_types Map(LowCardinality(String), UInt8)`,
+  before them.
+
+Fresh tables have the same columns in the same order (`CREATE TABLE`, a
+unit test). Rows of older binaries and SDKs read NULL / an empty map.
+
+### Cost and limits of the export
+
+The admin API and ingest share one 10-connection ClickHouse pool. One
+export:
+
+- 2 + 9 queries (the session's span: the time line's first query; the
+  session.json context keys; one per table over the session's span, by the
+  `idx_session_id` index where it exists, `ORDER BY timestamp, seq LIMIT`),
+  **one after another**, each holding one of the time line's 4 shared query
+  slots (time lines and exports together never hold more than 4
+  connections), cancelled with the request or after 25 s (below the admin
+  server's 30 s write timeout).
+- **One export at a time** per server process; a second request waits for
+  it (or its own deadline).
+- Rows per table: custom events 20000, perf samples 10800 (3 hours at 1/s),
+  exceptions 2000 (message 2000 and stack 4000 characters), crashes 200, the
+  others 5000 each; the **earliest** rows are kept and a table with more is
+  listed in `apm.truncated` and the `X-Apm-Export-Truncated` header. The files
+  are at most 32 MB uncompressed: lines are added in time order up to it
+  (`bytes` in truncated). The zip is built in memory (deflate) and sent with
+  its length.
+- Estimated (not measured at production volume): per table the time line's
+  per-type query reads the same granules (APM-15 measured 46-60 ms for a
+  whole time line on a 14 M row database; the export reads up to 20 times
+  more rows of a long session's custom events and perf samples, which are
+  still one or two daily partitions of one session).
+
+### Rolling deploy and rollback
+
+Old and new binaries serve side by side: the old binary names its insert
+columns (its rows get NULL clocks and empty `prop_types`), ignores `t` /
+`frame`, and stores typed properties as text; the new one exports rows of
+both. **Rollback:** redeploy the previous server and admin UI; no schema
+action; the columns stay (unused). SDK builds with APM-10 work with every
+server version (the previous ones ignore the new fields). To remove the
+columns after a permanent rollback (admin; mutations):
+`ALTER TABLE <t> DROP COLUMN game_t, DROP COLUMN frame` per event table and
+`ALTER TABLE apm_custom_events DROP COLUMN prop_types`.
+
+### Verified
+
+- Server: `go vet ./...`, `go test -race -short ./...` (all packages pass):
+  the clock's validation (14 shapes), property types (numbers, booleans,
+  look-alike strings, 1e400, a cut number), the SDK-serialized fixture
+  (`processor/testdata/sdk_events_apm10.jsonl`, written by the APM-10 SDK on
+  Unity's Mono: `ApmClient.Event`'s builder, a TrackEvent, an exception, a
+  jank, a count beyond the budget) through ingest (clock, types, NULL for
+  the count) and through the export (the exact lines of every file), hostile
+  text, the channel rule, the byte limit, the zip, the handler (zip, headers,
+  400/404/500), the export queries (every value bound, every event table
+  once, earliest rows), one export at a time, the schema (columns last,
+  same order fresh and migrated, migrate.sql regenerated).
+- **ai_trace.py on the export** (`OZX_AI_TRACE=<ozx>/scripts/ai_trace.py go
+  test ./internal/sessionexport -run AiTrace -v`; `python3 -I`, OZX's script
+  unmodified): it reads the exported directory without an error: session
+  metadata (started, scene, commit, timeBase), `PLAYER DEATHS (1)` at t=30.08
+  by quick_sand_worm in f0_room_1_0 with 7 live enemies, the death slice,
+  0 anomalies (no corrupt line, no unreadable file); `--json` gives the
+  death's `pos {x:1.703, y:8.09}` and `killerTypeId`. The enemy sections are
+  empty (APM has no per-enemy files).
+- Admin UI: `tsc`, vitest (the Download link over the time line's range,
+  the session id encoded), `vite build`.
+- SDK: compiles at C# 8 (Android, iOS, with and without
+  `UNITY_2020_2_OR_NEWER`/`UNITY_2021_2_OR_NEWER`); on Unity's Mono outside
+  Unity the runtime tests pass (new: `GameClockTests`, `ApmEventTests`: live
+  vs cached clock across threads, stamping rules, the wire format, fixed
+  decimals, the JSON-number guard, typed and vector properties, invalid
+  values left out with kinds aligned, the per-name budget, aggregated counts
+  without a clock, exceptions with their occurrence's clock, abandoned and
+  re-sent builders), except the 2 environment failures as before; the 2 new
+  allocation tests need the Unity runtime.
+
+### Not verified (for the lead)
+
+- The integration tests (`tests/integration/apm10_test.go`: the SDK
+  fixture through ingest -> ClickHouse -> export on both insert paths, with
+  ai_trace.py when `OZX_AI_TRACE` is set; hostile text through ClickHouse;
+  rows of the pre-APM-10 binary) and the migration tests with the new
+  columns: not run (the sandbox cannot reach ClickHouse).
+- Unity EditMode (the 2 allocation tests), a device run
+  (`/tmp/claude-501/apm10/DEVICE_PLAN.md`), the per-frame cost of
+  `Time.timeAsDouble`/`frameCount` on a device (expected: `update_ms` p50
+  unchanged).
+- The export's cost at production volume; the admin link in a browser
+  (jsdom only); verify-ticket on an export (it is a skill run by an agent in
+  the OZX repo; its inputs are the files above, checked by name and format).

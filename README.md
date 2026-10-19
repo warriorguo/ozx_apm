@@ -231,6 +231,31 @@ ApmClient.SetContextCount("aliveEnemies", aliveCount);   // "0", "1-5", "6-10", 
   minute of play and FPS p05 by any context key. Details: `server/RELEASE.md`
   (APM-9).
 
+### Typed events and the session export (OZX AiTelemetry format)
+
+```csharp
+ApmClient.BeginRun(runId);
+ApmClient.Event("runstart.run").Send();
+ApmClient.Event("playermovement.room_enter").Str("roomId", roomId).Vec("pos", p.x, p.y).Send();
+ApmClient.Event("loot.drop").Str("item", item).Str("src", "enemy").Bool("pin", false).Vec("pos", p.x, p.y).Send();
+```
+
+- `ApmClient.Event(name)`: a custom event with typed properties (`Str`,
+  `Int`, `Num` with 3 fixed decimals by default, `Bool`, `Vec` as `key.x` /
+  `key.y`), otherwise `TrackEvent` (limits, budget, time line). Any thread;
+  build and send on one thread; nothing allocated when not collecting.
+- Every event the SDK records while the game runs carries the game clock:
+  `t` (`Time.timeAsDouble`, scaled game time) and `frame`
+  (`Time.frameCount`), as OZX's AiTelemetry lines do.
+- The admin's session time line has **Download (AiTelemetry JSONL)**
+  (`GET /api/sessions/export?session_id=S`): a zip of an AiTelemetry session
+  directory (`session.json`, `<channel>.jsonl` for events named
+  `<channel>.<ev>`, `custom.jsonl`, `apm.jsonl` for APM's own events) that
+  OZX's `scripts/ai_trace.py` reads as is. Events beyond the per-minute
+  budget (`MaxCustomEventsPerMinute`, `MaxCustomEventsPerNamePerMinute`) are
+  only counted and are not in the channel files. Details, the line format and
+  what OZX must send: `server/RELEASE.md` (APM-10).
+
 ### Privacy consent
 
 Two categories, each `Undecided`, `Granted` or `Denied`: `Technical`
@@ -434,6 +459,17 @@ All take the common filter (time range, at most 31 days; `app_version`,
 - **GET /api/health/sessions[?by=..|key=dataVersion][&crash_types=native,java,oom,killed][&user_kills=1]** - crash-free sessions and users (force-stops by the player are not crashes unless `user_kills=1`), ANR and exception rates
 - **GET /api/funnel?steps=[{"name":"run_start"},{"name":"room_enter","props":{"roomType":"boss"}}][&window=7200][&by=app_version]** - sessions per step and conversion
 - **GET /api/context/distribution?key=aliveEnemies&metric=fps&bucket=count** - also `metric=jank_rate`
+
+### Session export (admin server, APM-10)
+
+**GET /api/sessions/export?session_id=S[&at=T][&start_time&end_time]** - a
+zip of the session in OZX's AiTelemetry session directory format (range as
+the time line's: at +- 24 h, else 7 days, at most 31; 404 if the session has
+no row in it). One export at a time; limits and format: `server/RELEASE.md`.
+```bash
+curl -o session.zip "http://localhost:8081/api/sessions/export?session_id=$SESSION_ID"
+unzip session.zip -d /tmp/s && python3 scripts/ai_trace.py /tmp/s/*/
+```
 
 ## Event Types
 
