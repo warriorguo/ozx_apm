@@ -87,6 +87,15 @@ namespace OzxApm.Core
         public int MaxCustomEventsPerMinute { get; set; } = 60;
 
         /// <summary>
+        /// Of MaxCustomEventsPerMinute, at most this many of one event name per
+        /// minute (so one frequent name cannot use up the budget of the others;
+        /// APM-10: a game that exports sessions in AiTelemetry's format, where
+        /// e.g. every hit the player takes is a line, raises both). Values
+        /// below 1 read as 1.
+        /// </summary>
+        public int MaxCustomEventsPerNamePerMinute { get; set; } = 10;
+
+        /// <summary>
         /// Native crashes, ANRs and kills by the system (APM-7), Android player
         /// only: a crash journal (session, context, breadcrumbs, recent warnings
         /// and errors, scene, foreground) is kept on disk while the game runs,

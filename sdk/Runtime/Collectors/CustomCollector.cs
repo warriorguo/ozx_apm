@@ -154,6 +154,7 @@ namespace OzxApm.Collectors
         }
 
         private int MaxEventsPerWindow => Math.Max(0, _config.MaxCustomEventsPerMinute);
+        private int MaxEventsPerName => Math.Max(1, _config.MaxCustomEventsPerNamePerMinute);
 
         public void Start()
         {
@@ -185,7 +186,7 @@ namespace OzxApm.Collectors
             if (_eventsSent >= MaxEventsPerWindow)
                 return false;
             _sentPerName.TryGetValue(name, out int sent);
-            if (sent >= MaxEventsPerNamePerMinute || (sent == 0 && _sentPerName.Count >= MaxBudgetNames))
+            if (sent >= MaxEventsPerName || (sent == 0 && _sentPerName.Count >= MaxBudgetNames))
                 return false;
             _sentPerName[name] = sent + 1;
             _eventsSent++;
@@ -253,7 +254,14 @@ namespace OzxApm.Collectors
         /// ValidateProps), kept as is; null for none. False if not collecting
         /// or the name is invalid.
         /// </summary>
-        internal bool TrackEvent(string name, string[] props)
+        internal bool TrackEvent(string name, string[] props) => TrackEvent(name, props, null);
+
+        /// <summary>
+        /// TrackEvent with the JSON type of each property (kinds: one PropKinds
+        /// value per pair, validated with ValidateProps; null: all strings).
+        /// The event carries the game's clock (APM-10, GameClock) of the call.
+        /// </summary>
+        internal bool TrackEvent(string name, string[] props, byte[] kinds)
         {
             if (!_isActive)
                 return false;
@@ -264,6 +272,7 @@ namespace OzxApm.Collectors
             }
             long now = Timeline.NowMs();
             var ctx = GameContext.Current;
+            bool clock = GameClock.Now(out double gameT, out int frame);
 
             CustomEvent evt = null;
             List<BaseEvent> closed;
@@ -278,7 +287,12 @@ namespace OzxApm.Collectors
                 _eventsTracked++;
                 if (TakeBudgetLocked(name))
                 {
-                    evt = new CustomEvent { timestamp = now, name = name, props = props, ctx = ctx };
+                    evt = new CustomEvent { timestamp = now, name = name, props = props, prop_kinds = props != null ? kinds : null, ctx = ctx };
+                    if (clock)
+                    {
+                        evt.game_t = gameT;
+                        evt.frame = frame;
+                    }
                 }
                 else
                 {
@@ -310,8 +324,17 @@ namespace OzxApm.Collectors
         /// entry). Returns the pairs kept (pairs itself if nothing was left out,
         /// a shorter copy otherwise, null if none).
         /// </summary>
-        internal static string[] ValidateProps(string[] pairs, int length)
+        internal static string[] ValidateProps(string[] pairs, int length) => ValidateProps(pairs, length, null, out _);
+
+        /// <summary>
+        /// ValidateProps with a PropKinds value per pair (kinds[i / 2] for
+        /// pairs[i]; null: all strings), compacted with the pairs (in place):
+        /// keptKinds is kinds itself if nothing was left out, a shorter copy
+        /// otherwise, null when no pair is kept or kinds is null.
+        /// </summary>
+        internal static string[] ValidateProps(string[] pairs, int length, byte[] kinds, out byte[] keptKinds)
         {
+            keptKinds = null;
             if (pairs == null || length < 2)
                 return null;
             int w = 0, total = 0;
@@ -356,11 +379,25 @@ namespace OzxApm.Collectors
                     continue;
                 }
                 total += entry;
+                if (kinds != null)
+                    kinds[w / 2] = r / 2 < kinds.Length ? kinds[r / 2] : PropKinds.String;
                 pairs[w++] = k;
                 pairs[w++] = v;
             }
             if (w == 0)
                 return null;
+            if (kinds != null)
+            {
+                if (w / 2 == kinds.Length)
+                {
+                    keptKinds = kinds;
+                }
+                else
+                {
+                    keptKinds = new byte[w / 2];
+                    Array.Copy(kinds, keptKinds, w / 2);
+                }
+            }
             if (w == pairs.Length)
                 return pairs;
             var kept = new string[w];
@@ -665,6 +702,9 @@ namespace OzxApm.Collectors
             }
             _client?.EnqueueEvent(evt);
         }
+
+        /// <summary>A refused value of the custom API (a warning, the first few; counted). Any thread.</summary>
+        internal static void ReportViolation(string api, string key, string what) => Violation(api, key, what);
 
         private static void Violation(string api, string key, string what)
         {

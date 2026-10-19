@@ -189,6 +189,8 @@ namespace OzxApm.Collectors
             public long FirstMs;
             public int FirstSeq;
             public long FirstSessionMs;
+            public double FirstGameT;  // APM-10: the game clock of the first occurrence
+            public int FirstFrame1;    // its frame + 1; 0: none
             public bool Merged;
         }
 
@@ -199,6 +201,10 @@ namespace OzxApm.Collectors
             public long SessionMs;
             public ContextSnapshot Ctx;
             public string Unhandled;
+            // APM-10: the game clock (GameClock) when it happened: frame + 1
+            // (0: none, also for a default Occurrence) and the game time.
+            public int Frame1;
+            public double GameT;
         }
 
         private struct HeldEvent
@@ -828,8 +834,11 @@ namespace OzxApm.Collectors
             if (_errorSeq < int.MaxValue)
                 _errorSeq++;
             _occurrences++;
+            bool hasGameClock = GameClock.Now(out double gameT, out int frame);
             return new Occurrence
             {
+                Frame1 = hasGameClock ? frame + 1 : 0,
+                GameT = hasGameClock ? gameT : 0,
                 TimeMs = nowMs,
                 Seq = _errorSeq,
                 SessionMs = clock != null ? Math.Max(0, nowMs - clock.StartUnixMs) : 0,
@@ -875,6 +884,8 @@ namespace OzxApm.Collectors
                 b.FirstMs = occ.TimeMs;
                 b.FirstSeq = occ.Seq;
                 b.FirstSessionMs = occ.SessionMs;
+                b.FirstGameT = occ.GameT;
+                b.FirstFrame1 = occ.Frame1;
             }
             b.Count++;
             e.Last = b;
@@ -988,6 +999,8 @@ namespace OzxApm.Collectors
                 TimeMs = b.FirstMs,
                 Seq = b.FirstSeq,
                 SessionMs = b.FirstSessionMs,
+                GameT = b.FirstGameT,
+                Frame1 = b.FirstFrame1,
                 Ctx = b.Ctx,
                 Unhandled = b.Unhandled
             };
@@ -1077,7 +1090,10 @@ namespace OzxApm.Collectors
                 // The session it happened in (null: the current one, set at enqueue).
                 session_id = sessionId,
                 // The context when it happened (not when it is enqueued).
-                ctx = occ.Ctx
+                ctx = occ.Ctx,
+                // The game clock of that occurrence (APM-10).
+                game_t = occ.Frame1 > 0 ? occ.GameT : 0,
+                frame = occ.Frame1 - 1
             };
         }
 

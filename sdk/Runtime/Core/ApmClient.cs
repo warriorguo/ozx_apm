@@ -741,6 +741,24 @@ namespace OzxApm.Core
             }
         }
 
+        /// <summary>
+        /// Starts a custom event with typed properties (APM-10): numbers,
+        /// booleans and 2D vectors as well as strings, sent with
+        /// <see cref="ApmEvent.Send"/>. For events shared with OZX's
+        /// AiTelemetry, the name is "&lt;channel&gt;.&lt;ev&gt;" (e.g.
+        /// "playermovement.room_enter") and the properties are the line's
+        /// fields: the session export (admin) writes them as that channel's
+        /// lines. See <see cref="ApmEvent"/>. Any thread; nothing is
+        /// allocated when the SDK is not collecting.
+        /// </summary>
+        public static ApmEvent Event(string name)
+        {
+            var custom = s_custom;
+            if (custom == null || !custom.IsActive)
+                return default;
+            return EventBuilder.Begin(custom, name);
+        }
+
         private static bool TrackEventInternal(string name, string[] pairs, int length)
         {
             try
@@ -1003,6 +1021,9 @@ namespace OzxApm.Core
                 DeleteLocalTechnicalData();
             }
             _offlineStorage.Start();
+
+            // The game clock events carry (APM-10): this is the main thread.
+            GameClock.Init();
 
             // Initialize collectors
             _timeline = new Timeline();
@@ -1408,6 +1429,7 @@ namespace OzxApm.Core
             _isShuttingDown = false;
             _logConfig = null;
             s_custom = null;
+            GameClock.ResetForTests();
             s_timeline = null;
             s_collecting = false;
             s_runs = null;
@@ -1464,6 +1486,9 @@ namespace OzxApm.Core
                 }
                 return;
             }
+
+            // The game clock for events recorded on other threads (APM-10).
+            GameClock.Tick();
 
             // Update collectors
             using (Markers.Collectors.Auto())
@@ -1716,6 +1741,12 @@ namespace OzxApm.Core
                 evt.device_id = _sessionManager.DeviceId;
                 evt.scene = _currentScene;
                 StampContext(evt, _buildType, _gpu, _ramClass, _netType);
+                // The game clock (APM-10) of events enqueued when they happen
+                // (perf samples, janks, scene loads, startup, runs). Custom
+                // events and exceptions carry the one of their call or first
+                // occurrence; counts and aggregates over a window carry none.
+                if (evt.frame < 0 && StampsClockAtEnqueue(evt))
+                    GameClock.Stamp(evt);
 
                 using (Markers.Enqueue.Auto())
                     _offlineStorage.Enqueue(evt);
@@ -1724,6 +1755,17 @@ namespace OzxApm.Core
             {
                 ReportInternalError("EnqueueEvent", ex);
             }
+        }
+
+        /// <summary>
+        /// Events whose enqueue is the moment they describe: everything but
+        /// custom events and metrics (stamped at the call, or a count or
+        /// aggregate over a window) and exceptions (stamped at the first
+        /// occurrence they report).
+        /// </summary>
+        internal static bool StampsClockAtEnqueue(BaseEvent evt)
+        {
+            return !(evt is CustomEvent) && !(evt is CustomMetricEvent) && !(evt is ExceptionEvent);
         }
 
         /// <summary>

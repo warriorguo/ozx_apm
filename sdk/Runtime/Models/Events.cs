@@ -42,6 +42,16 @@ namespace OzxApm.Models
         /// </summary>
         [NonSerialized] internal ulong id_hi;
         [NonSerialized] internal ulong id_lo;
+
+        /// <summary>
+        /// The game's clock when the event happened (APM-10, Core.GameClock):
+        /// Unity's scaled game time in seconds and Time.frameCount, sent as
+        /// "t" and "frame". frame &lt; 0: none (counts and aggregates that span
+        /// many moments, crashes of an earlier process, before the first
+        /// frame); then neither is sent.
+        /// </summary>
+        [NonSerialized] internal double game_t;
+        [NonSerialized] internal int frame = -1;
     }
 
     [Serializable]
@@ -261,12 +271,26 @@ namespace OzxApm.Models
         public bool ctx_merged;
         /// <summary>Properties as key, value pairs (validated, immutable); null for none.</summary>
         [NonSerialized] internal string[] props;
+        /// <summary>
+        /// The JSON type of each property (APM-10, ApmClient.Event): per pair,
+        /// PropKinds.String, Number or Bool; a number or bool value is its
+        /// JSON text, written unquoted. Null: every value is a string.
+        /// </summary>
+        [NonSerialized] internal byte[] prop_kinds;
 
         public CustomEvent()
         {
             type = "custom_event";
             count = 1;
         }
+    }
+
+    /// <summary>The JSON type of a custom event property (CustomEvent.prop_kinds, APM-10).</summary>
+    internal static class PropKinds
+    {
+        internal const byte String = 0;
+        internal const byte Number = 1;
+        internal const byte Bool = 2;
     }
 
     /// <summary>

@@ -84,6 +84,8 @@ namespace OzxApm.Models
             evt.ram_class = null;
             evt.net_type = null;
             evt.ctx = null;
+            evt.game_t = 0;
+            evt.frame = -1;
             evt.fps = 0;
             evt.frame_time_ms = 0;
             evt.main_thread_ms = 0;

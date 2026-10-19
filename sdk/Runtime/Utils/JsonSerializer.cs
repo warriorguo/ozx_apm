@@ -87,6 +87,14 @@ namespace OzxApm.Utils
             OptionalField(w, "gpu", evt.gpu);
             OptionalField(w, "ram_class", evt.ram_class);
             OptionalField(w, "net_type", evt.net_type);
+            // APM-10: the game's clock (Core.GameClock), when the event has it.
+            if (evt.frame >= 0)
+            {
+                w.Name("t");
+                w.Fixed(evt.game_t, 4);
+                w.Name("frame");
+                w.Long(evt.frame);
+            }
 
             // Type-specific fields
             switch (evt)
@@ -245,6 +253,7 @@ namespace OzxApm.Utils
                     var props = ce.props;
                     if (props != null && props.Length >= 2)
                     {
+                        var kinds = ce.prop_kinds;
                         w.Name("props");
                         w.Byte((byte)'{');
                         for (int i = 0; i + 1 < props.Length; i += 2)
@@ -252,7 +261,13 @@ namespace OzxApm.Utils
                             if (i > 0) w.Byte((byte)',');
                             w.String(props[i]);
                             w.Byte((byte)':');
-                            w.String(props[i + 1]);
+                            // APM-10: numbers and booleans unquoted (their text
+                            // was written by the SDK); anything else a string.
+                            string v = props[i + 1];
+                            if (kinds != null && i / 2 < kinds.Length && IsJsonLiteral(kinds[i / 2], v))
+                                w.Ascii(v);
+                            else
+                                w.String(v);
                         }
                         w.Byte((byte)'}');
                     }
@@ -310,6 +325,52 @@ namespace OzxApm.Utils
             }
 
             w.Byte((byte)'}');
+        }
+
+        /// <summary>
+        /// True if v may be written unquoted as a value of the given kind:
+        /// "true" or "false" for Bool; for Number, JSON's number grammar (an
+        /// optional '-', an integer part, an optional fraction and exponent).
+        /// Never allocates.
+        /// </summary>
+        internal static bool IsJsonLiteral(byte kind, string v)
+        {
+            if (string.IsNullOrEmpty(v))
+                return false;
+            if (kind == PropKinds.Bool)
+                return v == "true" || v == "false";
+            if (kind != PropKinds.Number)
+                return false;
+            int i = 0, n = v.Length;
+            if (v[i] == '-' && ++i == n)
+                return false;
+            if (v[i] == '0')
+            {
+                i++;
+            }
+            else if (v[i] >= '1' && v[i] <= '9')
+            {
+                while (i < n && v[i] >= '0' && v[i] <= '9') i++;
+            }
+            else
+            {
+                return false;
+            }
+            if (i < n && v[i] == '.')
+            {
+                int start = ++i;
+                while (i < n && v[i] >= '0' && v[i] <= '9') i++;
+                if (i == start) return false;
+            }
+            if (i < n && (v[i] == 'e' || v[i] == 'E'))
+            {
+                i++;
+                if (i < n && (v[i] == '+' || v[i] == '-')) i++;
+                int start = i;
+                while (i < n && v[i] >= '0' && v[i] <= '9') i++;
+                if (i == start) return false;
+            }
+            return i == n;
         }
 
         private static void Field(JsonLine w, string name, string value)
@@ -600,6 +661,97 @@ namespace OzxApm.Utils
                 return;
             }
             Ascii(value.ToString("R", CultureInfo.InvariantCulture));
+        }
+
+        private static readonly double[] s_pow10d = { 1, 10, 100, 1000, 10000, 100000, 1000000 };
+        private static readonly long[] s_pow10l = { 1, 10, 100, 1000, 10000, 100000, 1000000 };
+
+        /// <summary>
+        /// Writes value with a fixed number of decimals (0-6), rounded half away
+        /// from zero, as AiTelemetry's lines are written ("F4" for t, "F3" for
+        /// numbers): no allocation while |value| x 10^decimals is below 9e15,
+        /// the round-trip form beyond (allocates). NaN and infinities are
+        /// written as null.
+        /// </summary>
+        public void Fixed(double value, int decimals)
+        {
+            if (double.IsNaN(value) || double.IsInfinity(value))
+            {
+                Ascii("null");
+                return;
+            }
+            if (!FixedText(value, decimals, out long units, out int d, out bool negative))
+            {
+                Ascii(value.ToString("R", CultureInfo.InvariantCulture));
+                return;
+            }
+            Ensure(24);
+            if (negative)
+                _buf[_len++] = (byte)'-';
+            long pow = s_pow10l[d];
+            Long(units / pow);
+            if (d == 0)
+                return;
+            Ensure(8);
+            _buf[_len++] = (byte)'.';
+            long frac = units % pow;
+            for (long p = pow / 10; p >= 1; p /= 10)
+            {
+                _buf[_len++] = (byte)('0' + (int)(frac / p));
+                frac %= p;
+            }
+        }
+
+        // The fixed-point form of a finite value: units of 10^-d, and the sign
+        // to write. False (d = -1) when it does not fit a long exactly.
+        private static bool FixedText(double value, int decimals, out long units, out int d, out bool negative)
+        {
+            d = decimals < 0 ? 0 : decimals > 6 ? 6 : decimals;
+            double scaled = Math.Abs(value) * s_pow10d[d];
+            if (scaled >= 9e15)
+            {
+                units = 0;
+                negative = false;
+                d = -1;
+                return false;
+            }
+            units = (long)Math.Round(scaled, MidpointRounding.AwayFromZero);
+            negative = value < 0 && units != 0;
+            return true;
+        }
+
+        /// <summary>The text Fixed writes (allocates; for property values and tests).</summary>
+        internal static string FixedString(double value, int decimals)
+        {
+            if (double.IsNaN(value) || double.IsInfinity(value))
+                return "null";
+            if (!FixedText(value, decimals, out long units, out int d, out bool negative))
+                return value.ToString("R", CultureInfo.InvariantCulture);
+            // One allocation: the string. At most 1 + 16 + 1 + 6 characters.
+            Span<char> buf = stackalloc char[32];
+            int n = 0;
+            if (negative)
+                buf[n++] = '-';
+            long pow = s_pow10l[d];
+            long whole = units / pow;
+            int start = n;
+            do
+            {
+                buf[n++] = (char)('0' + (int)(whole % 10));
+                whole /= 10;
+            } while (whole != 0);
+            buf.Slice(start, n - start).Reverse();
+            if (d > 0)
+            {
+                buf[n++] = '.';
+                long frac = units % pow;
+                for (long p = pow / 10; p >= 1; p /= 10)
+                {
+                    buf[n++] = (char)('0' + (int)(frac / p));
+                    frac %= p;
+                }
+            }
+            return new string(buf.Slice(0, n));
         }
 
         [StructLayout(LayoutKind.Explicit)]
