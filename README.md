@@ -188,6 +188,46 @@ ApmClient.StopTimer(t);                                   // or StopTimer("room_
   data in names, properties or units.** Technical data: collected only with
   technical consent; business events (purchases, funnels) are not for this API.
 
+### Memory, game runs and count ranges
+
+Every perf sample (once per `SamplingIntervalSeconds`, never per frame)
+carries the memory breakdown (`ApmConfig.EnableMemoryBreakdown`, on by
+default): the managed heap in use (`mem_mb`, as before) and reserved,
+Unity's native memory allocated and reserved, the graphics memory Unity
+estimates, and the process's resident memory (Android: RSS from
+`/proc/self/statm`, read on a thread of its own; elsewhere Unity's System
+Used Memory). A figure the platform does not give is not sent.
+
+```csharp
+ApmClient.BeginRun(runId);       // a game run (OZX: a dungeon run); sets the context key "runId"
+// ... the run ...
+ApmClient.EndRun("win");         // sends a "run" event: peak of every memory figure, start/end, length
+ApmClient.SetContextCount("aliveEnemies", aliveCount);   // "0", "1-5", "6-10", "11-20", ... "201+"
+```
+
+- `BeginRun(id)`: any thread; the id is 1-64 printable characters (a run
+  sequence number or seed, never personal data). A run still open is ended
+  first (`end_reason` `new_run`); one open at quit is ended as `shutdown`.
+  `EndRun(result)`: the result is optional (`[A-Za-z0-9_.-]{1,64}`); the
+  context key `runId` is removed (if it still is the run's id).
+  `ApmClient.CurrentRunId` is the open run.
+- If the process dies during a run (an OOM kill, a crash, a kill in the
+  background), the crash journal has the run and its peaks: the next launch
+  sends the run (`end_reason` `crash` with the crash type, or `process_end`),
+  and the crash's details carry the last memory reading, its age, the
+  process's peak RSS and the run's peaks ("memory before death" on the crash
+  page).
+- `SetContextCount(key, n)`: for numbers that change often (alive enemies):
+  the context only changes when `n` enters another range, so calling it every
+  frame copies and allocates nothing. The admin groups raw numeric context
+  values into the same ranges (`bucket=count`).
+- Admin: **Memory** (breakdown and peak per run by version, device, RAM class
+  or any context key; OOM runs), **Health** (crash-free sessions and users,
+  ANR rate, exception rates per version, build type or data pack), **Funnel**
+  (custom events in order per session), and the Context page's jank rate per
+  minute of play and FPS p05 by any context key. Details: `server/RELEASE.md`
+  (APM-9).
+
 ### Privacy consent
 
 Two categories, each `Undecided`, `Granted` or `Denied`: `Technical`
@@ -381,6 +421,17 @@ library's symbol table by `apmsym` (APM-7). Bearer token
 **GET /api/crashes/detail?fingerprint=F** - A crash group with its latest
 crash symbolicated (C# method, file, line), exit info, context and breadcrumbs.
 
+### Memory, health and funnels (admin server, APM-9)
+
+All take the common filter (time range, at most 31 days; `app_version`,
+`platform`, `build_type`, `ctx=key:value`) and run at most two at once.
+
+- **GET /api/memory/breakdown[?by=..|key=..]** - perf samples' memory figures (p50/p95/max) per group
+- **GET /api/memory/runs?metric=peak_rss[&by=..|key=..]** - peak memory per run, OOM/crashed runs, histogram
+- **GET /api/health/sessions[?by=..|key=dataVersion][&crash_types=native,java,oom,killed]** - crash-free sessions and users, ANR and exception rates
+- **GET /api/funnel?steps=[{"name":"run_start"},{"name":"room_enter","props":{"roomType":"boss"}}][&window=7200][&by=app_version]** - sessions per step and conversion
+- **GET /api/context/distribution?key=aliveEnemies&metric=fps&bucket=count** - also `metric=jank_rate`
+
 ## Event Types
 
 | Type | Description |
@@ -393,6 +444,7 @@ crash symbolicated (C# method, file, line), exit info, context and breadcrumbs.
 | `crash` | Native crashes, ANRs, kills of the previous process, with its context and breadcrumbs (APM-7) |
 | `custom_event` | `ApmClient.TrackEvent` (APM-6) |
 | `custom_metric` | `RecordMetric` / timers, aggregated per name, context and minute (APM-6) |
+| `run` | A game run that ended (`BeginRun` / `EndRun`), with its peak memory (APM-9) |
 
 Other types (`asset_load`, `http`: planned) are rejected with a reason in the
 response (`errors`, `rejected_types`).

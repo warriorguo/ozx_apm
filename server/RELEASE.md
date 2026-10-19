@@ -3226,3 +3226,327 @@ settings above (symbols.zip "Debugging", `--emit-source-mapping
 - Symbol upload and lookups at production volume, and the upload against
   the test environment (needs `OZX_SYMBOLS_UPLOAD_TOKEN` on apps 36 and 38).
 - The admin crash pages in a browser (jsdom tests and API checks only).
+
+## APM-9: memory breakdown, peak memory per run, context slicing, funnels, crash-free sessions (additive schema change)
+
+Deploy order: **server (apps 36 and 38), then admin UI, then SDK builds.**
+Each step works without the next: an older server stores the new SDK's perf
+samples without the new fields and rejects `run` events as an unknown type
+(the rest of the batch is stored; those runs are lost: ship the SDK after
+the server); the previous admin UI reads everything as before; the new
+admin UI needs this server (it calls the new endpoints).
+
+### Design
+
+- **Memory breakdown** (SDK `Collectors/MemorySampler.cs`): every perf
+  sample (once per `SamplingIntervalSeconds`, never per frame) reads, on the
+  main thread, `Profiler.GetMonoHeapSizeLong` (managed heap reserved),
+  `GetTotalAllocatedMemoryLong` / `GetTotalReservedMemoryLong` (Unity's
+  native memory) and the profiler counter "Gfx Used Memory" through a
+  `ProfilerRecorder` created once (engine calls, no allocation). The process
+  RSS is read on Android from `/proc/self/statm` (resident pages x page size)
+  by a thread of its own (`OzxApm.Memory`, 128 KB stack) at the same
+  interval (every 10 s while paused): the file is opened once and re-read
+  from offset 0 into a reused buffer (if a re-read gives nothing usable, it
+  is opened for every reading). Elsewhere (iOS, desktop, the Editor) the RSS
+  figure is Unity's "System Used Memory" counter. `Debug.getPss` (the
+  proportional set size) walks the page tables and needs JNI: not affordable
+  at 1 Hz; the device plan compares it with RSS on demand. `mem_mb` keeps its
+  meaning (managed heap in use, `GC.GetTotalMemory`). A figure that is 0 (not
+  given by the platform, or the call failed: then it is not called again) is
+  not sent and reads as 0 on the server; queries count only rows that have it.
+  `ApmConfig.EnableMemoryBreakdown` (default on) turns all of it off.
+- **Game runs** (`Core/RunTracker.cs`): `ApmClient.BeginRun(id)` /
+  `EndRun(result)`; explicit API rather than derived from a context key, so
+  that the run's boundaries, the result and the end reason are exact and an
+  open run can be closed at quit. While a run is open the context key
+  `runId` is its id (every event of the run carries it; OZX-1277 may keep
+  setting its own context keys: a `runId` the game set after BeginRun is not
+  removed by EndRun). The tracker keeps, under one small lock taken about
+  twice a second, the latest reading of each figure, the process's peak RSS,
+  and the open run's peaks, sample count and native/resident memory at its
+  start. `EndRun` sends one `run` event (`end`); `BeginRun` with a run open
+  ends it first (`new_run`); `Shutdown`/quit ends it (`shutdown`) before the
+  crash journal is marked clean.
+- **Peak memory before death**: the crash journal (APM-7) now also records
+  the last memory reading and its time, the process's peak RSS and the open
+  run (id, start, samples, peaks, start figures). It is rewritten when RSS or
+  native memory moved by 32 MB (besides the 5 s heartbeat), so an OOM kill's
+  journal is at most one step and one reading (1 s) behind. At the next
+  launch the crash's `details` carry `mem_*_mb` (last reading), `mem_age_ms`
+  (its age at the crash), `proc_peak_rss_mb`, `run_id`, `run_ms` (time into
+  the run), `run_samples`, `run_peak_*_mb`, `run_start_alloc_mb`,
+  `run_start_rss_mb`, next to Android's own PSS/RSS at exit (`pss_kb`,
+  `rss_kb`, APM-7). The run the process did not survive is sent too, from the
+  journal: `end_reason` `crash` with `crash_type` (the exit's APM-7 type:
+  `oom`, `killed`, `native`, ...), or `process_end` when the exit was not a
+  crash (a background kill), with the journal's peaks, the crashed session's
+  fields and context, and an event id derived from the process (a re-report
+  is a duplicate). No crash schema change: `details` is the APM-7 map.
+- **Context slicing** (item 3): APM-5 already filters and groups perf
+  samples and janks by any context key (`/api/context/distribution`, Context
+  page). Added: `bucket=count` groups numeric values into count ranges `0`,
+  `1-5`, `6-10`, `11-20`, `21-30`, `31-50`, `51-100`, `101-200`, `201+`
+  (text values are kept as they are); `ApmClient.SetContextCount(key, n)`
+  writes the same labels on the device (constant strings: the context only
+  changes when the count enters another range, so the game can call it every
+  frame; no copy, no allocation), so raw numbers of older builds and labels
+  group together. `metric=jank_rate`: janks per minute of play per value (the
+  perf samples' windows, `interval_ms`, give the play time; 1 s for rows of
+  older SDKs). Every metric now also returns p05/p90/p99 (for FPS the low
+  percentiles are the slow moments).
+- **Funnel** (item 4): admin-defined ordered steps (custom event name and up
+  to 4 property filters each, 1-8 steps), per session: ClickHouse
+  `windowFunnel(window_ms)(toUInt64(toUnixTimestamp64Milli(timestamp)), cond1, ...)`
+  over the session's `apm_custom_events` rows of the steps' names, then
+  sessions per deepest level; sessions reaching step k = those whose level is
+  at least k. Window default 2 h, at most 24 h, always within one session.
+  Aggregated rows of APM-6 (calls beyond the SDK's per-minute budget, no
+  properties, `timestamp` = the first counted call) match a step without
+  property filters (the event happened in that session) and never a step
+  with property filters: for exact funnels, steps should be events the game
+  sends at most a few times a minute (the budget is 60 a minute, 10 per
+  name). A step name repeated in the funnel may be satisfied by the same
+  event (windowFunnel's default mode): use distinct events.
+- **Session health** (item 5): per group (version, build type, platform,
+  device, RAM class, or a context key such as the data pack version
+  `dataVersion`) and build type: sessions and users (`uniqExact` of
+  `session_id` / `device_id` of every row of perf samples, startups, janks,
+  custom events and metrics, runs, exceptions and crashes in the range),
+  crashed sessions/users (a crash of the counted types; default `native`,
+  `java`, `oom`, `killed`: the process died in the foreground; `unknown`
+  (Android 10 and older, a foreground process ended without an exit record)
+  only on request since it may be a kill the player caused), crash-free rates,
+  ANR sessions and rate (separate, like Play Console's ANR rate), exception
+  sessions, occurrences and per-session rate, crashes per type. Crash rows
+  carry the crashed session's version, build type and context (APM-7), so a
+  crash counts against the session it ended; a crash is only known after the
+  next launch, so the newest sessions' rates rise when those reports arrive.
+  By context key, a session counts under every value its rows had.
+
+### Wire format (SDK -> server)
+
+```json
+{"type":"perf_sample", ..., "mem_mb":80.25, "interval_ms":1004, "mem_mono_heap_mb":96.50,
+ "mem_alloc_mb":410.25, "mem_reserved_mb":640.00, "mem_gfx_mb":180.75, "mem_rss_mb":1500.50, "ctx":{...}}
+{"type":"run", <common fields>, "run_id":"run-1042", "end_reason":"end", "result":"win",
+ "duration_ms":600000, "samples":600, "peak_mem_mb":120.00, "peak_mono_heap_mb":96.50,
+ "peak_alloc_mb":905.50, "peak_reserved_mb":640.00, "peak_gfx_mb":180.75, "peak_rss_mb":1900.00,
+ "start_alloc_mb":410.25, "start_rss_mb":1400.00, "end_alloc_mb":905.50, "end_rss_mb":1850.00,
+ "ctx":{"runId":"run-1042"}}
+{"type":"run", ..., "run_id":"run-1043", "end_reason":"crash", "crash_type":"oom", ...}
+```
+
+`processor/testdata/sdk_events_apm9.jsonl` are such events built and
+serialized by the SDK on Unity's Mono (MemorySampler, RunTracker, an OOM
+crash and its run from CrashReporter); the ingest test stores them.
+
+Server policy: the perf sample's new fields are decoded leniently (a wrong
+JSON type reads as 0, never rejects the sample), clamped to [0, 1 TB] and
+`interval_ms` to an hour. A run needs the common fields and a `run_id`
+(else rejected with a reason); `run_id` and `result` are cut to 64
+printable characters, an unknown `end_reason` is stored as `unknown`,
+`crash_type` only for `crash` (an unknown one as `unknown`), numbers
+clamped (duration a week, memory 1 TB). Context as APM-5.
+
+### Schema
+
+```sql
+ALTER TABLE apm_perf_samples ADD COLUMN IF NOT EXISTS interval_ms UInt32 DEFAULT 0;
+ALTER TABLE apm_perf_samples ADD COLUMN IF NOT EXISTS mem_mono_heap_mb Float32 DEFAULT 0;
+ALTER TABLE apm_perf_samples ADD COLUMN IF NOT EXISTS mem_alloc_mb Float32 DEFAULT 0;
+ALTER TABLE apm_perf_samples ADD COLUMN IF NOT EXISTS mem_reserved_mb Float32 DEFAULT 0;
+ALTER TABLE apm_perf_samples ADD COLUMN IF NOT EXISTS mem_gfx_mb Float32 DEFAULT 0;
+ALTER TABLE apm_perf_samples ADD COLUMN IF NOT EXISTS mem_rss_mb Float32 DEFAULT 0;
+CREATE TABLE IF NOT EXISTS apm_runs (... common columns, run_id, end_reason, result, crash_type,
+  duration_ms, samples, peak_*_mb, start/end alloc and rss, the APM-2/5 columns,
+  idx_event_id, idx_session_id) ENGINE = ReplacingMergeTree()
+  PARTITION BY toYYYYMMDD(timestamp) ORDER BY (app_version, end_reason, timestamp, event_id)
+  TTL toDateTime(timestamp) + INTERVAL 30 DAY;
+```
+
+(full statements in `scripts/migrate.sql`, generated from `schema.go`).
+Everything within the `apm` account's grants: `ALTER ADD COLUMN` (metadata
+only, existing rows read 0) and `CREATE TABLE` (with both skip indexes in
+the statement: nothing for an admin to add). Fresh and migrated perf tables
+have the same columns in the same order. `apm_fps_daily` and the other
+daily views are unchanged (they name their columns; new columns do not
+reach them). **No new view**: runs are technical detail data kept 30 days
+like every event table; a one-year aggregate of run peaks (CLAUDE.md) would
+be a new `CREATE MATERIALIZED VIEW` (the `apm` account may on 24.1 and 26.1),
+which only sees rows inserted after it exists (no backfill): not part of
+this release. `apm_runs` is an event table (APM-19 duplicate lookup with key
+column `end_reason`, ReplacingMergeTree safety net, privacy deletion by its
+`device_id`, the session time line and the device's sessions, context keys).
+
+### Admin API
+
+All take the common filter (`start_time`, `end_time`, `app_version`,
+`platform`, `build_type` default release incl. `''`, `ctx=key:value`); the
+new ones default to 7 days and refuse a range over 31 days or an end before
+the start (400). Grouping: `by=app_version` (default) | `build_type` |
+`platform` | `device_model` | `os_version` | `ram_class`, or `key=<context
+key>`; at most 50 groups (`truncated`).
+
+- `GET /api/memory/breakdown` -> `{group_by, rows[{value, samples, sessions,
+  figures{mem_mb, mem_mono_heap_mb, mem_alloc_mb, mem_reserved_mb,
+  mem_gfx_mb, mem_rss_mb: {rows, p50, p95, max}}}], truncated}`: per figure
+  only the samples that have it (> 0); p50/p95 approximate (`quantileIf`).
+- `GET /api/memory/runs?metric=peak_rss|peak_alloc|peak_reserved|peak_gfx|peak_mem|peak_mono_heap`
+  (default `peak_rss`) -> `{metric, group_by, rows[{value, runs, with_value,
+  sessions, devices, crashed_runs, oom_runs, killed_runs, p50, p90, p99, max,
+  avg_duration_ms, avg_growth_mb}], buckets[{low, high, runs, oom}],
+  truncated}`: exact percentiles (`quantileExactIf`) over the runs that have
+  the figure; growth = end - start of RSS or native memory over the runs
+  that ended normally (`end`, `new_run`, `shutdown`); the histogram (MB:
+  256, 512, 768, 1024, 1536, 2048, 3072, 4096, `high` 0 = open) over every
+  filtered run.
+- `GET /api/health/sessions[&crash_types=native,java,oom,killed]` -> `{group_by,
+  crash_types, rows[{value, build_type, sessions, users, crashed_sessions,
+  crashed_users, crash_free_sessions, crash_free_users, anr_sessions, anr_rate,
+  exception_sessions, exceptions, exception_session_rate,
+  exceptions_per_session, crashes_by_type{native, java, oom, killed, anr,
+  unknown}}], truncated}`; rates are fractions; an unknown crash type is a 400.
+- `GET /api/funnel?steps=<JSON>[&window=<s>][&by=app_version|build_type|platform]`:
+  `steps` = `[{"name":"run_start"},{"name":"room_enter","props":{"roomType":"boss"}}]`
+  (at most 8 KB; 1-8 steps; names and property keys `[A-Za-z0-9_.-]{1,64}`,
+  values up to 256 characters, at most 4 properties; unknown fields refused)
+  -> `{start_time, end_time, window_seconds, group_by, steps, groups[{value,
+  steps[{name, props, sessions, conversion, from_previous}]}], truncated}`;
+  `by`: a session's value is that of its first row; top 20 groups by first
+  step. No match: one group of zeros.
+- `GET /api/context/distribution` adds `bucket=count`, `metric=jank_rate`
+  (`count` janks, `minutes`, `rate` janks per minute, unit `janks/min`, rows
+  by play time) and `p05`, `p90`, `p99` on every row; `source=runs` for the
+  context keys/values endpoints.
+- `GET /api/sessions/timeline`: items of type `run` (`run_id`,
+  `end_reason`, `result`, `crash_type`, `duration_ms`, `peak_rss_mb`,
+  `peak_alloc_mb`, `peak_mem_mb`, context).
+- Every key, value, name and property is a bound argument; nothing from the
+  request is in the SQL text (unit tests check every builder with hostile
+  input). Errors: 400 for bad parameters, 503 "narrow the time range" when a
+  request runs out of time, 500 otherwise (no ClickHouse detail in the body).
+
+Admin UI: **Memory** (breakdown, peak per run with histogram, by version,
+build, device, RAM class or a context key), **Health** (crash-free sessions
+and users, ANR and exception rates, crash types selectable, deltas against a
+baseline row), **Funnel** (step editor with event names from the Custom
+page's list, property filters, reorder, window, split), Context page
+(`bucket=count`, jank rate, p05/p99), crash detail "Memory before death"
+(last reading and its age, run peaks, process peak RSS, Android PSS/RSS),
+session time line run items. Game text is rendered as text only and cut to
+120 characters (the full text in the tooltip); the funnel's steps are sent
+as one JSON parameter built with `JSON.stringify`.
+
+### Cost
+
+SDK (Unity's Mono outside Unity, M-series Mac, `/tmp/claude-501/apm9/bench`;
+the engine calls themselves can only be measured on the device: the stats'
+`MemorySampleMs` and the device plan):
+
+| Path | Thread | Time | Allocated |
+|---|---|---|---|
+| Perf sample's memory path without the engine calls (`MemorySampler.Sample` + `RunTracker.Record`) | main, once per sample | 0.08 us | 0 |
+| `RunTracker.RecordRss` | OzxApm.Memory, 1/s | 0.02 us | 0 |
+| statm reading (re-read of the open file; a regular file here, procfs on the device) | OzxApm.Memory, 1/s | 1.1 us | 0 |
+| `SetContextCount`, same range | any | 0.06 us | 0 |
+| Crash journal write, 30 context keys, + memory and a run | journal thread | 11.6 us (10.6 without) | 0 |
+
+Nothing is added per frame: `ApmClient.Update` is unchanged; the memory
+figures are read in the frame that emits the perf sample (4 engine calls
+and one counter read, once a second). The journal grows by ~350 bytes and
+is rewritten at most once more per 32 MB of memory movement. The RSS thread
+wakes once a second in the foreground, every 10 s in the background. Wire
+size: about 120 bytes more per perf sample (6 fields), ~600 bytes per run.
+
+Server (estimated, not measured: the author's sandbox has no ClickHouse):
+
+- `/api/memory/breakdown`: one query over the range's perf samples (the six
+  memory columns, `session_id`, the group column): like the APM-11 scratch
+  database's 10 M rows a week, ~40 M rows for 31 days.
+- `/api/memory/runs`: two queries over `apm_runs` (a row per run: small).
+- `/api/health/sessions`: one query; per table part a GROUP BY (group,
+  build type, session) over `session_id`, `device_id`, `build_type` and the
+  group column of every row of the range (perf samples dominate: ~1 row per
+  second of play), then over sessions. Memory: one entry per session per
+  table part. Expect it to be the slowest admin request (seconds at tens of
+  millions of rows): narrow the range for large releases.
+- `/api/funnel`: one query over `apm_custom_events` rows of the steps'
+  names (`name` is the second sort key column: with `app_version` set,
+  granules of other names are skipped), reading `session_id`, `timestamp`,
+  `props` (only with property filters), then one row per session.
+- `jank_rate`: two queries (janks; perf samples' `interval_ms`), merged in Go
+  (at most 1000 values each).
+- Bounds: at most 2 of these requests run at once across requests (a third
+  waits; the time line keeps its own 4), each runs its queries one after the
+  other on one pooled connection (of 10, shared with ingest), 25 s per
+  request (503 after that), 31-day range.
+
+Measure on the test environment with `system.query_log` (user `apm`) before
+relying on these numbers.
+
+### Rolling deploy and rollback
+
+Old and new binaries serve side by side: the old binary names its insert
+columns (its perf rows read 0 for the new columns) and rejects `run` events
+("unknown type", counted in `rejected_types`; the SDK drops rejected
+events). Deploy the server before SDK builds with this SDK. **Rollback:**
+redeploy the previous server and admin UI; no schema action. The columns and
+`apm_runs` stay (unused; rows expire by TTL). An SDK with APM-9 against an
+older server: perf samples are stored without the breakdown, runs are lost,
+crashes keep the memory in `details` (the APM-7 map takes any key). To
+remove the table after a permanent rollback (admin): `DROP TABLE apm_runs`.
+
+### Verified
+
+- Server: `go vet ./...`, `go test -race -short ./...` (all packages pass):
+  new unit tests for the perf memory and run normalization and leniency,
+  ingest of hand-written events and of the SDK-serialized fixture (perf
+  breakdown, a run, an OOM crash with the memory before death and the run it
+  ended), the duplicate drop of a re-sent run, the SQL builders (every value
+  bound and the placeholders matching the arguments with hostile keys,
+  values and versions; health union parts limited to the range, no alias
+  equal to a column inside an aggregate; funnel conditions in key order,
+  names deduplicated, limits), the funnel arithmetic, the health rates, the
+  count ranges and their order, the handlers' defaults, 400s (range, group,
+  metric, crash types, steps JSON, window, split), 503 on a timeout, no
+  ClickHouse detail in a 500.
+- `tests/integration/apm9_test.go` (both insert paths where it matters):
+  memory breakdown and run peaks with exact percentiles, the histogram and
+  OOM runs, growth, by context key, the run on the session time line; FPS
+  by bucketed `aliveEnemies` (raw numbers and SDK labels together, p05/p99),
+  jank rate by `stageType`; the funnel (property filter, an aggregated row,
+  the window, per version, a version filter, no match); session health per
+  version, with `unknown`, per build type, per data pack; 400s. The existing
+  integration tests now include `apm_runs` (duplicate lookup, privacy
+  deletion, migration fixtures). **Written and compiled, not run here.**
+- SDK: compiles at C# 8 with and without `UNITY_2021_2_OR_NEWER`, for
+  Android and iOS defines; on Unity's Mono outside Unity 237 runtime tests
+  pass (16 new: statm parsing and re-reading, the run tracker, count ranges,
+  the sampler with a fake engine source and with its thread, paused and
+  resumed, the journal's memory/run lines, an OOM during a run reported with
+  the memory in the details and the run, a background kill reporting the run
+  only, no report without consent, the wire format), 2 fail for the
+  environment as before (JSONSerializeModule, gzip), 111 need the Unity
+  runtime (among them the 9 new `RunApiTests`: BeginRun/EndRun through
+  ApmClient, shutdown, consent, SetContextCount, no allocation on the
+  sampling paths and the journal write).
+- Admin UI: `tsc`, vitest (170 tests, 22 new), `vite build`.
+- The test driver (`/tmp/claude-501/apm9/ApmTestDriver.cs`) compiles against
+  this SDK; the device plan is `/tmp/claude-501/apm9/DEVICE_PLAN.md`.
+
+### Not verified
+
+- **Nothing here ran against ClickHouse** (23.8, 24.1, 26.1): the new SQL
+  (the `WITH ctx[?] AS raw_value` grouping, `windowFunnel` on UInt64
+  millisecond timestamps, the session health union, `quantileExactIf`) is
+  covered by the integration tests above, not run.
+- Unity EditMode (the sandbox blocks the licensing client) and the device:
+  whether `Profiler.GetTotalAllocatedMemoryLong` / `GetTotalReservedMemoryLong`
+  and the "Gfx Used Memory" / "System Used Memory" counters give values in
+  an IL2CPP release player on Android 16 (a 0 is sent as "not available"),
+  the statm re-read on procfs under IL2CPP's FileStream, the engine calls'
+  cost on the main thread, RSS against `Debug.getPss`, the OOM report's
+  memory against Android's PSS/RSS.
+- Query cost at any volume; the admin pages in a browser (jsdom only); iOS;
+  16 KB page devices.
