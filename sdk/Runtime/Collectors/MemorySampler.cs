@@ -241,10 +241,8 @@ namespace OzxApm.Collectors
             {
                 ApmClient.ReportInternalError("MemorySampler.Loop", ex);
             }
-            finally
-            {
-                _statm?.Dispose();
-            }
+            // The file stays open (one descriptor) until Dispose: closing it here
+            // could race a new thread started meanwhile (consent granted again).
         }
 
         /// <summary>One RSS reading (the thread; tests). False when it could not be read.</summary>
