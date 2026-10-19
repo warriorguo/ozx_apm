@@ -2868,6 +2868,20 @@ Unity settings (2022.3, Android; in the build script or Player Settings):
 | `EditorUserBuildSettings.androidCreateSymbols = AndroidCreateSymbols.Debugging` ("Create symbols.zip": Debugging) | `<product>-<version>-v<code>-IL2CPP.symbols.zip` next to the APK/AAB, with `<abi>/libil2cpp.so` (symbol table and DWARF line tables; 92 MB on the test app), `libunity.so`, `libmain.so`: named `.so`, not `.sym.so`/`.dbg.so` | `Public`: symbol tables only (names, no lines). Copies also under `Library/Bee/artifacts/Android/il2cppOutput/build/<abi>/` (`.sym.so`, `.dbg.so`) |
 | `PlayerSettings.SetAdditionalIl2CppArgs("--emit-source-mapping --emit-method-map")` | `LineNumberMappings.json` (C++ line -> C# file:line) and `MethodMap.tsv` (C function -> C# method). The place for CI: `<build>_BackUpThisFolder_ButDontShipItWithYourGame/il2cppOutput/Symbols/` next to the APK (copies also under `Library/Bee`) | no C# files/lines; C# names guessed from IL2CPP's function names (`Type_Method_m<hash>` -> `Type.Method`; wrong split for nested types and types with `_`) |
 
+**Clean player build when the SDK version changes.** A release build of
+the test app (IL2CPP, Medium stripping, Strip Engine Code) made
+incrementally after changing the SDK logged `Could not produce class with
+ID 115` (MonoScript) on every launch, 118 times, from
+`AddComponent<ApmClient>()`: the stale build cache (`Library/Bee`) had
+regenerated the engine class registration without `MonoScript`. The same
+SDK built clean (`Library/Bee`, `Library/PlayerDataCache`,
+`Library/Il2cppBuildCache` deleted) logged none. In CI, build the player
+clean when the SDK version changes (delete those folders, or build in a
+fresh checkout). To check a build:
+`Library/Bee/artifacts/Android/il2cppOutput/UnityClassRegistration.cpp`
+must contain `RegisterUnityClass<MonoScript>`, and logcat must show no
+`class with ID 115`.
+
 `--emit-source-mapping` is what Unity passes itself when Cloud
 Diagnostics crash reporting is on; the source-mapping comments only change
 the generated C++, not the binary. Both arguments are accepted by il2cpp in
