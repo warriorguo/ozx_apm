@@ -2741,30 +2741,6 @@ stripping; because not every Unity version reads link.xml inside packages,
 `Temp/OzxApm/link.xml`. The package now depends on the built-in module
 `com.unity.modules.androidjni`.
 
-**Engine code stripping and MonoScript (device finding).** A release build
-of the test app at 4eb0961 (IL2CPP, Medium, `stripEngineCode` on) logged
-`Could not produce class with ID 115` 118 times at startup: 16 while the
-first scene loads, 102 inside the one `AddComponent<ApmClient>()` of
-`ApmClient.Instance` (one GameObject `[OzxApm]`, created once under a lock;
-no leak; Unity tries to make a MonoScript for each script class it knows).
-Class ID 115 is `MonoScript`: the build's `UnityClassRegistration.cpp`
-registered 49 classes without `MonoScript` and `TextAsset`, the earlier
-builds 51 with them; the linker's report
-(`ManagedStripped/UnityLinkerToEditorData.json`) listed both only while the
-managed `UnityEngine.TextAsset` type was kept (the 0-error build's
-libil2cpp has `TextAsset_get_bytes/get_text/ToString`, the new one none),
-and the shipped `libunity.so` lost MonoScript's class code. The test app's
-scene has no script component, so nothing in its assets required
-MonoScript; which SDK change made the linker drop `TextAsset` (only reached
-through it, no code calls it) was not pinned down without a Unity build.
-Fix: both link.xml copies preserve `UnityEngine.TextAsset` (a few methods),
-which keeps the native `TextAsset` and `MonoScript` classes registered;
-`LinkXmlTests` checks the rule and that both copies agree. A game whose
-scenes contain script components always had MonoScript; this makes the SDK
-independent of that. To verify a build: `UnityClassRegistration.cpp` (in
-`Library/Bee/artifacts/Android/il2cppOutput/`) contains
-`RegisterUnityClass<MonoScript>`, and logcat has no `class with ID 115`.
-
 ### SDK: cost
 
 Unity's Mono outside Unity (M-series Mac), `/tmp/claude-501/apm7/bench`:
