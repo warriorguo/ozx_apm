@@ -92,7 +92,18 @@ namespace OzxApm.Core
                 frame = testFrame != null ? testFrame() : 0;
                 return frame >= 0 && t >= 0;
             }
-            ReadEngine(out t, out frame);
+            try
+            {
+                ReadEngine(out t, out frame);
+            }
+            catch
+            {
+                // Unity refused the API here (a restricted callback): no clock,
+                // never an exception into the caller (the log callback, TrackEvent).
+                t = 0;
+                frame = -1;
+                return false;
+            }
             return frame >= 0 && t >= 0;
         }
 

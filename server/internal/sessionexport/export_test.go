@@ -361,6 +361,40 @@ func TestBuild_ByteLimit(t *testing.T) {
 	}
 }
 
+// Review fixes: many channels stay under the limit (session.json's "lines"
+// counted); the counters only count written lines; a vector named like a
+// leading field is written as its two plain keys.
+func TestBuild_ByteLimitManyChannelsAndCounters(t *testing.T) {
+	old := maxBytes
+	defer func() { maxBytes = old }()
+	maxBytes = 12000
+	var rows []Row
+	for i := 0; i < 400; i++ {
+		rows = append(rows, Row{Source: SourceCustomEvent, Time: t0.Add(time.Duration(i) * time.Millisecond), Seq: uint64(i), GameT: fp(1), Frame: ip(1),
+			Name: "channel_with_a_long_name_" + itoa(i) + ".x", Count: 1, Props: map[string]string{"t": "1"}})
+		rows = append(rows, Row{Source: SourceCustomEvent, Time: t0.Add(time.Duration(i) * time.Millisecond), Seq: uint64(1000 + i), Name: "loot.drop", Count: 1})
+	}
+	res := Build(Input{Session: Session{SessionID: "s", FirstSeen: t0, LastSeen: t0}, Rows: rows}, t0)
+	if res.TotalBytes > maxBytes {
+		t.Errorf("%d bytes > %d", res.TotalBytes, maxBytes)
+	}
+	written := 0
+	for f, n := range res.Lines {
+		if f != FileAPM {
+			written += n
+		}
+	}
+	if res.DroppedProps != written || res.WithoutClock != res.Lines[FileAPM] || written >= 400 {
+		t.Errorf("dropped %d, without clock %d, lines %v", res.DroppedProps, res.WithoutClock, res.Lines)
+	}
+
+	res = Build(Input{Session: Session{SessionID: "s", FirstSeen: t0, LastSeen: t0}, Rows: []Row{{Source: SourceCustomEvent, Time: t0, GameT: fp(1), Frame: ip(1),
+		Name: "loot.drop", Count: 1, Props: map[string]string{"t.x": "1", "t.y": "2"}, PropTypes: map[string]uint8{"t.x": 1, "t.y": 1}}}}, t0)
+	if got := fileOf(t, res, "loot.jsonl"); got != `{"t":1.0000,"frame":1,"run":0,"ev":"drop","t.x":1,"t.y":2}`+"\n" || res.DroppedProps != 0 {
+		t.Errorf("%s %d", got, res.DroppedProps)
+	}
+}
+
 func itoa(n int) string { b, _ := json.Marshal(n); return string(b) }
 
 func TestWriteZip(t *testing.T) {

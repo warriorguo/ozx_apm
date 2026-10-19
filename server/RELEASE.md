@@ -4267,8 +4267,20 @@ columns after a permanent rollback (admin; mutations):
   re-sent builders), except the 2 environment failures as before; the 2 new
   allocation tests need the Unity runtime.
 
+- A code review (another agent) found: `Span`/`stackalloc` in the SDK's
+  number formatting (not available on Unity 2020.3's API profiles, the
+  package's minimum), the game clock's engine read not guarded (an
+  exception there would have cost the exception being captured), the byte
+  limit not counting session.json's per-file entries (many channels could
+  exceed it), the clock/dropped counters counting lines cut by the limit, a
+  vector named like a leading field (`t.x`/`t.y`) dropped as one; all fixed
+  with tests (the SDK fixture regenerated: identical).
+
 ### Not verified (for the lead)
 
+- Compiling the SDK against Unity 2020.3's .NET Standard 2.0 profile (no
+  2.0 reference assemblies here; `Span` was removed, nothing else of 2.1 is
+  used to my knowledge).
 - The integration tests (`tests/integration/apm10_test.go`: the SDK
   fixture through ingest -> ClickHouse -> export on both insert paths, with
   ai_trace.py when `OZX_AI_TRACE` is set; hostile text through ClickHouse;

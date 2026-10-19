@@ -721,6 +721,8 @@ namespace OzxApm.Utils
         }
 
         /// <summary>The text Fixed writes (allocates; for property values and tests).</summary>
+        [ThreadStatic] private static char[] t_fixedChars;
+
         internal static string FixedString(double value, int decimals)
         {
             if (double.IsNaN(value) || double.IsInfinity(value))
@@ -728,7 +730,8 @@ namespace OzxApm.Utils
             if (!FixedText(value, decimals, out long units, out int d, out bool negative))
                 return value.ToString("R", CultureInfo.InvariantCulture);
             // One allocation: the string. At most 1 + 16 + 1 + 6 characters.
-            Span<char> buf = stackalloc char[32];
+            // (No Span: Unity 2020.3 has no .NET Standard 2.1 profile.)
+            var buf = t_fixedChars ?? (t_fixedChars = new char[32]);
             int n = 0;
             if (negative)
                 buf[n++] = '-';
@@ -740,7 +743,7 @@ namespace OzxApm.Utils
                 buf[n++] = (char)('0' + (int)(whole % 10));
                 whole /= 10;
             } while (whole != 0);
-            buf.Slice(start, n - start).Reverse();
+            Array.Reverse(buf, start, n - start);
             if (d > 0)
             {
                 buf[n++] = '.';
@@ -751,7 +754,7 @@ namespace OzxApm.Utils
                     frac %= p;
                 }
             }
-            return new string(buf.Slice(0, n));
+            return new string(buf, 0, n);
         }
 
         [StructLayout(LayoutKind.Explicit)]

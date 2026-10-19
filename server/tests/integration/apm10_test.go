@@ -116,7 +116,7 @@ func TestAPM10_SessionExport(t *testing.T) {
 				e.ev("scene_load", session, "2.4.0", 200, map[string]interface{}{"scene_name": "Gameplay", "load_ms": 812.5, "activate_ms": 40, "t": 0.2, "frame": 12}),
 				e.ev("run", session, "2.4.0", 58000, map[string]interface{}{"run_id": "run-2001", "end_reason": "end", "result": "defeat", "duration_ms": 57400,
 					"samples": 57, "peak_rss_mb": 1250.5, "t": 57.9, "frame": 3427}),
-				e.ev("crash", session, "2.4.0", 59000, map[string]interface{}{"crash_type": "anr", "stack": "main\n  at android.os.MessageQueue.nativePollOnce"}),
+				e.ev("crash", session, "2.4.0", 59000, map[string]interface{}{"crash_type": "anr", "fingerprint": "anr-main", "stack": "main\n  at android.os.MessageQueue.nativePollOnce"}),
 				e.ev("custom_event", "other-"+session, "2.4.0", 1000, map[string]interface{}{"name": "playermovement.room_enter", "count": 1, "t": 1.0, "frame": 60,
 					"props": map[string]interface{}{"roomId": "not-this-session"}}),
 			)

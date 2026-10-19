@@ -208,6 +208,9 @@ type line struct {
 	seq   uint64
 	order int // input order, for a stable sort
 	data  []byte
+	// counted only if the line is written
+	withoutClock bool
+	dropped      int
 }
 
 // Build turns the session's rows into the export's files.
@@ -235,8 +238,9 @@ func Build(in Input, exportedAt time.Time) *Result {
 	lines := make([]line, 0, len(rows))
 	for i := range rows {
 		r := &rows[i]
-		file, data := buildLine(r, runOf[r.RunID], res)
-		lines = append(lines, line{file: file, time: r.Time, seq: r.Seq, order: i, data: data})
+		l := buildLine(r, runOf[r.RunID])
+		l.time, l.seq, l.order = r.Time, r.Seq, i
+		lines = append(lines, l)
 	}
 
 	// Files in time order of their lines, cut at MaxBytes.
@@ -250,16 +254,26 @@ func Build(in Input, exportedAt time.Time) *Result {
 			cut = true
 			break
 		}
-		total += len(l.data) + 1
 		b := buffers[l.file]
 		if b == nil {
+			// session.json's "lines" gets an entry for the file.
+			if total+len(l.data)+1+len(l.file)+32 > maxBytes {
+				cut = true
+				break
+			}
+			total += len(l.file) + 32
 			b = &bytes.Buffer{}
 			buffers[l.file] = b
 			names = append(names, l.file)
 		}
+		total += len(l.data) + 1
 		b.Write(l.data)
 		b.WriteByte('\n')
 		res.Lines[l.file]++
+		if l.withoutClock {
+			res.WithoutClock++
+		}
+		res.DroppedProps += l.dropped
 	}
 	if cut {
 		res.Truncated = append(res.Truncated, "bytes")
@@ -276,7 +290,7 @@ func Build(in Input, exportedAt time.Time) *Result {
 }
 
 // buildLine returns the file and the JSON text of one row.
-func buildLine(r *Row, run int, res *Result) (string, []byte) {
+func buildLine(r *Row, run int) line {
 	var w writer
 	hasClock := r.GameT != nil && r.Frame != nil && finite(*r.GameT)
 	if r.Source == SourceCustomEvent && hasClock && !r.Aggregated {
@@ -293,9 +307,9 @@ func buildLine(r *Row, run int, res *Result) (string, []byte) {
 		w.raw(strconv.Itoa(run))
 		w.key("ev")
 		w.str(ev)
-		res.DroppedProps += w.props(r.Props, r.PropTypes, true)
+		dropped := w.props(r.Props, r.PropTypes, true)
 		w.end()
-		return file, w.bytes()
+		return line{file: file, data: w.bytes(), dropped: dropped}
 	}
 
 	// apm.jsonl
@@ -305,8 +319,6 @@ func buildLine(r *Row, run int, res *Result) (string, []byte) {
 		w.raw(strconv.FormatFloat(*r.GameT, 'f', 4, 64))
 		w.key("frame")
 		w.raw(strconv.FormatInt(*r.Frame, 10))
-	} else {
-		res.WithoutClock++
 	}
 	w.key("run")
 	w.raw(strconv.Itoa(run))
@@ -339,7 +351,7 @@ func buildLine(r *Row, run int, res *Result) (string, []byte) {
 		w.value(f.Value)
 	}
 	w.end()
-	return FileAPM, w.bytes()
+	return line{file: FileAPM, data: w.bytes(), withoutClock: !hasClock}
 }
 
 func finite(f float64) bool { return !math.IsNaN(f) && !math.IsInf(f, 0) }
@@ -433,7 +445,7 @@ func (w *writer) props(props map[string]string, types map[string]uint8, skipRese
 	for k := range props {
 		if strings.HasSuffix(k, ".x") {
 			base := k[:len(k)-2]
-			if _, clash := props[base]; !clash && base != "" && isNum(k) && isNum(base+".y") {
+			if _, clash := props[base]; !clash && base != "" && !(skipReserved && reservedKeys[base]) && isNum(k) && isNum(base+".y") {
 				vec[base] = true
 				keys = append(keys, base)
 				continue
@@ -441,7 +453,7 @@ func (w *writer) props(props map[string]string, types map[string]uint8, skipRese
 		}
 		if strings.HasSuffix(k, ".y") {
 			base := k[:len(k)-2]
-			if _, clash := props[base]; !clash && base != "" && isNum(base+".x") && isNum(k) {
+			if _, clash := props[base]; !clash && base != "" && !(skipReserved && reservedKeys[base]) && isNum(base+".x") && isNum(k) {
 				continue // written with its .x
 			}
 		}
