@@ -48,6 +48,8 @@ namespace OzxApm.Core
 
         /// <summary>The main thread for the ANR watchdog (Android); null: no watchdog.</summary>
         internal IMainThreadProbe Probe;
+        /// <summary>Enqueues the run an earlier process had open when it ended (APM-9); null: not reported.</summary>
+        internal Action<RunEvent> EnqueueRun;
         /// <summary>The live ANR reports so far (stats, tests).</summary>
         internal AnrWatchdog Watchdog => _watchdog;
 
@@ -69,6 +71,8 @@ namespace OzxApm.Core
         internal JournalInputs Inputs => _inputs;
 
         internal void SetPerf(PerformanceCollector perf) => _inputs.Perf = perf;
+
+        internal void SetRuns(RunTracker runs) => _inputs.Runs = runs;
 
         /// <summary>Collecting (technical consent Granted) started or stopped.</summary>
         internal void OnCollecting(bool on)
@@ -97,6 +101,7 @@ namespace OzxApm.Core
             {
                 CurrentDeviceId = _inputs.DeviceId,
                 UnityTombstoneDir = _inputs.UnityTombstoneDir,
+                EnqueueRun = EnqueueRun,
             };
             if (!_useThreads)
             {

@@ -89,6 +89,12 @@ namespace OzxApm.Models
             evt.main_thread_ms = 0;
             evt.gc_alloc_kb = 0;
             evt.mem_mb = 0;
+            evt.interval_ms = 0;
+            evt.mem_mono_heap_mb = 0;
+            evt.mem_alloc_mb = 0;
+            evt.mem_reserved_mb = 0;
+            evt.mem_gfx_mb = 0;
+            evt.mem_rss_mb = 0;
         }
     }
 }

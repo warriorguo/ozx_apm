@@ -156,6 +156,11 @@ namespace OzxApm.Core
         /// <summary>The last run's events (tests).</summary>
         internal readonly List<CrashEvent> LastEvents = new List<CrashEvent>();
 
+        /// <summary>Enqueues the run a crashed process had open (APM-9, BuildRun); null: not reported.</summary>
+        internal Action<RunEvent> EnqueueRun;
+        /// <summary>The run events of the last report (tests).</summary>
+        internal readonly List<RunEvent> LastRuns = new List<RunEvent>();
+
         internal CrashReporter(string dir, IExitInfoSource source, Action<CrashEvent> enqueue, Func<bool> allowed, Func<int, bool> waitPersisted)
         {
             _dir = dir;
@@ -184,6 +189,7 @@ namespace OzxApm.Core
         private void Process(int ownPid, long ownStartMs)
         {
             LastEvents.Clear();
+            LastRuns.Clear();
             DeleteStaleTraces();
             var invalid = new List<string>();
             var journals = CrashJournal.ReadPrevious(_dir, ownPid, ownStartMs, invalid);
@@ -281,12 +287,17 @@ namespace OzxApm.Core
                 var evt = Build(j, exit, trace);
                 if (evt != null)
                     events.Add(evt);
+                // APM-9: a run the process did not survive ends here.
+                var run = BuildRun(j, exit, evt);
                 if (events.Count == 0)
                 {
                     NotCrashes++;
-                    foreach (var f in j.Files)
-                        TryDelete(f);
-                    continue;
+                    if (run == null)
+                    {
+                        foreach (var f in j.Files)
+                            TryDelete(f);
+                        continue;
+                    }
                 }
                 if (!_allowed())
                     return; // consent withdrawn meanwhile: keep the journals (Undecided keeps, Denied deletes them)
@@ -297,6 +308,11 @@ namespace OzxApm.Core
                     _enqueue(ev);
                     LastEvents.Add(ev);
                     Reported++;
+                }
+                if (run != null)
+                {
+                    EnqueueRun?.Invoke(run);
+                    LastRuns.Add(run);
                 }
                 reportedJournals.Add(j);
             }
@@ -647,11 +663,84 @@ namespace OzxApm.Core
                 details.Add(j.PerfKeys[i]);
                 details.Add(j.PerfValues[i]);
             }
+            // APM-9: how old the last memory reading was at the crash, and the
+            // open run (its peaks are among the keys above).
+            if (j.MemMs > 0)
+            {
+                details.Add("mem_age_ms");
+                details.Add(Math.Max(0, evt.timestamp - j.MemMs).ToString(CultureInfo.InvariantCulture));
+            }
+            if (j.RunId != null)
+            {
+                details.Add("run_id");
+                details.Add(j.RunId);
+                if (j.RunStartMs > 0)
+                {
+                    details.Add("run_ms");
+                    details.Add(Math.Max(0, evt.timestamp - j.RunStartMs).ToString(CultureInfo.InvariantCulture));
+                }
+            }
             evt.details = details.ToArray();
             evt.fingerprint = Fingerprint(evt, trace);
             if (type == "anr")
                 UseWatchdogIdentity(j, evt);
             return evt;
+        }
+
+        /// <summary>
+        /// The run a journal had open (APM-9): the process ended before EndRun,
+        /// so the run ends here, at the crash (end reason crash, crash type of
+        /// the exit) or, when the exit was not a crash (a background kill), at
+        /// the exit / the journal's last write (process_end). Its peaks are the
+        /// journal's; null when the journal had no run.
+        /// </summary>
+        internal static RunEvent BuildRun(JournalRecord j, ExitRecord e, CrashEvent crash)
+        {
+            if (j.RunId == null)
+                return null;
+            long ts = crash != null && crash.timestamp > 0 ? crash.timestamp
+                : e != null && e.TimestampMs > 0 ? e.TimestampMs : j.WrittenMs;
+            var run = new RunEvent
+            {
+                run_id = j.RunId,
+                end_reason = crash != null ? RunEvent.EndCrash : RunEvent.EndProcessEnd,
+                crash_type = crash?.crash_type,
+                timestamp = ts,
+                event_id = EventId(j, "run"),
+                app_version = j.AppVersion,
+                platform = j.Platform,
+                device_model = j.DeviceModel,
+                os_version = j.OsVersion,
+                session_id = j.SessionId,
+                device_id = j.DeviceId,
+                scene = j.Scene,
+                build_type = j.BuildType,
+                gpu = j.Gpu,
+                ram_class = j.RamClass,
+                net_type = j.NetType,
+                duration_ms = j.RunStartMs > 0 ? Math.Max(0, ts - j.RunStartMs) : 0,
+                samples = (int)PerfNumber(j, "run_samples"),
+                peak_mem_mb = PerfNumber(j, "run_peak_mem_mb"),
+                peak_mono_heap_mb = PerfNumber(j, "run_peak_mono_heap_mb"),
+                peak_alloc_mb = PerfNumber(j, "run_peak_alloc_mb"),
+                peak_reserved_mb = PerfNumber(j, "run_peak_reserved_mb"),
+                peak_gfx_mb = PerfNumber(j, "run_peak_gfx_mb"),
+                peak_rss_mb = PerfNumber(j, "run_peak_rss_mb"),
+                start_alloc_mb = PerfNumber(j, "run_start_alloc_mb"),
+                start_rss_mb = PerfNumber(j, "run_start_rss_mb"),
+                end_alloc_mb = PerfNumber(j, "mem_alloc_mb"),
+                end_rss_mb = PerfNumber(j, "mem_rss_mb"),
+            };
+            run.ctx = Context(j);
+            return run;
+        }
+
+        private static float PerfNumber(JournalRecord j, string key)
+        {
+            int i = j.PerfKeys.IndexOf(key);
+            if (i < 0)
+                return 0;
+            return float.TryParse(j.PerfValues[i], NumberStyles.Float, CultureInfo.InvariantCulture, out float v) && v > 0 && !float.IsInfinity(v) ? v : 0;
         }
 
         private static ContextSnapshot Context(JournalRecord j)

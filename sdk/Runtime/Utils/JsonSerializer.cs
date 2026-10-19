@@ -97,6 +97,39 @@ namespace OzxApm.Utils
                     Field(w, "main_thread_ms", perf.main_thread_ms);
                     Field(w, "gc_alloc_kb", perf.gc_alloc_kb);
                     Field(w, "mem_mb", perf.mem_mb);
+                    // APM-9; a figure that is not available (0) is not sent.
+                    if (perf.interval_ms > 0)
+                    {
+                        w.Name("interval_ms");
+                        w.Long(perf.interval_ms);
+                    }
+                    OptionalField(w, "mem_mono_heap_mb", perf.mem_mono_heap_mb);
+                    OptionalField(w, "mem_alloc_mb", perf.mem_alloc_mb);
+                    OptionalField(w, "mem_reserved_mb", perf.mem_reserved_mb);
+                    OptionalField(w, "mem_gfx_mb", perf.mem_gfx_mb);
+                    OptionalField(w, "mem_rss_mb", perf.mem_rss_mb);
+                    break;
+
+                case RunEvent run:
+                    // APM-9
+                    Field(w, "run_id", run.run_id);
+                    Field(w, "end_reason", run.end_reason);
+                    OptionalField(w, "result", run.result);
+                    OptionalField(w, "crash_type", run.crash_type);
+                    w.Name("duration_ms");
+                    w.Long(run.duration_ms);
+                    w.Name("samples");
+                    w.Long(run.samples);
+                    OptionalField(w, "peak_mem_mb", run.peak_mem_mb);
+                    OptionalField(w, "peak_mono_heap_mb", run.peak_mono_heap_mb);
+                    OptionalField(w, "peak_alloc_mb", run.peak_alloc_mb);
+                    OptionalField(w, "peak_reserved_mb", run.peak_reserved_mb);
+                    OptionalField(w, "peak_gfx_mb", run.peak_gfx_mb);
+                    OptionalField(w, "peak_rss_mb", run.peak_rss_mb);
+                    OptionalField(w, "start_alloc_mb", run.start_alloc_mb);
+                    OptionalField(w, "start_rss_mb", run.start_rss_mb);
+                    OptionalField(w, "end_alloc_mb", run.end_alloc_mb);
+                    OptionalField(w, "end_rss_mb", run.end_rss_mb);
                     break;
 
                 case JankEvent jank:
@@ -295,6 +328,15 @@ namespace OzxApm.Utils
 
         private static void Field(JsonLine w, string name, float value)
         {
+            w.Name(name);
+            w.Float2(value);
+        }
+
+        // A figure that is 0 (or not a positive finite number) is not available: not sent.
+        private static void OptionalField(JsonLine w, string name, float value)
+        {
+            if (!(value > 0) || float.IsInfinity(value))
+                return;
             w.Name(name);
             w.Float2(value);
         }

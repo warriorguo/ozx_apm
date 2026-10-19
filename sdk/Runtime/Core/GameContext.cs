@@ -222,6 +222,26 @@ namespace OzxApm.Core
             }
         }
 
+        /// <summary>
+        /// The count ranges of ApmClient.SetContextCount (APM-9). The server
+        /// groups raw numeric context values into the same ranges
+        /// (models.CountBucketLabels): both must change together.
+        /// </summary>
+        internal static readonly string[] CountBucketLabels = { "0", "1-5", "6-10", "11-20", "21-30", "31-50", "51-100", "101-200", "201+" };
+        /// <summary>Exclusive upper bounds of CountBucketLabels but the last.</summary>
+        internal static readonly long[] CountBucketUpper = { 1, 6, 11, 21, 31, 51, 101, 201 };
+
+        /// <summary>The count range of n (a constant string: no allocation). Negative counts read as 0.</summary>
+        internal static string CountBucket(long n)
+        {
+            for (int i = 0; i < CountBucketUpper.Length; i++)
+            {
+                if (n < CountBucketUpper[i])
+                    return CountBucketLabels[i];
+            }
+            return CountBucketLabels[CountBucketLabels.Length - 1];
+        }
+
         /// <summary>True if key is 1-64 characters from [A-Za-z0-9_.-].</summary>
         public static bool IsValidKey(string key)
         {

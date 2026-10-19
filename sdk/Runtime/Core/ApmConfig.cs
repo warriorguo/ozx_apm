@@ -112,6 +112,16 @@ namespace OzxApm.Core
         public float SamplingIntervalSeconds { get; set; } = 1.0f;
 
         /// <summary>
+        /// The perf sample's memory breakdown (APM-9): Unity's managed heap
+        /// reserved, native memory allocated and reserved, graphics memory, and
+        /// the process RSS (Android: /proc/self/statm on a thread of its own at
+        /// SamplingIntervalSeconds; elsewhere Unity's System Used Memory), and
+        /// the peaks of game runs (ApmClient.BeginRun). Read once per perf
+        /// sample, never per frame.
+        /// </summary>
+        public bool EnableMemoryBreakdown { get; set; } = true;
+
+        /// <summary>
         /// Frame time threshold for jank detection (ms)
         /// </summary>
         public float JankThresholdMs { get; set; } = 50.0f;

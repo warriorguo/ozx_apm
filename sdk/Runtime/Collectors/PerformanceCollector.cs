@@ -1,3 +1,4 @@
+using System;
 using UnityEngine;
 using OzxApm.Core;
 using OzxApm.Models;
@@ -90,6 +91,10 @@ namespace OzxApm.Collectors
             evt.main_thread_ms = avgFrameTime; // In Unity, main thread ≈ frame time for most cases
             evt.gc_alloc_kb = gcAllocKb;
             evt.mem_mb = _client.GetUsedMemoryMB();
+            // APM-9: the play time the sample covers, and the memory breakdown
+            // (a few engine calls, no allocation; once per sample).
+            evt.interval_ms = (int)Math.Min(int.MaxValue, Math.Round(elapsed * 1000.0));
+            _client.SampleMemory(evt);
             LastFps = fps;
             LastFrameMs = avgFrameTime;
             LastMaxFrameMs = _maxFrameTime;

@@ -75,6 +75,22 @@ namespace OzxApm.Core
         public long CrashJournalWrites;
         /// <summary>Duration of the last crash journal write on its thread, in milliseconds.</summary>
         public double CrashJournalWriteMs;
+        /// <summary>The open game run's id (ApmClient.BeginRun, APM-9), or null.</summary>
+        public string RunId;
+        /// <summary>Runs ended in this process (EndRun, a new BeginRun, shutdown).</summary>
+        public int RunsEnded;
+        /// <summary>The perf sample reads the memory breakdown (ApmConfig.EnableMemoryBreakdown).</summary>
+        public bool MemoryBreakdown;
+        /// <summary>The process RSS is read from /proc/self/statm on its own thread (Android).</summary>
+        public bool ProcRss;
+        /// <summary>Main-thread time of the last memory reading of a perf sample, in milliseconds.</summary>
+        public double MemorySampleMs;
+        /// <summary>Time of the last RSS reading on its thread, in milliseconds.</summary>
+        public double RssReadMs;
+        /// <summary>The last RSS reading (MB); 0 before the first or where not read.</summary>
+        public float RssMb;
+        /// <summary>RSS readings so far.</summary>
+        public long RssReadings;
         /// <summary>"release", "dev" or "editor"; null before Initialize.</summary>
         public string BuildType;
         /// <summary>False in the Unity Editor unless ApmConfig.UploadInEditor.</summary>

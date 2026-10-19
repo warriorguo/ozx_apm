@@ -65,6 +65,10 @@ namespace OzxApm.Core
         // null where crash reporting is off (not Android, or disabled).
         private CrashMonitor _crash;
         private string _crashDir;
+        // Memory readings and game runs (APM-9).
+        private RunTracker _runs;
+        private MemorySampler _memory;
+        private static volatile RunTracker s_runs;
 
         // Read by the static API from any thread (TrackEvent, RecordMetric,
         // timers, RecordBreadcrumb) without touching the UnityEngine.Object.
@@ -496,6 +500,118 @@ namespace OzxApm.Core
         }
 
         /// <summary>
+        /// Sets a context key to the count range of a number (APM-9), e.g. the
+        /// alive enemy count: "0", "1-5", "6-10", "11-20", "21-30", "31-50",
+        /// "51-100", "101-200", "201+" (the server groups raw numbers into the
+        /// same ranges). The context only changes when the count enters another
+        /// range, so calling it whenever the count changes, even every frame,
+        /// copies nothing and allocates nothing. Any thread; works before
+        /// Initialize. Returns false for an invalid key.
+        /// </summary>
+        public static bool SetContextCount(string key, long count)
+        {
+            try
+            {
+                return GameContext.Set(key, GameContext.CountBucket(count));
+            }
+            catch (Exception ex)
+            {
+                ReportInternalError("SetContextCount", ex);
+                return false;
+            }
+        }
+
+        // ------------------------------------------------------------------
+        // Game runs (APM-9)
+        //
+        // A run is one play-through between BeginRun and EndRun (for OZX: a
+        // dungeon run). While it is open, the context key "runId" is the run's
+        // id (every event of the run carries it), and the SDK keeps the peak
+        // of every memory figure it reads (the perf sample's breakdown and,
+        // on Android, the process RSS). EndRun sends one "run" event with the
+        // peaks, the length and the result. If the process dies during a run
+        // (an OOM kill, a crash), the crash journal has the run and its peaks:
+        // the next launch sends the run (end reason "crash" with the crash
+        // type, or "process_end") and the crash's details carry the run's
+        // peaks and the last memory reading.
+        //
+        // Technical data: without technical consent the run is tracked in
+        // memory but nothing is sent or written (APM-14).
+        // ------------------------------------------------------------------
+
+        /// <summary>
+        /// Starts a game run with the game's id for it (1-64 printable
+        /// characters; e.g. the run sequence number or seed: never personal
+        /// data). A run still open is ended first (end reason "new_run") and
+        /// sent. Sets the context key "runId". Any thread; returns false before
+        /// Initialize or for an invalid id. Allocates the ended run's event.
+        /// </summary>
+        public static bool BeginRun(string runId)
+        {
+            try
+            {
+                var runs = s_runs;
+                var client = _instance;
+                if (runs == null || !_isInitialized || ReferenceEquals(client, null))
+                    return false;
+                if (!RunTracker.IsValidRunId(runId))
+                {
+                    Log(LogLevel.Warning, "BeginRun: the run id must be 1-64 printable characters; not started");
+                    return false;
+                }
+                var previous = runs.Begin(runId);
+                if (previous != null)
+                    client.EnqueueEvent(previous); // with the previous run's context
+                GameContext.Set(RunTracker.ContextKey, runId);
+                CrashJournal.NotifyChanged();
+                return true;
+            }
+            catch (Exception ex)
+            {
+                ReportInternalError("BeginRun", ex);
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Ends the open run and sends it with its peak memory, length and the
+        /// optional result ([A-Za-z0-9_.-]{1,64}, e.g. "win", "death", "quit";
+        /// an invalid one is left out). Removes the context key "runId" (if it
+        /// still is the run's id). Returns false when no run is open. Any thread.
+        /// </summary>
+        public static bool EndRun(string result = null)
+        {
+            try
+            {
+                var runs = s_runs;
+                var client = _instance;
+                if (runs == null || !_isInitialized || ReferenceEquals(client, null))
+                    return false;
+                if (result != null && !GameContext.IsValidKey(result))
+                {
+                    Log(LogLevel.Warning, "EndRun: the result must be [A-Za-z0-9_.-]{1,64}; sent without it");
+                    result = null;
+                }
+                var evt = runs.End(RunEvent.EndEnd, result);
+                if (evt == null)
+                    return false;
+                client.EnqueueEvent(evt);
+                if (GameContext.Current.TryGetValue(RunTracker.ContextKey, out string current) && current == evt.run_id)
+                    GameContext.Remove(RunTracker.ContextKey);
+                CrashJournal.NotifyChanged();
+                return true;
+            }
+            catch (Exception ex)
+            {
+                ReportInternalError("EndRun", ex);
+                return false;
+            }
+        }
+
+        /// <summary>The open run's id, or null.</summary>
+        public static string CurrentRunId => s_runs?.CurrentRunId;
+
+        /// <summary>
         /// Marks Time To Interactive. Also tells the SDK the game has finished
         /// loading, so uploads may start before InitialUploadDelaySeconds.
         /// </summary>
@@ -892,6 +1008,7 @@ namespace OzxApm.Core
             s_timeline = _timeline;
             _currentScene = SceneManager.GetActiveScene().name;
             CreateCrashMonitor();
+            CreateMemorySampler();
             InitializeCollectors();
 
             // Subscribe to scene changes
@@ -970,6 +1087,35 @@ namespace OzxApm.Core
                 },
                 threads);
             _crash.Probe = _config.EnableAnrWatchdog ? probe : null;
+            _crash.EnqueueRun = EnqueuePreviousRun;
+        }
+
+        /// <summary>
+        /// Memory readings and game runs (APM-9). The RSS of /proc/self/statm is
+        /// read on its own thread on Android; elsewhere the perf sample reads
+        /// Unity's System Used Memory instead.
+        /// </summary>
+        private void CreateMemorySampler()
+        {
+            _runs = new RunTracker();
+            s_runs = _runs;
+            _crash?.SetRuns(_runs);
+            if (!_config.EnableMemoryBreakdown)
+                return;
+            string statm = ProcStatmPathForTests ??
+                (MemorySourceForTests == null && Application.platform == RuntimePlatform.Android ? ProcStatm.DefaultPath : null);
+            var testSource = MemorySourceForTests;
+            Func<IMemorySource> source = testSource != null
+                ? () => testSource
+                : (Func<IMemorySource>)(() => new UnityMemorySource(statm == null));
+            int intervalMs = (int)(Math.Max(0.1f, _config.SamplingIntervalSeconds) * 1000f);
+            _memory = new MemorySampler(_runs, source, statm, intervalMs);
+        }
+
+        /// <summary>The perf sample's memory figures (PerformanceCollector, main thread).</summary>
+        internal void SampleMemory(PerfSampleEvent evt)
+        {
+            _memory?.Sample(evt, evt.mem_mb);
         }
 
         private void InitializeCollectors()
@@ -1061,6 +1207,17 @@ namespace OzxApm.Core
             {
                 ReportInternalError("CrashMonitor", ex);
             }
+            try
+            {
+                if (on)
+                    _memory?.Start(StoragePathForTests == null);
+                else
+                    _memory?.Stop();
+            }
+            catch (Exception ex)
+            {
+                ReportInternalError("MemorySampler", ex);
+            }
             foreach (var collector in _collectors)
             {
                 if (ReferenceEquals(collector, _startupTracker))
@@ -1150,6 +1307,20 @@ namespace OzxApm.Core
                     stats.CrashJournalWriteMs = journal.LastWriteTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
                 }
             }
+            if (client._runs != null)
+            {
+                stats.RunId = client._runs.CurrentRunId;
+                stats.RunsEnded = client._runs.RunsEnded;
+            }
+            if (client._memory != null)
+            {
+                stats.MemoryBreakdown = true;
+                stats.ProcRss = client._memory.ReadsProcRss;
+                stats.MemorySampleMs = client._memory.LastSampleTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+                stats.RssReadMs = client._memory.LastRssReadTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+                stats.RssMb = client._memory.LastRssMb;
+                stats.RssReadings = System.Threading.Interlocked.Read(ref client._memory.RssReadings);
+            }
             stats.TimersSpanningPause = TimerRegistry.SpanningPauseCount;
             stats.TimersUntracked = TimerRegistry.UntrackedCount;
             if (client._timeline != null)
@@ -1173,6 +1344,11 @@ namespace OzxApm.Core
         internal static IMainThreadProbe ProbeForTests;
         internal static int PidForTests = 4242;
         internal CrashMonitor CrashMonitorForTests => _crash;
+        /// <summary>APM-9: a statm file read instead of /proc/self/statm, and the engine's memory figures, for the next Initialize.</summary>
+        internal static string ProcStatmPathForTests;
+        internal static IMemorySource MemorySourceForTests;
+        internal MemorySampler MemorySamplerForTests => _memory;
+        internal RunTracker RunsForTests => _runs;
         internal OfflineStorage StorageForTests => _offlineStorage;
         internal EventReporter ReporterForTests => _reporter;
         internal ExceptionCollector ExceptionCollectorForTests => _exceptionCollector;
@@ -1197,6 +1373,9 @@ namespace OzxApm.Core
             s_custom = null;
             s_timeline = null;
             s_collecting = false;
+            s_runs = null;
+            ProcStatmPathForTests = null;
+            MemorySourceForTests = null;
             _resetDeviceIdBeforeInit = false;
             for (int i = 0; i < _explicitConsent.Length; i++)
                 _explicitConsent[i] = -1;
@@ -1299,6 +1478,9 @@ namespace OzxApm.Core
                 _sessionManager.OnApplicationPause(paused);
                 // The journal says whether a later kill hit the game in the foreground (APM-7).
                 _crash?.OnPause(paused);
+                // The RSS reader sleeps in the background (APM-9).
+                if (_memory != null)
+                    _memory.Paused = paused;
 
                 if (paused)
                 {
@@ -1362,6 +1544,13 @@ namespace OzxApm.Core
             {
                 Log(LogLevel.Info, "Shutting down APM SDK");
 
+                // A run still open ends here (APM-9), before the journal is
+                // marked clean (a clean journal's run would be lost).
+                var openRun = _runs?.End(RunEvent.EndShutdown, null);
+                if (openRun != null)
+                    EnqueueEvent(openRun);
+                _memory?.Dispose();
+
                 // Stop collectors (ExceptionCollector enqueues its pending repeats here)
                 foreach (var collector in _collectors)
                 {
@@ -1378,6 +1567,7 @@ namespace OzxApm.Core
                 _collecting = false;
                 s_collecting = false;
                 s_custom = null;
+                s_runs = null;
 
                 SceneManager.sceneLoaded -= OnSceneLoaded;
 
@@ -1512,6 +1702,28 @@ namespace OzxApm.Core
             catch (Exception ex)
             {
                 ReportInternalError("EnqueuePreviousCrash", ex);
+            }
+        }
+
+        /// <summary>
+        /// Enqueues the run an earlier process had open when it died (APM-9,
+        /// CrashReporter.BuildRun, on its thread): every field is that
+        /// process's, like EnqueuePreviousCrash. Only with technical consent.
+        /// </summary>
+        internal void EnqueuePreviousRun(RunEvent evt)
+        {
+            var storage = _offlineStorage;
+            if (evt == null || storage == null || !_config.TechnicalAllowed)
+                return;
+            try
+            {
+                if (evt.ctx == null)
+                    evt.ctx = ContextSnapshot.Empty;
+                storage.Enqueue(evt);
+            }
+            catch (Exception ex)
+            {
+                ReportInternalError("EnqueuePreviousRun", ex);
             }
         }
 

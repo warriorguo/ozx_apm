@@ -33,6 +33,8 @@ namespace OzxApm.Core
         public Func<string> DeviceId;
         public Timeline Timeline;
         public PerformanceCollector Perf;
+        /// <summary>Memory readings and the open game run (APM-9); null: none.</summary>
+        public RunTracker Runs;
         /// <summary>Where Unity's crash handler writes tombstone_NN (persistentDataPath; read by CrashReporter), null: none.</summary>
         public string UnityTombstoneDir;
         /// <summary>
@@ -70,6 +72,10 @@ namespace OzxApm.Core
     ///   device / app_version / build_type / platform / device_model /
     ///   os_version / gpu / ram_class / net_type / abi / scene / fg /
     ///   fps / frame_ms / frame_ms_max / mem_mb / gc_count /
+    ///   (APM-9, each only when known) mem_mono_heap_mb / mem_alloc_mb /
+    ///   mem_reserved_mb / mem_gfx_mb / mem_rss_mb / mem_ms / proc_peak_rss_mb /
+    ///   run_id / run_start / run_samples / run_peak_*_mb / run_start_alloc_mb /
+    ///   run_start_rss_mb /
     ///   ctx.&lt;key&gt; (one per context entry) / crumb (one per time line line, oldest first) /
     ///   end=&lt;FNV-1a 64 of the bytes before this line&gt;
     /// </summary>
@@ -340,6 +346,9 @@ namespace OzxApm.Core
                 Tenths("mem_mb", perf.LastMemMb);
                 Num("gc_count", perf.LastGcCount);
             }
+            var runs = input.Runs;
+            if (runs != null)
+                AppendMemory(runs);
             var ctx = GameContext.Current;
             for (int i = 0; i < ctx.Count; i++)
             {
@@ -366,6 +375,42 @@ namespace OzxApm.Core
                 _bytes[n++] = (byte)Hex((int)(h >> shift) & 0xF);
             _bytes[n++] = (byte)'\n';
             return n;
+        }
+
+        // APM-9: the last memory reading, the process's peak RSS and the open
+        // run with its peaks (a copy taken under the tracker's lock; no allocation).
+        private void AppendMemory(RunTracker runs)
+        {
+            runs.Read(out MemoryJournalState m);
+            if (m.LastMs > 0)
+            {
+                Positive("mem_mono_heap_mb", m.Last.MonoHeap);
+                Positive("mem_alloc_mb", m.Last.Alloc);
+                Positive("mem_reserved_mb", m.Last.Reserved);
+                Positive("mem_gfx_mb", m.Last.Gfx);
+                Positive("mem_rss_mb", m.Last.Rss);
+                Num("mem_ms", m.LastMs);
+            }
+            Positive("proc_peak_rss_mb", m.ProcessPeakRss);
+            if (m.RunId == null)
+                return;
+            Kv("run_id", m.RunId);
+            Num("run_start", m.RunStartMs);
+            Num("run_samples", m.RunSamples);
+            Positive("run_peak_mem_mb", m.RunPeak.Managed);
+            Positive("run_peak_mono_heap_mb", m.RunPeak.MonoHeap);
+            Positive("run_peak_alloc_mb", m.RunPeak.Alloc);
+            Positive("run_peak_reserved_mb", m.RunPeak.Reserved);
+            Positive("run_peak_gfx_mb", m.RunPeak.Gfx);
+            Positive("run_peak_rss_mb", m.RunPeak.Rss);
+            Positive("run_start_alloc_mb", m.RunStartAlloc);
+            Positive("run_start_rss_mb", m.RunStartRss);
+        }
+
+        private void Positive(string key, float value)
+        {
+            if (value > 0 && !float.IsInfinity(value))
+                Tenths(key, value);
         }
 
         private void Kv(string key, string value)
@@ -574,6 +619,10 @@ namespace OzxApm.Core
         /// <summary>The last ANR the watchdog reported in that process (0/null: none).</summary>
         public long AnrMs;
         public string AnrEventId;
+        /// <summary>APM-9: when the last memory reading was taken (Unix ms; 0: none), the open run (null: none) and its start.</summary>
+        public long MemMs;
+        public string RunId;
+        public long RunStartMs;
         public readonly List<string> PerfKeys = new List<string>();
         public readonly List<string> PerfValues = new List<string>();
         public readonly List<string> ContextKeys = new List<string>();
@@ -651,9 +700,28 @@ namespace OzxApm.Core
                     case "frame_ms_max":
                     case "mem_mb":
                     case "gc_count":
+                    // APM-9: the last memory reading, peaks of the process and the run
+                    case "mem_mono_heap_mb":
+                    case "mem_alloc_mb":
+                    case "mem_reserved_mb":
+                    case "mem_gfx_mb":
+                    case "mem_rss_mb":
+                    case "proc_peak_rss_mb":
+                    case "run_samples":
+                    case "run_peak_mem_mb":
+                    case "run_peak_mono_heap_mb":
+                    case "run_peak_alloc_mb":
+                    case "run_peak_reserved_mb":
+                    case "run_peak_gfx_mb":
+                    case "run_peak_rss_mb":
+                    case "run_start_alloc_mb":
+                    case "run_start_rss_mb":
                         r.PerfKeys.Add(key);
                         r.PerfValues.Add(value);
                         break;
+                    case "mem_ms": r.MemMs = ParseLong(value); break;
+                    case "run_id": r.RunId = RunTracker.IsValidRunId(value) ? value : null; break;
+                    case "run_start": r.RunStartMs = ParseLong(value); break;
                     case "crumb":
                         r.Breadcrumbs.Add(value);
                         break;

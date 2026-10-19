@@ -51,11 +51,61 @@ namespace OzxApm.Models
         public float frame_time_ms;
         public float main_thread_ms;
         public float gc_alloc_kb;
+        /// <summary>The managed heap in use (GC.GetTotalMemory), MB: unchanged by APM-9.</summary>
         public float mem_mb;
+        // APM-9: the sample's window and the memory breakdown (MB; 0 = not
+        // available, then not sent). See Core.MemoryFigures.
+        public int interval_ms;
+        public float mem_mono_heap_mb;
+        public float mem_alloc_mb;
+        public float mem_reserved_mb;
+        public float mem_gfx_mb;
+        public float mem_rss_mb;
 
         public PerfSampleEvent()
         {
             type = "perf_sample";
+        }
+    }
+
+    /// <summary>
+    /// A game run that ended (ApmClient.BeginRun / EndRun, APM-9): its id,
+    /// how it ended, the game's result, its length and the peak of each
+    /// memory figure (MB) while it ran, with native and resident memory at its
+    /// start and end. A run its process did not survive is reported at the
+    /// next launch from the crash journal (end_reason crash or process_end).
+    /// </summary>
+    [Serializable]
+    public class RunEvent : BaseEvent
+    {
+        internal const string EndEnd = "end";
+        internal const string EndNewRun = "new_run";
+        internal const string EndShutdown = "shutdown";
+        internal const string EndCrash = "crash";
+        internal const string EndProcessEnd = "process_end";
+
+        public string run_id;
+        public string end_reason;
+        /// <summary>EndRun's result ([A-Za-z0-9_.-]{1,64}); null for none.</summary>
+        public string result;
+        /// <summary>For end_reason crash: the APM-7 crash type.</summary>
+        public string crash_type;
+        public long duration_ms;
+        public int samples;
+        public float peak_mem_mb;
+        public float peak_mono_heap_mb;
+        public float peak_alloc_mb;
+        public float peak_reserved_mb;
+        public float peak_gfx_mb;
+        public float peak_rss_mb;
+        public float start_alloc_mb;
+        public float start_rss_mb;
+        public float end_alloc_mb;
+        public float end_rss_mb;
+
+        public RunEvent()
+        {
+            type = "run";
         }
     }
 
