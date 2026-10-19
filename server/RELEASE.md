@@ -2673,12 +2673,49 @@ Now:
   per process. A slow main thread that Android does not declare (no input
   waiting) is not reported. Its event id is the one the exit record's trace
   of the same ANR gets at the next launch (also written to the journal:
-  `anr_id`, `anr_ms`; a trace within 2 minutes of it keeps that id), so the
-  server keeps one event. UnityMain's stack is not in the live report (native,
-  not obtainable cheaply from Java); the exit trace has it. **Unverified on
-  the device:** whether One UI sets `NOT_RESPONDING` when it shows no dialog
-  (the A33 case). If not, the watchdog reports nothing for it and the exit
-  trace at the next launch is the report.
+  `anr_id`, `anr_ms`; a trace within 2 minutes of it keeps that id **and
+  the live report's timestamp**), so the server keeps one event. UnityMain's
+  stack is not in the live report (native, not obtainable cheaply from
+  Java); the exit trace has it. Verified on the A33 (round 2): One UI sets
+  `NOT_RESPONDING` without a dialog, the watchdog reported 4 s after
+  Android's `ANR in`.
+- **One ANR, one row, one group** (device round 2 stored the same event id
+  twice in two groups). Three causes, three fixes:
+  - the duplicate lookup searched only the incoming events' timestamp
+    range, and the trace's event had the dump time (4 s before the live
+    one): crashes are now looked up 7 days around their timestamps (by
+    event id, app version; the event_id bloom index; crashes are few), and
+    the SDK gives the trace's report the live report's timestamp too
+    (`apm_crashes` is a ReplacingMergeTree ordered by app_version,
+    fingerprint, timestamp, event_id);
+  - **the first report wins**: the live one (watchdog, main thread's Java
+    stack) is stored, the exit trace's richer copy (UnityMain) is dropped as
+    a duplicate. Replacing it would need a delete or a version column; not
+    worth it for the UnityMain stack, which Android cannot connect to the
+    block anyway (UnityMain was waiting for vsync on the device);
+  - the fingerprint used UnityMain (only in the trace) and counted
+    `$Proxy4.run` as in-app (live) but not `java.lang.Runnable.run`
+    (trace). An ANR is now keyed by the **main (blocked) thread's Java
+    frames only**: up to 3 in-app methods (file names and line numbers never
+    count: "Unknown Source" / "unavailable" / "Proxy.java:1006"), skipping
+    proxies (`$ProxyN`, `java.lang.reflect.Proxy`) and the framework and
+    Unity player packages; native frames are not in the key (the live
+    report has none). Without an in-app frame (the device case: the driver
+    blocks the UI thread through a C# `AndroidJavaProxy`, all frames are
+    Unity's reflection proxy), the key is the ANR's kind from its cause:
+    "Input dispatching timed out" (Android's message up to its first
+    `(`/`{`/`:`, without "ANR" / "user request after error:" / "bg anr:"),
+    so all such ANRs of a version are one group. UnityMain stays in the
+    stack shown.
+  - Summary: "ANR: <kind> in <frame>", the frame being the first in-app
+    method, else the first frame of the blocked thread that is not a wait
+    (`Thread.sleep`, `Object.wait`, `Unsafe.park`, looper, reflection):
+    "ANR: Input dispatching timed out in
+    com.unity3d.player.ReflectionHelper.nativeProxyInvoke" (a C# call through
+    an `AndroidJavaProxy` blocked the UI thread). The same for both sources.
+  - Tests: the device's two stacks (fingerprint test), and an integration
+    test that ingests both shapes with one event id (one row, one group,
+    count 1; a second ANR of the same kind joins the group).
 - **UnityMain frozen, UI thread fine** (`anr=20` with taps on the A33):
   Android raises no ANR, because input is dispatched to the Java UI thread,
   which stays responsive, so neither path reports it, and Play Console does
@@ -2774,7 +2811,7 @@ serialized on Unity's Mono; the ingest test stores them.
   forms (tombstone, ANR trace), bounded (8 threads x 256 frames of 64 KB).
 - Crash fingerprint, version 1 (`internal/fingerprint/crash.go`): native:
   signal + the first 3 distinct in-app frames of the crashed thread; ANR:
-  the UnityMain thread's in-app frames (else the main thread's); Java: the
+  the main thread's in-app Java frames, else the ANR's kind (below); Java: the
   template of the description; kills: the exit reason. A frame is keyed by
   `module!function` when uploaded symbols (or the device) name it, else by
   `module!?` (its library, **never its address**): with symbols uploaded
@@ -2783,6 +2820,8 @@ serialized on Unity's Mono; the ingest test stores them.
   frames such as libc's `abort`, libraries): coarser, but stable across
   builds. `crash_site` and the summary still show the address
   (`libil2cpp.so+0x5417bc`); the list and detail symbolicate it when read.
+  A fault address of dashes (Unity's tombstone: `fault addr --------`) is
+  left out of the summary.
   C# names are normalized like exception frames (`Type:Method` ->
   `Type.Method`, generic arguments dropped); a C++ name keeps its `::`
   (device FailFast: the summary showed `il2cpp..os..CrashHelpers..CrashImpl`,

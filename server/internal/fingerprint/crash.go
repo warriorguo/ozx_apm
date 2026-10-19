@@ -38,9 +38,15 @@ import (
 //	"v1", "crash", the crash type, then by type:
 //	  native: the signal name, then "f:" + up to 3 distinct frame keys of the
 //	          crashed thread's in-app frames (any frames if none is in-app);
-//	  anr:    "f:" + up to 3 distinct in-app frame keys of the "UnityMain"
-//	          thread (where the game's code runs), else of the first thread,
-//	          else its first 3 frames;
+//	  anr:    the main (blocked) thread only, its Java frames only, so that
+//	          the live watchdog report (Java getStackTrace: no native frames,
+//	          no UnityMain) and the exit record's ANR trace of the same ANR
+//	          get one fingerprint: "f:" + up to 3 distinct in-app Java frame
+//	          keys (methods; file names and lines never count), proxies
+//	          ($ProxyN, java.lang.reflect.Proxy) and framework/Unity player
+//	          frames skipped; without one, "k:" + the ANR's kind from its
+//	          cause ("Input dispatching timed out"). UnityMain stays in the
+//	          stack shown, not in the key;
 //	  java:   "m:" + the template of the exit description;
 //	  others (oom, killed, unknown): "r:" + the exit reason.
 //
@@ -402,7 +408,9 @@ type CrashInput struct {
 	Signal          string
 	ExitReason      string
 	ExitDescription string
-	Threads         []CrashThread
+	// Cause: the SDK's details.cause (an ANR's "Input dispatching timed out (...)").
+	Cause   string
+	Threads []CrashThread
 	// Resolve returns the name of a native frame's function from uploaded
 	// symbols ("" if unknown); nil: none.
 	Resolve func(f CrashFrame) string
@@ -443,19 +451,15 @@ func CrashFingerprint(in CrashInput) CrashResult {
 		}
 		b.WriteString("f:" + strings.Join(keys, "\n"))
 	case CrashTypeANR:
-		for _, t := range in.Threads {
-			if t.Name == "UnityMain" {
-				keys, site = frameKeys(t.Frames, true, in.Resolve, &r.Symbolicated)
-				break
-			}
+		main := anrMainThread(in.Threads)
+		keys = anrFrameKeys(main.Frames)
+		if len(keys) > 0 {
+			site = keys[0]
+			b.WriteString("f:" + strings.Join(keys, "\n"))
+		} else {
+			site = AnrBlockedIn(main.Frames)
+			b.WriteString("k:" + AnrKind(in.Cause, in.ExitDescription))
 		}
-		if len(keys) == 0 && len(in.Threads) > 0 {
-			keys, site = frameKeys(in.Threads[0].Frames, true, in.Resolve, &r.Symbolicated)
-			if len(keys) == 0 {
-				keys, site = frameKeys(in.Threads[0].Frames, false, in.Resolve, &r.Symbolicated)
-			}
-		}
-		b.WriteString("f:" + strings.Join(keys, "\n"))
 	case CrashTypeJava:
 		b.WriteString("m:" + Template(in.ExitDescription))
 	default:
@@ -583,4 +587,107 @@ func isHexString(s string) bool {
 		}
 	}
 	return true
+}
+
+// anrMainThread is the blocked thread of an ANR: the one marked crashed (the
+// SDK marks main), else "main", else the first.
+func anrMainThread(ts []CrashThread) CrashThread {
+	for _, t := range ts {
+		if t.Crashed {
+			return t
+		}
+	}
+	for _, t := range ts {
+		if t.Name == "main" {
+			return t
+		}
+	}
+	if len(ts) > 0 {
+		return ts[0]
+	}
+	return CrashThread{}
+}
+
+func isJavaProxy(method string) bool {
+	return strings.HasPrefix(method, "$Proxy") || strings.HasPrefix(method, "java.lang.reflect.Proxy.") ||
+		strings.HasPrefix(method, "jdk.proxy")
+}
+
+// anrFrameKeys: up to 3 distinct in-app Java methods of the blocked thread.
+func anrFrameKeys(frames []CrashFrame) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, f := range frames {
+		if len(out) == crashFingerprintFrames {
+			break
+		}
+		if f.Native || !f.InApp || isJavaProxy(f.Function) {
+			continue
+		}
+		k := NormalizeMethod(f.Function)
+		if k == "" || seen[k] {
+			continue
+		}
+		seen[k] = true
+		out = append(out, k)
+	}
+	return out
+}
+
+// anrWaitPrefixes are where a blocked thread waits (not where it is stuck).
+var anrWaitPrefixes = []string{
+	"java.lang.Thread.sleep", "java.lang.Object.wait", "java.util.concurrent.", "sun.misc.Unsafe.park",
+	"jdk.internal.misc.Unsafe.park", "java.lang.Thread.join", "android.os.MessageQueue.nativePollOnce",
+	"android.os.MessageQueue.next", "android.os.Looper.", "android.os.Handler.", "java.lang.reflect.",
+	"com.android.internal.os.", "android.app.ActivityThread.main", "dalvik.system.",
+}
+
+// AnrBlockedIn names, for an ANR without an in-app frame, the first Java
+// frame of the blocked thread that is not a wait, a proxy or the looper
+// ("com.unity3d.player.ReflectionHelper.nativeProxyInvoke": a C#
+// AndroidJavaProxy call that blocked the UI thread); "" if none.
+func AnrBlockedIn(frames []CrashFrame) string {
+	for _, f := range frames {
+		if f.Native || f.Function == "" || isJavaProxy(f.Function) {
+			continue
+		}
+		wait := false
+		for _, p := range anrWaitPrefixes {
+			if strings.HasPrefix(f.Function, p) {
+				wait = true
+				break
+			}
+		}
+		if !wait {
+			return NormalizeMethod(f.Function)
+		}
+	}
+	return ""
+}
+
+// AnrKind is the kind of an ANR from Android's message, the same for the
+// watchdog's ("ANR Input dispatching timed out (... Waited 10000ms ...)")
+// and the trace's Subject ("Input dispatching timed out (...)"): the text
+// before its first '(', '{' or ':', without a leading "ANR", digits
+// templated; "ANR" when there is no message.
+func AnrKind(cause, description string) string {
+	m := strings.TrimSpace(cause)
+	if m == "" {
+		m = strings.TrimSpace(description)
+	}
+	// Prefixes of Android's exit descriptions ("user request after error: Input
+	// dispatching timed out ...", "bg anr: ...") and the watchdog's "ANR ...".
+	for _, p := range []string{"user request after error:", "bg anr:", "ANR:", "ANR "} {
+		if len(m) >= len(p) && strings.EqualFold(m[:len(p)], p) {
+			m = strings.TrimSpace(m[len(p):])
+		}
+	}
+	if i := strings.IndexAny(m, "({:\n"); i >= 0 {
+		m = m[:i]
+	}
+	m = strings.TrimSpace(m)
+	if m == "" {
+		return "ANR"
+	}
+	return Template(capBytes(m, 120))
 }

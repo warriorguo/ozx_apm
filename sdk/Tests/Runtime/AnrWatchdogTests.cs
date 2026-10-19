@@ -243,6 +243,7 @@ namespace OzxApm.Tests
                 Assert.AreEqual(1, next.Count);
                 Assert.AreEqual("anr", next[0].crash_type);
                 Assert.AreEqual(e.event_id, next[0].event_id, "the same ANR: the server drops the duplicate");
+                Assert.AreEqual(e.timestamp, next[0].timestamp, "with the live report's timestamp");
             }
             finally
             {

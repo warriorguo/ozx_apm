@@ -72,6 +72,26 @@ func TestCrashSummary(t *testing.T) {
 	if s := CrashSummary(&java, ""); s != "Java crash" {
 		t.Errorf("java: %q", s)
 	}
+	// Unity's own tombstone: "fault addr --------" is no address.
+	unity := models.Crash{CrashType: "native"}
+	unity.Signal, unity.SignalCode, unity.FaultAddr = "SIGSEGV", "SI_TKILL", "--------"
+	if s := CrashSummary(&unity, "libunity.so!Utils_CUSTOM_ForceCrash"); s != "SIGSEGV (SI_TKILL) in Utils_CUSTOM_ForceCrash (libunity.so)" {
+		t.Errorf("unity tombstone: %q", s)
+	}
+	// ANR: the kind from details.cause (watchdog and trace alike), else the exit description.
+	anr := models.Crash{CrashType: "anr"}
+	anr.Details = map[string]string{"cause": "ANR Input dispatching timed out (925aad com.ozx.apmtest/com.unity3d.player.UnityPlayerActivity is not responding. Waited 10000ms for MotionEvent)."}
+	if s := CrashSummary(&anr, "com.unity3d.player.ReflectionHelper.nativeProxyInvoke"); s != "ANR: Input dispatching timed out in com.unity3d.player.ReflectionHelper.nativeProxyInvoke" {
+		t.Errorf("anr: %q", s)
+	}
+	anr.Details, anr.ExitDescription = nil, "user request after error: Input dispatching timed out"
+	if s := CrashSummary(&anr, ""); s != "ANR: Input dispatching timed out" {
+		t.Errorf("anr from the description: %q", s)
+	}
+	anr.ExitDescription = ""
+	if s := CrashSummary(&anr, ""); s != "ANR" {
+		t.Errorf("anr without a message: %q", s)
+	}
 }
 
 // Device FailFast (SIGTRAP in il2cpp's CrashHelpers): the summary showed

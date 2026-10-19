@@ -491,7 +491,8 @@ namespace OzxApm.Core
             }
             SetDetail(evt, "anr_trace_on", ExitReasons.Name(e.Reason));
             // The watchdog's report of the same ANR: the same id, a duplicate the server drops.
-            evt.event_id = SameAsWatchdogAnr(j, at) ? j.AnrEventId : EventId(j, "anr");
+            evt.event_id = EventId(j, "anr");
+            UseWatchdogIdentity(j, evt);
             return evt;
         }
 
@@ -513,6 +514,18 @@ namespace OzxApm.Core
             SetDetail(evt, "journal_age_ms", "0");
             evt.event_id = EventId(j, ordinal <= 0 ? "anr" : "anr" + ordinal.ToString(CultureInfo.InvariantCulture));
             return evt;
+        }
+
+        // The ANR the watchdog reported live: the same event id AND timestamp, so
+        // the server sees one event (its duplicate lookup and the table's key);
+        // the live report, stored first, stays.
+        private static void UseWatchdogIdentity(JournalRecord j, CrashEvent evt)
+        {
+            if (!SameAsWatchdogAnr(j, evt.timestamp))
+                return;
+            evt.event_id = j.AnrEventId;
+            evt.timestamp = j.AnrMs;
+            evt.session_ms = j.SessionStartMs > 0 && j.AnrMs > j.SessionStartMs ? j.AnrMs - j.SessionStartMs : 0;
         }
 
         private static bool SameAsWatchdogAnr(JournalRecord j, long at) =>
@@ -636,8 +649,8 @@ namespace OzxApm.Core
             }
             evt.details = details.ToArray();
             evt.fingerprint = Fingerprint(evt, trace);
-            if (type == "anr" && SameAsWatchdogAnr(j, evt.timestamp))
-                evt.event_id = j.AnrEventId; // reported live by the watchdog: a duplicate the server drops
+            if (type == "anr")
+                UseWatchdogIdentity(j, evt);
             return evt;
         }
 

@@ -604,6 +604,7 @@ namespace OzxApm.Tests
             var sink = new List<CrashEvent>();
             Reporter(exits, sink).ProcessPrevious(1, 1);
             Assert.AreEqual(watchdogId, sink.Single().event_id, "the same ANR: a duplicate the server drops");
+            Assert.AreEqual(AnrMs + 3000, sink.Single().timestamp, "and the watchdog's timestamp (one event for the server)");
 
             // An ANR long after the watchdog's: another one.
             PreviousProcessEnded(4797, AnrMs - 60_000, clean: false, foreground: true, i =>

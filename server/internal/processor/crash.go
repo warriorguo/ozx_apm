@@ -122,6 +122,7 @@ func ApplyCrashFingerprint(c *models.Crash, threads []fingerprint.CrashThread, r
 		Signal:          c.Signal,
 		ExitReason:      c.ExitReason,
 		ExitDescription: c.ExitDescription,
+		Cause:           c.Details["cause"],
 		Threads:         threads,
 		Resolve:         resolve,
 	})
@@ -155,15 +156,19 @@ func CrashSummary(c *models.Crash, site string) string {
 		if msg := firstLineOf(d.AbortMessage); msg != "" {
 			return sig + ": " + truncateRunes(msg, 160) + where
 		}
-		if d.FaultAddr != "" && (d.Signal == "SIGSEGV" || d.Signal == "SIGBUS") {
+		// Unity's own tombstone writes "fault addr --------" (no address).
+		if strings.Trim(d.FaultAddr, "- ") != "" && (d.Signal == "SIGSEGV" || d.Signal == "SIGBUS") {
 			sig += " at " + d.FaultAddr
 		}
 		return sig + where
 	case fingerprint.CrashTypeANR:
-		if desc := firstLineOf(d.ExitDescription); desc != "" {
-			return "ANR: " + truncateRunes(desc, 200) + where
+		// The same text for the watchdog's report and the exit trace's: the
+		// ANR's kind and where the main thread is blocked.
+		kind := fingerprint.AnrKind(d.Details["cause"], d.ExitDescription)
+		if kind == "ANR" {
+			return "ANR" + where
 		}
-		return "ANR" + where
+		return "ANR: " + truncateRunes(kind, 120) + where
 	case fingerprint.CrashTypeJava:
 		if desc := firstLineOf(d.ExitDescription); desc != "" {
 			return "Java crash: " + truncateRunes(desc, 200)

@@ -166,7 +166,7 @@ func TestIngest_KilledAndOOMCrashes(t *testing.T) {
 	if weird.CrashType != "unknown" || weird.ExitReason != "SIGNALED<b>" {
 		t.Errorf("weird: %q %q", weird.CrashType, weird.ExitReason)
 	}
-	if anr.Summary != "ANR: user request after error: Input dispatching timed out in com.ozx.Foo.bar" {
+	if anr.Summary != "ANR: Input dispatching timed out in com.ozx.Foo.bar" {
 		t.Errorf("anr summary %q", anr.Summary)
 	}
 }
@@ -203,7 +203,10 @@ func TestIngest_CrashEventsFromTheSDK(t *testing.T) {
 	if native.CrashSite != "libil2cpp.so+0x5417bc" || !strings.HasPrefix(native.Summary, "SIGSEGV (SEGV_MAPERR) at 0x0000000000000008 in libil2cpp.so+0x5417bc") {
 		t.Errorf("site %q summary %q", native.CrashSite, native.Summary)
 	}
-	if anr.CrashType != "anr" || anr.CrashSite != "libil2cpp.so+0x5417bc" || !strings.HasPrefix(anr.Summary, "ANR: user request after error") {
+	// ANR: the main thread's Java frames only (UnityMain's libil2cpp frames are not the key);
+	// all of them framework/Unity player here, so the kind and where main is blocked.
+	if anr.CrashType != "anr" || anr.CrashSite != "com.unity3d.player.UnityPlayer.nativeRender" ||
+		anr.Summary != "ANR: Input dispatching timed out in com.unity3d.player.UnityPlayer.nativeRender" {
 		t.Errorf("anr %+v", anr.CrashDetails)
 	}
 	if oom.CrashType != "oom" || oom.Summary != "Killed for low memory in the foreground (PSS 1024 MB)" {
@@ -242,6 +245,11 @@ func TestIngest_CrashDuplicateLookupIgnoresTheFingerprint(t *testing.T) {
 	last := store.lookups[len(store.lookups)-1]
 	if !last.AnyKey || last.Table.Name != "apm_crashes" {
 		t.Fatalf("lookup %+v", last)
+	}
+	// One event id is one crash whatever its timestamp (the watchdog's ANR and the
+	// exit trace's of it): the lookup spans crashDedupWindow on both sides.
+	if last.MaxTime.Sub(last.MinTime) < 2*crashDedupWindow {
+		t.Fatalf("lookup window %v .. %v", last.MinTime, last.MaxTime)
 	}
 }
 

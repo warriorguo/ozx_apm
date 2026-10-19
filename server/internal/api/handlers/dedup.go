@@ -179,5 +179,16 @@ func lookupFor(table storage.EventTable, keys []eventKey, idx []int) storage.Eve
 			q.MaxTime = k.ts
 		}
 	}
+	if table == storage.TableCrashes {
+		// APM-7: an event id is one crash whatever its timestamp (an ANR the
+		// watchdog reported live, then again from the exit record's trace at the
+		// next launch; a crash re-sent by an older SDK with another time).
+		q.MinTime = q.MinTime.Add(-crashDedupWindow)
+		q.MaxTime = q.MaxTime.Add(crashDedupWindow)
+	}
 	return q
 }
+
+// crashDedupWindow widens the duplicate lookup of crashes around their
+// timestamps (crashes are few; app_version and the event_id index bound it).
+const crashDedupWindow = 7 * 24 * time.Hour

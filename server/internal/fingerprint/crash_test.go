@@ -172,12 +172,13 @@ Thread "UnityMain" tid=20
 #00 pc 0000000000541470 libil2cpp.so (BuildId: 0d65)
 `)
 	r := CrashFingerprint(CrashInput{CrashType: "anr", Threads: anr})
-	if r.Site != "libil2cpp.so+0x541470" {
-		t.Fatalf("anr uses UnityMain: %+v", r)
+	if r.Site != "com.ozx.game.Foo.bar" {
+		t.Fatalf("anr keys the main thread's in-app Java frame: %+v", r)
 	}
+	// UnityMain is not part of the key (the watchdog's report has no UnityMain).
 	noUnity := ParseCrashStack("Thread \"main\" tid=1\nat java.lang.Thread.sleep(Native method)\nat com.ozx.game.Foo.bar(Foo.java:12)\n")
-	if r := CrashFingerprint(CrashInput{CrashType: "anr", Threads: noUnity}); r.Site != "com.ozx.game.Foo.bar" {
-		t.Fatalf("anr without UnityMain: %+v", r)
+	if r2 := CrashFingerprint(CrashInput{CrashType: "anr", Threads: noUnity}); r2.Site != "com.ozx.game.Foo.bar" || r2.Fingerprint != r.Fingerprint {
+		t.Fatalf("anr without UnityMain: %+v vs %+v", r2, r)
 	}
 
 	oom1 := CrashFingerprint(CrashInput{CrashType: "oom", ExitReason: "LOW_MEMORY"})
