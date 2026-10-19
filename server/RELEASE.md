@@ -3664,3 +3664,211 @@ Samsung A33, Android 16 (One UI).
 - Query cost at production volume (the lead's numbers are a test device's);
   the admin pages in a browser (jsdom only); iOS; 16 KB page devices;
   other Android versions.
+
+## APM-21: jank detection relative to the frame rate (SDK only; no schema change)
+
+Deploy order: **SDK builds only.** No server, schema or admin API change: the
+`jank` event keeps its fields (`duration_ms`, `max_frame_ms`,
+`recent_gc_count`, `recent_gc_alloc_kb`, `recent_events`, context). The admin
+UI's "Jank Definition" text on the Performance page is updated (text only;
+deploy app 38 whenever convenient).
+
+### The bug
+
+`JankDetector` entered a jank on a frame over 50 ms and then counted every
+frame over a fixed 33 ms (`SustainedJankThresholdMs`) as "sustained". At 30
+fps every frame is 33.4 ms, so a jank never ended and was never sent: every
+device test so far had 0 janks (APM-5: a 150 ms frame; APM-6: `jank=200`;
+APM-9: `wavejank=120`). Its duration started after the long frame (the long
+frame was not part of it), and a resume after 2-6 s in the background was a
+"jank" of 20 s with a 6210 ms frame (the first frame after a resume holds the
+time in the background).
+
+### Design
+
+`Collectors/JankTracker.cs` holds the definition without Unity (unit tested
+with frame sequences); `JankDetector` feeds it `Time.unscaledDeltaTime` once
+per frame (unscaled: `Time.timeScale`, slow motion or a pause menu at 0, do
+not change frame times).
+
+- **Expected frame time E**: the median of the last 31 normal frames, but
+  never below the frame time the game asks for (`1000 /
+  Application.targetFrameRate` when it is set). The median is the frame rate
+  the game actually runs at: `targetFrameRate` alone is not enough (-1 means
+  the platform's default, 30 fps on mobile; `vSyncCount` overrides it on some
+  platforms; a game below its target on a weak or hot device would be
+  "janky" every frame). The target floor is for display cadences around the
+  target: 60 fps on a 90 Hz display alternates 11.1 / 22.2 ms frames; with
+  the median alone (11.1) a 22.2 ms frame is slow and three in a row a jank
+  (`/tmp/claude-501/apm21/bench/Check90.cs`: 51 false janks in 5 minutes
+  without the floor, 0 with it).
+- **Slow frame**: longer than max(1.5 E, E + 8 ms): 50.1 ms at 30 fps, 25 ms
+  at 60, 19.1 ms at 90, 16.3 ms at 120. This replaces CLAUDE.md's fixed
+  "consecutive frames > 33 ms", which was the 60 fps case (a frame twice as
+  long as expected); 1.5x is one display refresh late at 60 fps on 60 Hz
+  (33.3 ms frames are slow, 25 ms ones are borderline), the 8 ms margin keeps
+  90/120 fps vsync jitter out.
+- **Jank** (`JankThresholdMs`, 50 ms as in CLAUDE.md): a run of consecutive
+  slow frames lasting more than 50 ms in total. One slow frame over 50 ms is
+  a jank (CLAUDE.md's single-frame rule; at 30 fps every slow frame is); at
+  60 fps two consecutive 30 ms frames are, a single 45 ms frame is not (it
+  is under 50 ms). A frame over 50 ms that is not slow is not a jank: a game
+  running at 20 fps (50 ms frames) is slow, not janky (the FPS distribution
+  shows it).
+- **Episode**: starts with the run's first slow frame (the long frame is part
+  of it). Slow frames less than 250 ms apart (`MergeGapMs`) are one jank, so
+  a stutter of long frames with a few normal ones between them is one event,
+  not many. It ends after 250 ms of normal frames (and is sent then), or when
+  it has lasted 5 s (`MaxEpisodeMs`).
+- **Figures**: `duration_ms` = from the start of the first slow frame to the
+  end of the last one (the sum of their frame times, with the normal frames
+  of merge gaps in between); `max_frame_ms` = the longest frame. A single
+  150 ms frame is `duration_ms = max_frame_ms = ` that frame's
+  `unscaledDeltaTime` (about 150 ms plus the rest of the frame, up to the
+  next display refresh). The number of frames (in the span, and slow ones)
+  is in `ApmStats` (`LastJankFrames`, `LastJankSlowFrames`) and the debug
+  log, not on the wire (no schema change).
+- **Lasting slowdown**: frames twice as slow for 20 s (60 -> 30 fps by heat,
+  a heavy scene) are one jank of 5 s, after which the new frame rate is the
+  baseline (it is re-learnt from the next 15 frames); slowdowns under 1.5x
+  (30 -> 23 fps) are never janks, the baseline follows them. A single very
+  long frame (5 s or more) is one jank and leaves the baseline as it was.
+  Slow frames never enter the baseline, so a slowdown of a few seconds is
+  measured against the frame rate before it.
+- **Not janks** (no detection, nothing taken into the baseline):
+  - the first 2 frames and 500 ms after start, after a resume
+    (`OnApplicationPause(false)`), and after focus comes back
+    (`OnApplicationFocus(true)`); while paused or without focus, nothing is
+    looked at. A jank in progress when the app pauses or loses focus is sent
+    at once (before the pause flush) with its frames so far. Without focus
+    the game may still render on Android (notification shade, a system
+    dialog): those frames are not watched either.
+  - **scene loads**: the frame in which `SceneManager.sceneLoaded` fires and
+    the next one. A synchronous `LoadScene` blocks one frame for the whole
+    load, which `scene_load` measures; counting it as a jank would make
+    every level change a jank and the jank rate a count of level loads. A
+    jank in progress is sent before the new scene's name is taken (it
+    belongs to the scene it happened in). Hitches of the frames after those
+    two (objects' `Start`, first-use shader compiles, an additive or async
+    load's later frames) are janks, with `Scene: <name>` among their recent
+    events.
+  - **target frame rate changes** (`Application.targetFrameRate` or
+    `QualitySettings.vSyncCount`, read every frame): a jank in progress is
+    sent, the baseline starts again (15 frames). Going from 60 to 30 fps is
+    not a jank.
+  - the first frame of the process (`unscaledDeltaTime` 0) and invalid
+    values. Startup itself is the `startup` event's (APM-1).
+  - In the Editor, Unity's Pause button stops the player loop without a
+    pause callback: the first frame after it is a jank (Editor data is
+    `build_type` editor and not uploaded by default).
+- **Event**: `timestamp` = when the jank began (the first slow frame), not
+  when it was sent (up to 250 ms later, 5 s for a capped one); the game
+  context (APM-5) of the frame the jank began in, so a room switch's hitch
+  carries the room it happened in; scene, session and the rest as every
+  event. `recent_events` (APM-6, APM-1 P1 #9): the breadcrumbs (10) and
+  warning/error lines (5) from 10 s before the jank began until it was sent,
+  200 characters each, as before. `recent_gc_*`: MemoryCollector's figures
+  of the last 10 s, as before.
+- **Rate limit**: at most `ApmConfig.MaxJanksPerMinute` (20) janks sent per
+  minute (a fixed window on the detector's clock); further ones are counted
+  (`ApmStats.JanksDropped`) and not sent. With the merge gap, a game that
+  stutters continuously produces at most 12 janks a minute (5 s episodes);
+  the limit is for stutters every 0.3-3 s. Worst case ~20 x ~3.5 KB (15
+  recent lines of 200 characters) = 70 KB a minute before gzip; a jank with
+  a few recent lines is 1-2 KB (estimated, not measured). The old 1 s cooldown dropped janks silently; this one counts them.
+- **Configuration**: `JankThresholdMs` (50) keeps its meaning (the shortest
+  jank); `MaxJanksPerMinute` is new; `SustainedJankThresholdMs` is
+  `[Obsolete]` and ignored (a game setting it gets a compiler warning, no
+  error). The factors, the 31-frame window, the grace periods, the 250 ms gap
+  and the 5 s cap are constants in `JankTracker`.
+- **ApmStats**: `JanksDetected`, `JanksSent`, `JanksDropped`,
+  `JankExpectedFrameMs` (0 while warming up), `LastJankDurationMs`,
+  `LastJankMaxFrameMs`, `LastJankFrames`, `LastJankSlowFrames`.
+
+### Behaviour change for existing data and dashboards
+
+- Janks appear: builds with this SDK send janks where older builds sent
+  none at 30 fps (and only rare, wrong ones at 60 fps). Jank counts,
+  `jank_count` time series, the Dashboard's "Jank Events" tile (warning
+  colour above 50), `/v1/metrics/jank`, the Context page's `janks` and
+  APM-9's `jank_rate` (janks per minute of play) rise from about 0 for these
+  builds. **Compare jank figures only between builds that both have this
+  SDK**: an older build's 0 is the bug, not a smooth game. Filter by
+  `app_version`.
+- `duration_ms` now includes the long frame itself and the stutter's span
+  (older rows: the frames after the long frame until a frame of 33 ms or
+  less, often the whole rest of the session at 30 fps). Averages of
+  `duration_ms` across old and new builds are not comparable.
+- `timestamp` is the start of the jank (was: the moment it was sent).
+- No alert uses janks (APM-8), no materialized view reads `apm_janks`:
+  nothing server-side to migrate. `jank_rate` needs nothing: it counts rows
+  and divides by the perf samples' play time; janks dropped by the rate
+  limit (more than 20 a minute on one device) are not in it.
+
+### Cost
+
+Unity's Mono outside Unity (M-series Mac, `/tmp/claude-501/apm21/bench/Bench21.cs`):
+
+| Path | Time | Allocated |
+|---|---|---|
+| `JankDetector` per frame, steady 30 fps (tracker, baseline insert/remove) | 0.07 us | 0 |
+| ... with a 120 ms frame every 10 frames (detected, not sent) | 0.04 us | 0 |
+| `JankTracker.Frame` alone, 60 fps with jitter | 0.05 us | 0 |
+| Reporting a jank (event, 10 recent lines; not enqueued) | ~1.4 us per jank | ~1.4 KB per jank |
+
+On the device, `Update` adds two engine property reads per frame
+(`Application.targetFrameRate`, `QualitySettings.vSyncCount`) and
+`GameContext.Current` once per jank (no copy unless the context changed).
+Memory: two arrays of 31 floats. Nothing on other threads. The APM-9
+baseline (A33 release, idle `update_ms` p50 0.036 / p99 0.11 ms) must hold:
+measured by the device plan, not here.
+
+### Rolling deploy and rollback
+
+SDK only. Old and new SDK builds send the same `jank` fields; the server
+stores both. Rollback: ship the previous SDK (janks disappear again). Admin
+text: redeploy the previous admin.
+
+### Verified
+
+- SDK: compiles at C# 8 with and without `UNITY_2021_2_OR_NEWER`, for
+  Android and iOS defines. On Unity's Mono outside Unity 272 runtime tests
+  pass (was 239): `JankDetectorTests` has 36 tests (replacing 3), 34 of
+  them pass here (steady 30 fps for 5 minutes on a
+  90 Hz cadence, a single 150 / 200 ms frame at 30 and 60 fps with its own
+  time as duration and max, the merge gap, consecutive and merged long
+  frames, two janks a second apart, APM-9's wave pattern (24 of 24),
+  thresholds at 30/60/90/120 fps, 20 fps not janky, a moderate slowdown
+  becoming the baseline, 3 s sustained slowdowns at 30 and 60 fps, a lasting
+  drop capped once, a 6 s frame, startup frames, resume after 6210 ms in
+  the background, flush of a jank in progress, a short run not flushed,
+  scene-load frames, invalid frame times, the median and the warm-up, the
+  budget; the detector: start time, context of the start, recent events,
+  pause, focus, scene load, target frame rate changes, 60 fps on a 90 Hz
+  display, the rate limit, stop); 2 fail for the environment as before
+  (JSONSerializeModule, gzip); 112 need the Unity runtime (was 111: the
+  2 of `JankDetectorTests` replace 2 old ones: `Config_Defaults` and
+  `Detector_PerFrame_DoesNotAllocate`, no allocation per frame, also
+  during a jank; new: `JankApiTests`, through ApmClient: a jank in
+  progress stored at the pause with its own frame, the context of its
+  start and the breadcrumb before it, no jank from the resume frame, the
+  stats).
+- Admin UI: `tsc`, vitest (174 tests), `vite build`.
+- The test driver (`/tmp/claude-501/apm21/ApmTestDriver.cs`: `jankframes=`,
+  `pattern=`, `slow=`/`slowfor=`, `fps=`, `vsync=`, `jankstats=1`,
+  `jankref=1`, a log line per frame over 50 ms) compiles against this SDK;
+  the device plan is `/tmp/claude-501/apm21/DEVICE_PLAN.md`.
+- No server change: server tests not re-run for this ticket.
+
+### Not verified
+
+- Everything on a device: the scenarios and numbers of the device plan (a
+  single 150 ms frame at 30 and 60 fps, consecutive frames, sustained
+  slowdown, `wavejank`, Home/resume, scene reload, 5 minutes idle, the
+  cost against the APM-9 baseline), whether the A33 can run at 60 fps at
+  all (`fps=60` on its 90 Hz display) and the frame pacing it then has.
+- Unity EditMode (the 2 tests that need the runtime, and the rest in
+  Unity's own runner); iOS; other Android devices and refresh rates.
+- How often real games hit the 20-a-minute limit, and whether 1.5x / +8 ms
+  and the 250 ms gap match what players perceive: to be reviewed with
+  production data.

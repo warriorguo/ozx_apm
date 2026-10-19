@@ -246,9 +246,9 @@ namespace OzxApm.Tests
             _t.RecordEvent("long_ago", null, now - 60000);
             _t.RecordEvent("room_enter", new[] { "roomId", "7" }, now - 4000);
             _t.OnLog("Asset not found: fx/boss", "", LogType.Warning, true);
-            var recent = JankDetector.RecentEvents(_t, Timeline.NowMs(), 500);
+            var recent = JankDetector.RecentEvents(_t, Timeline.NowMs() - 500);
             CollectionAssert.AreEqual(new[] { "Event: room_enter roomId=7", "Warning: Asset not found: fx/boss" }, recent.Select(Body).ToArray());
-            Assert.AreEqual(0, JankDetector.RecentEvents(null, now, 100).Count);
+            Assert.AreEqual(0, JankDetector.RecentEvents(null, now).Count);
         }
     }
 }

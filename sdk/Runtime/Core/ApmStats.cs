@@ -91,6 +91,19 @@ namespace OzxApm.Core
         public float RssMb;
         /// <summary>RSS readings so far.</summary>
         public long RssReadings;
+        /// <summary>Janks detected since Initialize (APM-21), sent or not.</summary>
+        public long JanksDetected;
+        /// <summary>Of those, enqueued (within ApmConfig.MaxJanksPerMinute).</summary>
+        public long JanksSent;
+        /// <summary>Of those, not sent (beyond ApmConfig.MaxJanksPerMinute).</summary>
+        public long JanksDropped;
+        /// <summary>The expected frame time the jank detector compares with (median of recent normal frames, ms; 0 while it warms up).</summary>
+        public float JankExpectedFrameMs;
+        /// <summary>The last jank: duration_ms, max_frame_ms, frames in its span, slow frames among them.</summary>
+        public float LastJankDurationMs;
+        public float LastJankMaxFrameMs;
+        public int LastJankFrames;
+        public int LastJankSlowFrames;
         /// <summary>"release", "dev" or "editor"; null before Initialize.</summary>
         public string BuildType;
         /// <summary>False in the Unity Editor unless ApmConfig.UploadInEditor.</summary>

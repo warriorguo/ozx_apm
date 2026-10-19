@@ -1343,6 +1343,18 @@ namespace OzxApm.Core
                 stats.RssMb = client._memory.LastRssMb;
                 stats.RssReadings = System.Threading.Interlocked.Read(ref client._memory.RssReadings);
             }
+            var jank = client._jankDetector;
+            if (jank != null)
+            {
+                stats.JanksDetected = jank.Detected;
+                stats.JanksSent = jank.Sent;
+                stats.JanksDropped = jank.Dropped;
+                stats.JankExpectedFrameMs = jank.ExpectedFrameMs;
+                stats.LastJankDurationMs = jank.LastDurationMs;
+                stats.LastJankMaxFrameMs = jank.LastMaxFrameMs;
+                stats.LastJankFrames = jank.LastFrames;
+                stats.LastJankSlowFrames = jank.LastSlowFrames;
+            }
             stats.TimersSpanningPause = TimerRegistry.SpanningPauseCount;
             stats.TimersUntracked = TimerRegistry.UntrackedCount;
             if (client._timeline != null)
@@ -1375,6 +1387,7 @@ namespace OzxApm.Core
         internal EventReporter ReporterForTests => _reporter;
         internal ExceptionCollector ExceptionCollectorForTests => _exceptionCollector;
         internal CustomCollector CustomCollectorForTests => _customCollector;
+        internal JankDetector JankDetectorForTests => _jankDetector;
         internal void UpdateForTests() => Update();
         internal void PauseForTests(bool paused) => OnApplicationPause(paused);
 
@@ -1503,6 +1516,9 @@ namespace OzxApm.Core
                 // The RSS reader sleeps in the background (APM-9).
                 if (_memory != null)
                     _memory.Paused = paused;
+                // A jank in progress is sent before the flush below; the frame
+                // after resuming holds the time in the background (APM-21).
+                _jankDetector?.OnPause(paused);
 
                 if (paused)
                 {
@@ -1536,6 +1552,7 @@ namespace OzxApm.Core
             try
             {
                 _sessionManager.OnApplicationFocus(hasFocus);
+                _jankDetector?.OnFocus(hasFocus);
             }
             catch (Exception ex)
             {
@@ -1617,6 +1634,9 @@ namespace OzxApm.Core
         {
             try
             {
+                // Before the scene name changes: a jank in progress belongs to
+                // the scene it happened in; the loading frames are not janks.
+                _jankDetector?.OnSceneLoaded();
                 _currentScene = scene.name;
                 _crash?.OnScene(scene.name);
                 RecordBreadcrumb($"Scene: {scene.name}");
@@ -1801,6 +1821,13 @@ namespace OzxApm.Core
             if (System.Threading.Interlocked.Increment(ref _internalErrorCount) > MaxReportedInternalErrors)
                 return;
             Log(LogLevel.Warning, $"Internal error in {where}: {ex.GetType().Name}: {ex.Message}");
+        }
+
+        /// <summary>Whether Log(level, ...) would write: lets a caller skip formatting the message.</summary>
+        internal static bool IsLogEnabled(LogLevel level)
+        {
+            var config = _logConfig;
+            return config != null && level != LogLevel.None && level <= config.LogLevel;
         }
 
         /// <summary>

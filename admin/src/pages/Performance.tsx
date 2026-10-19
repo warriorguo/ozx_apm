@@ -115,9 +115,11 @@ export function Performance() {
             <div className="bg-white rounded-lg shadow p-6">
               <h3 className="text-sm font-medium text-gray-700 mb-4">Jank Definition</h3>
               <ul className="text-sm text-gray-600 space-y-2">
-                <li>- Single frame &gt; 50ms = jank event</li>
-                <li>- Consecutive frames &gt; 33ms = sustained jank</li>
-                <li>- Captures scene/level and last 10s GC info on jank</li>
+                <li>- Slow frame: longer than 1.5x the expected frame time (at least +8ms); expected = median of the recent normal frames</li>
+                <li>- Jank: consecutive slow frames lasting &gt; 50ms in total (one slow frame &gt; 50ms is a jank)</li>
+                <li>- Slow frames less than 250ms apart are one jank; duration = first slow frame to last, at most 5s</li>
+                <li>- Not janks: the frames after a resume, a scene load or a frame rate change (SDK with APM-21)</li>
+                <li>- Captures scene/level, game context, last 10s GC info and recent events on jank</li>
               </ul>
             </div>
           </div>

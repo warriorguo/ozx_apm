@@ -120,7 +120,10 @@ var config = new ApmConfig
 
     // Sampling
     SamplingIntervalSeconds = 1.0f,
+    // Jank (APM-21): consecutive slow frames (> 1.5x the recent median frame
+    // time, at least +8 ms) lasting more than this; at most MaxJanksPerMinute sent
     JankThresholdMs = 50f,
+    MaxJanksPerMinute = 20,
 
     // Batching
     BatchSize = 20,
@@ -437,7 +440,7 @@ All take the common filter (time range, at most 31 days; `app_version`,
 | Type | Description |
 |------|-------------|
 | `perf_sample` | FPS, frame time, memory usage |
-| `jank` | Frame drops with context |
+| `jank` | A stutter: slow frames relative to the frame rate (APM-21; not resume, scene-load or frame-rate-change frames), with context and recent events |
 | `startup` | App launch timing phases |
 | `scene_load` | Scene load and activation time |
 | `exception` | Non-fatal exceptions |

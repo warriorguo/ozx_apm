@@ -123,14 +123,29 @@ namespace OzxApm.Core
         public bool EnableMemoryBreakdown { get; set; } = true;
 
         /// <summary>
-        /// Frame time threshold for jank detection (ms)
+        /// A jank (APM-21) is a run of consecutive slow frames lasting more than
+        /// this (ms): a single slow frame over it, or several shorter ones in a
+        /// row. A frame is slow when it is longer than max(1.5 x, x + 8 ms) of the
+        /// expected frame time x (the median of the recent normal frames), so a
+        /// game running at 30 fps or below its target is never janky for that
+        /// alone. Default 50.
         /// </summary>
         public float JankThresholdMs { get; set; } = 50.0f;
 
         /// <summary>
-        /// Sustained jank threshold (ms)
+        /// Ignored since APM-21: a fixed sustained threshold made every frame of a
+        /// 30 fps game "sustained" (a jank never ended). Slow frames are now
+        /// relative to the frame rate (see JankThresholdMs).
         /// </summary>
+        [System.Obsolete("Ignored since APM-21: slow frames are relative to the frame rate (see JankThresholdMs).")]
         public float SustainedJankThresholdMs { get; set; } = 33.0f;
+
+        /// <summary>
+        /// Janks sent per minute at most (APM-21); further janks of the minute
+        /// are counted in ApmStats.JanksDropped, not sent. Janks less than
+        /// 250 ms apart are already one jank. Default 20.
+        /// </summary>
+        public int MaxJanksPerMinute { get; set; } = 20;
 
         /// <summary>
         /// Maximum events to batch before sending
