@@ -112,7 +112,7 @@ namespace OzxApm.Tests
             var t = Warm(Fps30);
             Steady30(t, 300, new Random(21));
             Assert.AreEqual(0, _found.Count);
-            Assert.AreEqual(33.4f, t.ExpectedFrameMs, 0.15f);
+            Assert.AreEqual(33.4f, t.ExpectedFrameMs, 0.8f); // an average: one 44.4 ms frame moves it 0.7 ms
         }
 
         [Test]
@@ -398,16 +398,21 @@ namespace OzxApm.Tests
         }
 
         [Test]
-        public void Baseline_IsTheMedianOfTheLastNormalFrames()
+        public void Baseline_WarmUpMedian_ThenTheAverageOfNormalFrames()
         {
             var t = Warm(20f);
             Assert.AreEqual(20f, t.ExpectedFrameMs);
-            for (int i = 0; i < JankTracker.BaselineFrames; i++)
+            for (int i = 0; i < 200; i++)
                 Feed(t, i % 2 == 0 ? 16f : 17f);
-            Assert.AreEqual(16f, t.ExpectedFrameMs, "16 of the 31 frames are 16 ms");
+            Assert.AreEqual(16.5f, t.ExpectedFrameMs, 0.05f, "the average of the normal frames");
+            Feed(t, 30f);  // slow (> 24.5): not taken in
+            Assert.AreEqual(16.5f, t.ExpectedFrameMs, 0.05f);
             t.ResetBaseline();
             Assert.IsTrue(t.WarmingUp);
-            Feed(t, 200f, JankTracker.WarmupFrames); // taken in without detection
+            Assert.AreEqual(0f, t.ExpectedFrameMs);
+            // Warm-up: the median of 15 frames, whatever they are (taken in without detection).
+            Feed(t, 900f, 4);
+            Feed(t, 200f, JankTracker.WarmupFrames - 4);
             Assert.AreEqual(0, _found.Count);
             Assert.IsFalse(t.WarmingUp);
             Assert.AreEqual(200f, t.ExpectedFrameMs);

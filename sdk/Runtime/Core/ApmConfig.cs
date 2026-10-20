@@ -126,7 +126,7 @@ namespace OzxApm.Core
         /// A jank (APM-21) is a run of consecutive slow frames lasting more than
         /// this (ms): a single slow frame over it, or several shorter ones in a
         /// row. A frame is slow when it is longer than max(1.5 x, x + 8 ms) of the
-        /// expected frame time x (the median of the recent normal frames), so a
+        /// expected frame time x (the average of the recent normal frames), so a
         /// game running at 30 fps or below its target is never janky for that
         /// alone. Default 50.
         /// </summary>

@@ -97,7 +97,7 @@ namespace OzxApm.Core
         public long JanksSent;
         /// <summary>Of those, not sent (beyond ApmConfig.MaxJanksPerMinute).</summary>
         public long JanksDropped;
-        /// <summary>The expected frame time the jank detector compares with (median of recent normal frames, ms; 0 while it warms up).</summary>
+        /// <summary>The expected frame time the jank detector compares with (average of recent normal frames, ms; 0 while it warms up).</summary>
         public float JankExpectedFrameMs;
         /// <summary>The last jank: duration_ms, max_frame_ms, frames in its span, slow frames among them.</summary>
         public float LastJankDurationMs;
@@ -106,6 +106,8 @@ namespace OzxApm.Core
         public int LastJankSlowFrames;
         /// <summary>The jank detector's own time in its last sampled frame (one in 64), microseconds.</summary>
         public double JankUpdateUs;
+        /// <summary>Two back-to-back Stopwatch reads in that frame (the self-check's own cost, already subtracted from JankUpdateUs), microseconds.</summary>
+        public double JankSelfCheckOverheadUs;
         /// <summary>"release", "dev" or "editor"; null before Initialize.</summary>
         public string BuildType;
         /// <summary>False in the Unity Editor unless ApmConfig.UploadInEditor.</summary>

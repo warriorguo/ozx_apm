@@ -1355,6 +1355,7 @@ namespace OzxApm.Core
                 stats.LastJankFrames = jank.LastFrames;
                 stats.LastJankSlowFrames = jank.LastSlowFrames;
                 stats.JankUpdateUs = System.Threading.Interlocked.Read(ref jank.LastSampledTicks) * 1e6 / System.Diagnostics.Stopwatch.Frequency;
+                stats.JankSelfCheckOverheadUs = System.Threading.Interlocked.Read(ref jank.SelfCheckOverheadTicks) * 1e6 / System.Diagnostics.Stopwatch.Frequency;
             }
             stats.TimersSpanningPause = TimerRegistry.SpanningPauseCount;
             stats.TimersUntracked = TimerRegistry.UntrackedCount;

@@ -15,7 +15,7 @@ namespace OzxApm.Collectors
         public int SlowFrames;
         /// <summary>Every frame of the span (the slow ones and the normal ones of merge gaps).</summary>
         public int Frames;
-        /// <summary>The expected frame time (baseline median) when it began.</summary>
+        /// <summary>The expected frame time (baseline) when it began.</summary>
         public float ExpectedFrameMs;
         /// <summary>Ended because it reached MaxEpisodeMs (a lasting slowdown), not by normal frames.</summary>
         public bool Capped;
@@ -26,8 +26,9 @@ namespace OzxApm.Collectors
     /// frame, it says when a jank ended. Main thread only; no allocation after
     /// construction.
     ///
-    /// - Expected frame time E: the median of the last BaselineFrames normal
-    ///   frames, at least the target frame time when the game set one (the
+    /// - Expected frame time E: the median of the first 15 frames (warm-up),
+    ///   then an exponential average of the normal frames (weight 1/16, about
+    ///   the last 31 frames), at least the target frame time when the game set one (the
     ///   frame rate it actually runs at, not only the one it asks for: see
     ///   RELEASE.md APM-21).
     /// - A frame is slow when it is longer than max(1.5 E, E + 8 ms).
@@ -45,7 +46,8 @@ namespace OzxApm.Collectors
     {
         internal const float SlowFactor = 1.5f;
         internal const float SlowMarginMs = 8f;
-        internal const int BaselineFrames = 31;
+        /// <summary>Weight of a normal frame in the baseline (an exponential average over ~31 frames).</summary>
+        internal const float BaselineAlpha = 1f / 16f;
         internal const int WarmupFrames = 15;
         internal const float MergeGapMs = 250f;
         internal const float MaxEpisodeMs = 5000f;
@@ -59,12 +61,21 @@ namespace OzxApm.Collectors
 
         private readonly float _jankMs;
 
-        // Baseline: the last BaselineFrames normal frames, as a ring and sorted.
-        private readonly float[] _ring = new float[BaselineFrames];
-        private readonly float[] _sorted = new float[BaselineFrames];
-        private int _count;
-        private int _head;
-        private int _warmup;
+        // Baseline: the median of the WarmupFrames first frames, then an
+        // exponential average of the normal frames (O(1) per frame: no array
+        // is touched once warmed up; APM-21 device check).
+        private readonly float[] _warm = new float[WarmupFrames];
+        private int _warmCount;
+        private bool _hasBase;
+        private float _base;
+        private float _targetFrameMs;
+
+        /// <summary>
+        /// The slow threshold while the tracker is idle and watching (not in a
+        /// jank, a grace period, warm-up or suspended); 0 otherwise. A frame in
+        /// (0, FastLimitMs] is a normal frame: the fast path.
+        /// </summary>
+        private float _fastLimitMs;
 
         private int _graceFrames;
         private float _graceMsLeft;
@@ -94,9 +105,6 @@ namespace OzxApm.Collectors
         /// </summary>
         internal bool RunStartedThisFrame { get; private set; }
 
-        /// <summary>Frames fed and frames ignored (grace, suspended, invalid), for tests and stats.</summary>
-        internal long FramesSeen { get; private set; }
-        internal long FramesIgnored { get; private set; }
 
         internal JankTracker(float jankThresholdMs)
         {
@@ -110,15 +118,23 @@ namespace OzxApm.Collectors
         /// pacing that alternates display refreshes around the target (60 fps
         /// on a 90 Hz display: 11.1 and 22.2 ms) is not slow.
         /// </summary>
-        internal float TargetFrameMs { get; set; }
+        internal float TargetFrameMs
+        {
+            get => _targetFrameMs;
+            set
+            {
+                _targetFrameMs = value;
+                RefreshFast();
+            }
+        }
 
-        /// <summary>The expected frame time (ms): the baseline median, at least TargetFrameMs; 0 until the baseline has its first frames.</summary>
-        internal float ExpectedFrameMs => _count == 0 ? 0f : Math.Max(_sorted[_count / 2], TargetFrameMs);
+        /// <summary>The expected frame time (ms): the baseline, at least TargetFrameMs; 0 while warming up.</summary>
+        internal float ExpectedFrameMs => _hasBase ? (_base > _targetFrameMs ? _base : _targetFrameMs) : 0f;
 
         /// <summary>The slow-frame threshold for the current baseline (ms); 0 while warming up.</summary>
         internal float SlowThresholdMs => SlowThreshold(ExpectedFrameMs);
 
-        internal bool WarmingUp => _warmup > 0;
+        internal bool WarmingUp => !_hasBase;
         internal bool InJank => _state == State.Episode || _state == State.Gap;
 
         internal static float SlowThreshold(float expectedMs)
@@ -137,6 +153,7 @@ namespace OzxApm.Collectors
             _graceMsLeft = 0f;
             ResetBaseline();
             StartGrace(GraceFrames, GraceMs);
+            RefreshFast();
         }
 
         /// <summary>
@@ -146,11 +163,11 @@ namespace OzxApm.Collectors
         /// </summary>
         internal void ResetBaseline()
         {
-            _count = 0;
-            _head = 0;
-            _warmup = WarmupFrames;
+            _warmCount = 0;
+            _hasBase = false;
             if (_state == State.Run)
                 _state = State.Idle;
+            RefreshFast();
         }
 
         /// <summary>Paused or unfocused: frames are ignored until Resume. Flush first.</summary>
@@ -158,6 +175,7 @@ namespace OzxApm.Collectors
         {
             _suspended = true;
             _state = State.Idle;
+            RefreshFast();
         }
 
         /// <summary>Back in the foreground: the grace period, the baseline kept.</summary>
@@ -166,6 +184,7 @@ namespace OzxApm.Collectors
             _suspended = false;
             _state = State.Idle;
             StartGrace(GraceFrames, GraceMs);
+            RefreshFast();
         }
 
         /// <summary>A scene was loaded in this frame: it and the next are not janks. Flush first.</summary>
@@ -173,6 +192,7 @@ namespace OzxApm.Collectors
         {
             _state = State.Idle;
             StartGrace(SceneLoadFrames, 0f);
+            RefreshFast();
         }
 
         private void StartGrace(int frames, float ms)
@@ -192,22 +212,56 @@ namespace OzxApm.Collectors
         /// </summary>
         internal bool Frame(float frameMs, out JankEpisode episode)
         {
-            episode = default;
             StartedThisFrame = false;
             RunStartedThisFrame = false;
-            FramesSeen++;
+            if (TryFast(frameMs))
+            {
+                episode = default;
+                return false;
+            }
+            bool ended = FrameSlow(frameMs, out episode);
+            RefreshFast();
+            return ended;
+        }
+
+        /// <summary>
+        /// The fast path, almost every frame: idle and a normal frame. A few
+        /// fields of this object, no array, no call, no engine. Returns false
+        /// (nothing done) for any other frame: then Frame must be called.
+        /// (NaN fails the test.)
+        /// </summary>
+        internal bool TryFast(float frameMs)
+        {
+            if (!(frameMs > 0f && frameMs <= _fastLimitMs))
+                return false;
+            // StartedThisFrame / RunStartedThisFrame are not reset here: callers
+            // read them only after Frame, which resets them.
+            ClockMs += frameMs;
+            float b = _base + (frameMs - _base) * BaselineAlpha;
+            _base = b;
+            float expected = b > _targetFrameMs ? b : _targetFrameMs;
+            float slow = expected * SlowFactor;
+            float margin = expected + SlowMarginMs;
+            _fastLimitMs = slow > margin ? slow : margin;
+            return true;
+        }
+
+        private void RefreshFast()
+        {
+            _fastLimitMs = _state == State.Idle && !_suspended && _hasBase && _graceFrames <= 0 && !(_graceMsLeft > 0f)
+                ? SlowThreshold(ExpectedFrameMs)
+                : 0f;
+        }
+
+        private bool FrameSlow(float frameMs, out JankEpisode episode)
+        {
+            episode = default;
             // NaN fails the comparison; 0 happens in the very first frame.
             if (!(frameMs > 0f) || float.IsInfinity(frameMs))
-            {
-                FramesIgnored++;
                 return false;
-            }
             ClockMs += frameMs;
             if (_suspended)
-            {
-                FramesIgnored++;
                 return false;
-            }
             if (_graceFrames > 0 || _graceMsLeft > 0f)
             {
                 if (!_graceFirst)
@@ -215,12 +269,10 @@ namespace OzxApm.Collectors
                 _graceFirst = false;
                 if (_graceFrames > 0)
                     _graceFrames--;
-                FramesIgnored++;
                 return false;
             }
-            if (_warmup > 0)
+            if (!_hasBase)
             {
-                _warmup--;
                 AddBaseline(frameMs);
                 return false;
             }
@@ -296,9 +348,11 @@ namespace OzxApm.Collectors
             if (_state == State.Episode || _state == State.Gap)
             {
                 Complete(false, out episode);
+                RefreshFast();
                 return true;
             }
             _state = State.Idle;
+            RefreshFast();
             return false;
         }
 
@@ -363,36 +417,25 @@ namespace OzxApm.Collectors
 
         private void AddBaseline(float frameMs)
         {
-            if (_count < BaselineFrames)
+            if (_hasBase)
             {
-                _ring[(_head + _count) % BaselineFrames] = frameMs;
-                Insert(frameMs, _count);
-                _count++;
+                _base += (frameMs - _base) * BaselineAlpha;
                 return;
             }
-            float old = _ring[_head];
-            _ring[_head] = frameMs;
-            _head = (_head + 1) % BaselineFrames;
-            // Remove old from the sorted array, then insert the new value. Plain
-            // loops over 31 floats: no generic comparer or Array call on IL2CPP.
-            int i = 0;
-            while (i < _count - 1 && _sorted[i] != old)
-                i++;
-            for (; i < _count - 1; i++)
-                _sorted[i] = _sorted[i + 1];
-            Insert(frameMs, _count - 1);
-        }
-
-        // Inserts value into _sorted[0..n) (n < capacity) keeping it sorted.
-        private void Insert(float value, int n)
-        {
-            int i = n;
-            while (i > 0 && _sorted[i - 1] > value)
+            // Warm-up: every frame, then the median of them (robust to the
+            // long frames of a start or a change).
+            int i = _warmCount++;
+            while (i > 0 && _warm[i - 1] > frameMs)
             {
-                _sorted[i] = _sorted[i - 1];
+                _warm[i] = _warm[i - 1];
                 i--;
             }
-            _sorted[i] = value;
+            _warm[i] = frameMs;
+            if (_warmCount == WarmupFrames)
+            {
+                _base = _warm[WarmupFrames / 2];
+                _hasBase = true;
+            }
         }
     }
 

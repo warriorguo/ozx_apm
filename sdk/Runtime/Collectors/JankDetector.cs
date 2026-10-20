@@ -114,15 +114,39 @@ namespace OzxApm.Collectors
         private int _frameCounter;
         /// <summary>The detector's own time in a sampled frame (1 in SelfCheckEvery), Stopwatch ticks.</summary>
         internal long LastSampledTicks;
+        /// <summary>Two back-to-back Stopwatch reads in the last sampled frame (the timer's own cost, subtracted above).</summary>
+        internal long SelfCheckOverheadTicks;
         internal const int SelfCheckEvery = 64;
 
         public void Update()
         {
             if (!_isActive)
                 return;
-            // A cheap self-check: one frame in 64 is timed (two timestamp reads).
-            bool timed = (++_frameCounter & (SelfCheckEvery - 1)) == 0;
-            long t0 = timed ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+            // A cheap self-check: one frame in 64 is timed. Three timestamp
+            // reads: the first two (back to back) measure the timer itself,
+            // which is subtracted (and reported: SelfCheckOverheadTicks).
+            if ((++_frameCounter & (SelfCheckEvery - 1)) == 0)
+            {
+                UpdateTimed();
+                return;
+            }
+            UpdateFrame();
+        }
+
+        private void UpdateTimed()
+        {
+            long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+            long t1 = System.Diagnostics.Stopwatch.GetTimestamp();
+            UpdateFrame();
+            long t2 = System.Diagnostics.Stopwatch.GetTimestamp();
+            long overhead = t1 - t0;
+            SelfCheckOverheadTicks = overhead;
+            long work = (t2 - t1) - overhead;
+            LastSampledTicks = work > 0 ? work : 0;
+        }
+
+        private void UpdateFrame()
+        {
             // Unscaled: Time.timeScale (slow motion, a pause menu at 0) does not change it.
             float frameMs = Time.unscaledDeltaTime * 1000f;
             _sincePollMs += frameMs > 0f ? frameMs : 0f;
@@ -131,9 +155,10 @@ namespace OzxApm.Collectors
                 _sincePollMs = 0f;
                 PollFrameRate(Application.targetFrameRate, QualitySettings.vSyncCount);
             }
+            // Almost every frame ends here: a normal frame while idle.
+            if (_tracker.TryFast(frameMs))
+                return;
             Feed(frameMs);
-            if (timed)
-                LastSampledTicks = System.Diagnostics.Stopwatch.GetTimestamp() - t0;
         }
 
         /// <summary>One frame of frameMs, the frame rate settings read in the same frame (tests).</summary>

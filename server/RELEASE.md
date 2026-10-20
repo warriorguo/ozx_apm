@@ -3691,17 +3691,22 @@ with frame sequences); `JankDetector` feeds it `Time.unscaledDeltaTime` once
 per frame (unscaled: `Time.timeScale`, slow motion or a pause menu at 0, do
 not change frame times).
 
-- **Expected frame time E**: the median of the last 31 normal frames, but
-  never below the frame time the game asks for (`1000 /
-  Application.targetFrameRate` when it is set). The median is the frame rate
-  the game actually runs at: `targetFrameRate` alone is not enough (-1 means
-  the platform's default, 30 fps on mobile; `vSyncCount` overrides it on some
-  platforms; a game below its target on a weak or hot device would be
-  "janky" every frame). The target floor is for display cadences around the
-  target: 60 fps on a 90 Hz display alternates 11.1 / 22.2 ms frames; with
-  the median alone (11.1) a 22.2 ms frame is slow and three in a row a jank
-  (`/tmp/claude-501/apm21/bench/Check90.cs`: 51 false janks in 5 minutes
-  without the floor, 0 with it).
+- **Expected frame time E**: the median of the first 15 frames (the
+  warm-up, after a start or a reset: robust to their long frames), then an
+  exponential average of the normal frames (weight 1/16, about the last 31
+  frames; slow frames are not taken in, so the average needs no outlier
+  rejection), but never below the frame time the game asks for (`1000 /
+  Application.targetFrameRate` when it is set). The baseline is the frame
+  rate the game actually runs at: `targetFrameRate` alone is not enough (-1
+  means the platform's default, 30 fps on mobile; `vSyncCount` overrides it
+  on some platforms; a game below its target on a weak or hot device would
+  be "janky" every frame). The target floor is for display cadences around
+  the target: 60 fps on a 90 Hz display alternates 11.1 / 22.2 ms frames
+  (`/tmp/claude-501/apm21/bench/Check90.cs`: with the first version's median
+  of 31 frames and no floor, 51 false janks in 5 minutes; the floor gave 0;
+  the average gives 0 with or without it, E 18.0 ms). Until the second cost fix the
+  baseline was an exact sliding median of 31 frames (two arrays kept sorted
+  every frame); the average is O(1) and touches no array.
 - **Slow frame**: longer than max(1.5 E, E + 8 ms): 50.1 ms at 30 fps, 25 ms
   at 60, 19.1 ms at 90, 16.3 ms at 120. This replaces CLAUDE.md's fixed
   "consecutive frames > 33 ms", which was the 60 fps case (a frame twice as
@@ -3797,8 +3802,8 @@ not change frame times).
   `JankUpdateUs` (a self-check: the detector's own time in one frame of
   64, timed with two Stopwatch reads in that frame only).
 - **A device below its target**: the A33 with `targetFrameRate=60` runs at
-  45 fps (22.3 ms frames on its 90 Hz display). E is then 22.3 ms (the
-  median, above the 16.7 ms floor), slow means > 33.45 ms: 33.3 ms frames
+  45 fps (22.3 ms frames on its 90 Hz display). E is then 22.3 ms (the baseline,
+  above the 16.7 ms floor), slow means > 33.45 ms: 33.3 ms frames
   (one refresh more) are not slow, and a 45 -> 30 fps drop is not a jank;
   a 150 ms frame is.
 
@@ -3828,9 +3833,10 @@ Unity's Mono outside Unity (M-series Mac, `/tmp/claude-501/apm21/bench/Bench21.c
 
 | Path | Time | Allocated |
 |---|---|---|
-| `JankDetector` per frame, steady 30 fps (tracker, baseline insert/remove) | 0.07 us | 0 |
-| ... with a 120 ms frame every 10 frames (detected, not sent) | 0.04 us | 0 |
-| `JankTracker.Frame` alone, 60 fps with jitter | 0.05 us | 0 |
+| `JankDetector` per frame, steady 30 fps (sliding median version) | 0.07 us | 0 |
+| ... average baseline and fast path (this version) | 0.011 us | 0 |
+| `JankTracker.TryFast` (the path of a normal frame) | 0.006 us | 0 |
+| ... with a 120 ms frame every 10 frames (detected, not sent) | 0.025 us | 0 |
 | Reporting a jank (event, 10 recent lines; not enqueued) | ~1.4 us per jank | ~1.4 KB per jank |
 
 Per frame on the device: `Time.unscaledDeltaTime` (read before APM-21
@@ -3840,12 +3846,45 @@ self-check); `GameContext.Current` and the wall clock once per run of slow
 frames. The first device build read the two frame rate settings every
 frame and measured idle `update_ms` p50 0.065 / p99 0.247 ms (30 fps) and
 0.065 / 0.465 ms (45 fps) against APM-9's 0.036 / 0.114: those engine calls
-are too expensive per frame on IL2CPP/Android. The baseline's sorted array
-is now kept with plain loops (no `Array.BinarySearch<float>` comparer or
-`Array.Copy`).
-Memory: two arrays of 31 floats. Nothing on other threads. The APM-9
-baseline (A33 release, idle `update_ms` p50 0.036 / p99 0.11 ms) must hold:
-measured by the device plan, not here.
+are too expensive per frame on IL2CPP/Android.
+
+The second build (frame rate settings once a second, a2637a9) measured idle
+p50 0.044 / p99 0.147 ms, still ~7 us above APM-9, and the self-check
+`JankUpdateUs` 6.6-9.1 us, against 0.07 us on Mono (a hot loop). The
+generated C++ of that build (`il2cppOutput/cpp/OzxApm__2.cpp`, `-Os`) has
+no engine call on the per-frame path besides `Time.unscaledDeltaTime` (as
+before APM-21), no allocation, no generic or virtual call, and the
+metadata-initialisation checks are one static flag each. What it did every
+frame: `JankDetector.Update` -> `Feed` -> `JankTracker.Frame` ->
+`AddBaseline` -> `Insert` (four non-inlined calls through the large
+`Frame` body), and in `AddBaseline` a linear search for the oldest value
+in the 31-float sorted array, the shift of the rest and the insertion
+shift, each element access an IL2CPP `GetAt`/`SetAt` with its bounds check
+(about 30-60 checked accesses over two arrays of two to three cache lines
+each), plus the ring array. Some hundreds of instructions: well under a
+microsecond with warm caches. **The rest is the cost of running cold**:
+the detector runs once per frame between the game's work, so its code
+(several functions, a few KB) and data (two objects, two arrays) come back
+from L2/DRAM every frame; on the A33's cores tens of cache misses are
+microseconds, which a hot-loop bench on a Mac cannot show. Not proven by a
+profile on the device (the sandbox has none): an inference from the code
+and the 100x gap.
+
+So the per-frame path is now as small as it can be (second cost fix):
+`Update` -> `UpdateFrame` -> `JankTracker.TryFast`: a 1-in-64 counter, the
+`unscaledDeltaTime` icall, the poll counter, then in `TryFast` one compare
+against a cached threshold and an average update: a handful of fields in
+two objects (no array, no other call). Everything else (runs of slow
+frames, janks, grace periods, warm-up, resets) takes the full `Frame` path,
+which only happens on slow frames or after an event. The self-check now
+takes three timestamps in its frame and subtracts the timer's own cost
+(back-to-back reads), reported as `ApmStats.JankSelfCheckOverheadUs`. For
+the definitive figure, the driver's `jd=0` launch key turns the detector
+off: compare `measure=` with and without it.
+
+Memory: two small objects and a 15-float warm-up array. Nothing on other
+threads. The APM-9 baseline (A33 release, idle `update_ms` p50 0.036 / p99
+0.11 ms) must hold: measured by the device plan, not here.
 
 ### Rolling deploy and rollback
 
@@ -3911,11 +3950,18 @@ text: redeploy the previous admin.
   allocation test with statement lambdas run once before measuring).
 - Cost: **regressed** (idle p50 0.065, p99 0.247 / 0.465 ms; above).
 
+- Cost at a2637a9 (frame rate settings once a second): idle p50 0.0440 /
+  p99 0.147, 45 fps 0.0429 / 0.156, wave 0.0434 / 0.189 ms;
+  `jank_update_us` 6.6-9.1 (7.0 idle). EditMode 400/400. S1 unchanged
+  (145.0 / 200.7).
+
 ### Not verified
 
-- The cost fix (frame rate settings read once a second, plain loops,
-  sliding rate window) on the device: the APM-9 baseline (p50 0.036 /
-  p99 0.11-0.13 ms) must be measured again; EditMode on it.
+- The fast path (average baseline, second cost fix) on the device: the APM-9 baseline
+  (p50 0.036 / p99 0.11-0.13 ms), `jank_update_us` (target <= 1-2 us), the
+  timer overhead it reports, and `jd=0` against it; EditMode on it; the
+  device scenarios again (the baseline is now an average: S1-S10 should
+  not change, S3 `slow=10` and the 45 fps runs are the ones to watch).
 - iOS; other Android devices and refresh rates; a device that really runs
   60 fps.
 - How often real games hit the 20-a-minute limit, and whether 1.5x / +8 ms
