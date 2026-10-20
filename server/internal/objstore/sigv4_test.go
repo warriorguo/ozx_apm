@@ -112,3 +112,12 @@ func TestURIEncode(t *testing.T) {
 		t.Errorf("slash: %q", got)
 	}
 }
+
+// Query parameters sort by encoded key, then value: "prefix" before
+// "prefix-x" although "prefix=" > "prefix-" as strings.
+func TestCanonicalQuery_SortsByKeyThenValue(t *testing.T) {
+	q := url.Values{"prefix-x": {"1"}, "prefix": {"b", "a"}, "uploads": {""}}
+	if got := canonicalQuery(q); got != "prefix=a&prefix=b&prefix-x=1&uploads=" {
+		t.Fatalf("%s", got)
+	}
+}

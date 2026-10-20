@@ -194,3 +194,56 @@ func TestNew_Validates(t *testing.T) {
 		}
 	}
 }
+
+// A store that ignores Range (answers 200 with the whole object): GetRange
+// still returns the requested bytes (the archive check reads the end of an
+// object this way).
+func TestClient_GetRangeOnAStoreIgnoringRange(t *testing.T) {
+	s := s3test.New("b")
+	defer s.Close()
+	c := newClient(t, s, s.SecretKey)
+	data := bytes.Repeat([]byte("0123456789"), 100)
+	s.Put("k", data)
+	s.IgnoreRange = true
+	for _, tc := range []struct{ off, n int64 }{{0, 5}, {3, 4}, {500, 20}, {995, 50}} {
+		got, err := c.GetRange(context.Background(), "k", tc.off, tc.n)
+		end := tc.off + tc.n
+		if end > int64(len(data)) {
+			end = int64(len(data))
+		}
+		if err != nil || !bytes.Equal(got, data[tc.off:end]) {
+			t.Errorf("off %d n %d: %q %v", tc.off, tc.n, got, err)
+		}
+	}
+}
+
+// A streamed GetObject is not cut by the client's per-request timeout;
+// the other calls read their bodies within it.
+func TestClient_StreamOutlivesTheTimeout(t *testing.T) {
+	s := s3test.New("b")
+	defer s.Close()
+	c, err := objstore.New(objstore.Config{Endpoint: s.URL, Bucket: s.Bucket, AccessKey: s.AccessKey, SecretKey: s.SecretKey,
+		Timeout: 50 * time.Millisecond}, s.HTTPClient())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Put("k", []byte("hello"))
+	rc, _, err := c.GetObject(context.Background(), "k")
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(120 * time.Millisecond)
+	got, err := io.ReadAll(rc)
+	rc.Close()
+	if err != nil || string(got) != "hello" {
+		t.Fatalf("%q %v", got, err)
+	}
+	if err := c.PutObject(context.Background(), "k2", []byte("x"), ""); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(120 * time.Millisecond)
+	objs, _, err := c.ListObjects(context.Background(), "", "", 10)
+	if err != nil || len(objs) != 2 {
+		t.Fatalf("%v %v", objs, err)
+	}
+}

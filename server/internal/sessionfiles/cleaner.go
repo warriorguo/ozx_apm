@@ -108,7 +108,8 @@ func (s *Service) ExpireOnce(ctx context.Context) (int, error) {
 func (s *Service) deleteObjects(ctx context.Context, files []models.SessionFile) ([]string, error) {
 	var done []string
 	for _, f := range files {
-		if f.ObjectKey != "" && strings.HasPrefix(f.ObjectKey, s.cfg.Prefix) {
+		// By the stored key, also when the prefix was changed since.
+		if f.ObjectKey != "" {
 			if err := s.obj.DeleteObject(ctx, f.ObjectKey); err != nil {
 				return done, fmt.Errorf("delete %s: %w", f.UploadID, err)
 			}

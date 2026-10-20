@@ -565,13 +565,23 @@ namespace OzxApm.Network
             }
 
             // A copy of session.json: the create request needs it, also after
-            // AiTelemetry's retention deleted the directory.
-            CopyCapped(sessionJson, SessionJsonPath(r.Id), MaxSessionJsonBytes);
+            // AiTelemetry's retention deleted the directory. A larger one is not
+            // sent (the server indexes none then; the recording has it).
+            if (new FileInfo(sessionJson).Length <= MaxSessionJsonBytes)
+                CopyCapped(sessionJson, SessionJsonPath(r.Id), MaxSessionJsonBytes);
+            else
+                File.WriteAllText(SessionJsonPath(r.Id), "");
+            string badName = FirstInvalidEntryName(before);
+            if (badName != null)
+            {
+                Finish(r, SessionUploadState.Failed, $"the server would refuse the file name '{badName}' (no ':' or '\\', at most 512 bytes)");
+                return;
+            }
             if (string.IsNullOrEmpty(r.SessionId))
             {
                 // The session the recording was made in, when OZX wrote it into
                 // session.json; else the session Upload was called in.
-                string apmSession = JsonField(File.ReadAllText(SessionJsonPath(r.Id)), "apmSessionId");
+                string apmSession = JsonField(File.ReadAllText(sessionJson), "apmSessionId");
                 r.SessionId = IsValidId(apmSession) ? apmSession : r.CurrentSession;
             }
             if (!IsValidId(r.SessionId))
@@ -606,6 +616,17 @@ namespace OzxApm.Network
             r.State = SessionUploadState.Packed;
             r.Save(StatePath(r.Id));
             ApmClient.Log(LogLevel.Info, $"Session files: {r.Recording} zipped: {r.FileCount} files, {r.RawBytes} -> {r.Size} bytes ({(result.Deflated ? "deflate" : "stored")})");
+        }
+
+        /// <summary>The first entry name the server's archive check refuses, or null.</summary>
+        internal static string FirstInvalidEntryName(List<SessionArchive.FileEntry> files)
+        {
+            foreach (var f in files)
+            {
+                if (f.Name.IndexOf(':') >= 0 || f.Name.IndexOf('\\') >= 0 || Encoding.UTF8.GetByteCount(f.Name) > 512)
+                    return f.Name;
+            }
+            return null;
         }
 
         private long StoredBytes()
@@ -660,7 +681,7 @@ namespace OzxApm.Network
         {
             int waitMs = (job.TimeoutSeconds + 30) * 1000;
             bool ok = _http.Send(job, waitMs);
-            job.Done.Close();
+            // job.Done is not disposed: the main thread may still set it (a request the worker stopped waiting for).
             if (Cancelled())
                 throw new OperationCanceledException();
             if (!ok || job.TransportError || job.Status == 0)
@@ -864,6 +885,8 @@ namespace OzxApm.Network
                 r.State = SessionUploadState.Packed;
                 _synced.Remove(r.Id);
                 r.Save(StatePath(r.Id));
+                // Not at full speed: a server (or proxy) without the route answers 404 too.
+                Backoff(r, 0);
                 return;
             }
             ApmClient.Log(LogLevel.Info, $"Session files: {r.Recording}: {_lastError}; retried later");

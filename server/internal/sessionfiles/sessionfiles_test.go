@@ -284,7 +284,6 @@ func TestCreate_Validation(t *testing.T) {
 		{"part too large", func(r *CreateRequest) { r.PartBytes = 8 << 20 }, 400, "invalid_request"},
 		{"part count wrong", func(r *CreateRequest) { r.PartCount = 7 }, 400, "invalid_request"},
 		{"bad sha", func(r *CreateRequest) { r.SHA256 = "xyz" }, 400, "invalid_request"},
-		{"session.json too long", func(r *CreateRequest) { r.SessionJSON = strings.Repeat(" ", MaxSessionJSON+1) }, 400, "invalid_request"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -296,6 +295,16 @@ func TestCreate_Validation(t *testing.T) {
 	}
 	if len(e.store.Rows()) != 0 {
 		t.Fatalf("a refused upload was stored: %d rows", len(e.store.Rows()))
+	}
+	// An oversized session.json is left out of the index, never a refusal.
+	big := ok
+	big.UploadID = newUploadID(t)
+	big.SessionJSON = `{"gitCommit":"abcdef1"}` + strings.Repeat(" ", MaxSessionJSON)
+	if _, err := e.svc.Create(context.Background(), big); err != nil {
+		t.Fatal(err)
+	}
+	if f, _ := e.store.GetSessionFile(context.Background(), big.UploadID); f.SessionJSON != "" || f.GitCommit != "" {
+		t.Fatalf("oversized session.json kept: %d bytes, commit %q", len(f.SessionJSON), f.GitCommit)
 	}
 	// The editor build type is accepted; a bad commit from session.json is dropped.
 	r := ok
@@ -747,5 +756,70 @@ func TestVersionOrdersStates(t *testing.T) {
 	}
 	if models.SessionFileVersion(models.SessionFileFailed, earlier) <= models.SessionFileVersion(models.SessionFileUploading, later) {
 		t.Fatal("failed must win over uploading")
+	}
+}
+
+// A zip whose local header names another file than its central directory
+// entry (a streaming extractor would write ../c.jsonl): refused.
+func TestCommit_LocalHeaderNameMismatchIsRefused(t *testing.T) {
+	data := makeZip(t, []zipEntry{{name: testRecording + "/session.json", data: []byte("{}")}, {name: testRecording + "/ab/c.jsonl", data: []byte("x")}})
+	i := bytes.Index(data, []byte("/ab/c.jsonl"))
+	copy(data[i:], "/../c.jsonl")
+	if _, _, err := ValidateArchive(bytes.NewReader(data), int64(len(data)), testRecording); err == nil || !strings.Contains(err.Error(), "local header") {
+		t.Fatalf("err %v", err)
+	}
+}
+
+// goneObjects reports every archive as missing after it was written: a
+// privacy deletion or the cleaner removed the upload during the commit.
+type goneObjects struct{ Objects }
+
+func (g goneObjects) HeadObject(ctx context.Context, key string) (int64, error) {
+	return 0, &objstore.Error{Op: "head", Key: key, Status: http.StatusNotFound}
+}
+
+func TestCommit_DeletedDuringTheCommitLeavesNoRow(t *testing.T) {
+	e := newEnv(t, Config{})
+	e.svc.obj = goneObjects{e.svc.obj}
+	ctx := context.Background()
+	data := sessionZip(t, testRecording)
+	id := newUploadID(t)
+	if _, err := e.svc.Create(ctx, createReq(id, data, MinPartBytes)); err != nil {
+		t.Fatal(err)
+	}
+	e.putParts(t, id, data, MinPartBytes, nil)
+	_, err := e.svc.Commit(ctx, id, CommitRequest{DeviceID: testDevice, SHA256: shaHex(data), SizeBytes: int64(len(data))})
+	wantError(t, err, http.StatusNotFound, "")
+	if f, _ := e.store.GetSessionFile(ctx, id); f != nil {
+		t.Fatalf("row left: %+v", f)
+	}
+}
+
+// A commit outlives the request that started it: the client's retry gets
+// its result.
+func TestCommit_DetachedFromTheRequest(t *testing.T) {
+	e := newEnv(t, Config{})
+	data := sessionZip(t, testRecording)
+	id := newUploadID(t)
+	if _, err := e.svc.Create(context.Background(), createReq(id, data, MinPartBytes)); err != nil {
+		t.Fatal(err)
+	}
+	e.putParts(t, id, data, MinPartBytes, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // the client has gone already
+	req := CommitRequest{DeviceID: testDevice, SHA256: shaHex(data), SizeBytes: int64(len(data))}
+	if _, err := e.svc.Commit(ctx, id, req); err == nil {
+		// the run may have finished first: fine
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		st, err := e.svc.Commit(context.Background(), id, req)
+		if err == nil && st.Status == models.SessionFileComplete {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%+v %v", st, err)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }

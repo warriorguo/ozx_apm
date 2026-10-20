@@ -354,7 +354,15 @@ namespace OzxApm.Core
         {
             // Session files (APM-13): Granted resumes, otherwise the request under
             // way is aborted; Denied deletes the queued copies.
-            _sessionFiles?.OnConsent(state);
+            try
+            {
+                _sessionFiles?.OnConsent(state);
+            }
+            catch (Exception ex)
+            {
+                // Never in the way of the consent change below.
+                ReportInternalError("SessionFiles.OnConsent", ex);
+            }
             if (state == ConsentState.Granted)
             {
                 _sessionManager.OnConsentGranted();
@@ -492,7 +500,14 @@ namespace OzxApm.Core
             _reporter.CancelInFlight();
             _offlineStorage.Clear(true);
             // Queued session file uploads carry the old id too (APM-13).
-            _sessionFiles?.Clear();
+            try
+            {
+                _sessionFiles?.Clear();
+            }
+            catch (Exception ex)
+            {
+                ReportInternalError("SessionFiles.Clear", ex);
+            }
             _sessionManager.ResetDeviceId();
             _sessionManager.StartNewSession();
             // Journals of earlier processes carry the old id (APM-7).
@@ -2286,7 +2301,14 @@ namespace OzxApm.Core
                 _opsReporter?.Shutdown();
                 // Session files resume from their state files at the next launch (APM-13).
                 s_sessionFiles = null;
-                _sessionFiles?.Shutdown(100);
+                try
+                {
+                    _sessionFiles?.Shutdown(100);
+                }
+                catch (Exception ex)
+                {
+                    ReportInternalError("SessionFiles.Shutdown", ex);
+                }
                 _sessionFiles = null;
                 long start = System.Diagnostics.Stopwatch.GetTimestamp();
                 _offlineStorage.Shutdown(ShutdownFlushTimeoutMs);

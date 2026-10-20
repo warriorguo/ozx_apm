@@ -761,6 +761,52 @@ namespace OzxApm.Tests
         }
 
         [Test]
+        public void Create404_BacksOff()
+        {
+            var server = new FakeSessionServer();
+            for (int i = 0; i < 50; i++)
+                server.Override(j => j.Method == "POST" && j.Url.EndsWith("/v1/session-files"), FakeSessionServer.Answer(404, "404 page not found"));
+            var u = NewUploader(server);
+            string id = u.Enqueue(SessionDirs.Make(_root, "s_404c", 0), Facts());
+            RunUntil(u, () => server.Requests.Count >= 1);
+            RunFor(u, 500);
+            Assert.LessOrEqual(server.Requests.Count, 2, "a 404 is retried after a backoff, not at once");
+            Assert.AreEqual(SessionUploadState.Packed, Info(u, id).State);
+        }
+
+        [Test]
+        public void HttpHandoff_ClosedOrAbandonedJobsNeverThrow()
+        {
+            var server = new FakeSessionServer();
+            var http = new SessionFileHttp(server);
+            var job = new SessionHttpJob { Method = "GET", Url = "http://apm.test/v1/session-files", Headers = new string[0] };
+            // The worker gives up before the main thread runs: withdrawn, never started.
+            Assert.IsFalse(http.Send(job, 10));
+            http.Update(0f, false);
+            Assert.AreEqual(0, server.Requests.Count);
+            // Taken by the main thread after the worker disposed its event: no exception.
+            var job2 = new SessionHttpJob { Method = "GET", Url = "http://apm.test/x", Headers = new string[0] };
+            var t = new Thread(() => http.Send(job2, 2000));
+            t.Start();
+            while (!http.Busy)
+                Thread.Sleep(1);
+            job2.Done.Close();
+            Assert.DoesNotThrow(() => http.Update(0f, false));
+            Assert.DoesNotThrow(() => http.Close());
+            t.Join();
+        }
+
+        [Test]
+        public void EntryNames_TheServerRefuses_FailEarly()
+        {
+            var ok = new List<SessionArchive.FileEntry> { new SessionArchive.FileEntry { Name = "s/a.jsonl" } };
+            Assert.IsNull(SessionFileUploader.FirstInvalidEntryName(ok));
+            ok.Add(new SessionArchive.FileEntry { Name = "s/c:x" });
+            Assert.AreEqual("s/c:x", SessionFileUploader.FirstInvalidEntryName(ok));
+            Assert.IsNotNull(SessionFileUploader.FirstInvalidEntryName(new List<SessionArchive.FileEntry> { new SessionArchive.FileEntry { Name = "s/" + new string('a', 600) } }));
+        }
+
+        [Test]
         public void JsonHelpers()
         {
             Assert.AreEqual("uploading", SessionFileUploader.JsonField("{\"a\":1, \"status\" : \"uploading\"}", "status"));

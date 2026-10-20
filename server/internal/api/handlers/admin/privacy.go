@@ -290,6 +290,12 @@ func (h *PrivacyHandler) runDeletion(ctx context.Context, job *models.PrivacyDel
 	if err == nil && len(tables) == 0 {
 		err = fmt.Errorf("no table has a %s column", column)
 	}
+	if err == nil && keepSessionFileRows && h.sessionFiles != nil && column != "device_id" {
+		// A player's recordings are found through its ops events' sessions:
+		// keep everything so that running the deletion again finds them.
+		err = fmt.Errorf("session file recordings could not be deleted (%s); nothing else was deleted: run it again",
+			result.SessionFiles.Error)
+	}
 
 	var denied error
 	if err == nil {

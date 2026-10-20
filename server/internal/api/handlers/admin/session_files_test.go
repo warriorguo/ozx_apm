@@ -289,3 +289,18 @@ func TestPrivacy_PlayerRecordingsAndVerify(t *testing.T) {
 		t.Fatalf("verify %d %s", rec.Code, rec.Body)
 	}
 }
+
+// By player id the recordings are found through the player's ops events:
+// when they cannot be deleted, nothing is (a retry must find them again).
+func TestPrivacyDelete_PlayerRecordingsFailure_KeepsEverything(t *testing.T) {
+	store, order := sfPrivacyFixture()
+	store.rows["ops_events"] = map[string]uint64{"p-1": 3}
+	purger := &fakePurger{result: models.PrivacySessionFiles{UploadsBefore: 1, UploadsAfter: 1, Error: "s3 down"}, order: order}
+	h := NewPrivacyHandler(store, zap.NewNop(), testToken)
+	h.SetSessionFiles(purger)
+	w := postPrivacy(h.Delete, `{"id_type":"player_id","id":"p-1"}`, "p-1")
+	d := decodeDeletion(t, w)
+	if d.Status != "failed" || !strings.Contains(d.Error, "run it again") || store.rows["ops_events"]["p-1"] != 3 {
+		t.Fatalf("%d %+v, ops rows %d", w.Code, d, store.rows["ops_events"]["p-1"])
+	}
+}

@@ -163,8 +163,11 @@ func (h *SessionFileHandler) Part(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// A part may take longer than the server's read timeout on a slow network.
+	// The write deadline too: the server's WriteTimeout counts from the
+	// request's headers, so a slow body would leave no time for the answer.
 	rc := http.NewResponseController(w)
 	_ = rc.SetReadDeadline(time.Now().Add(h.PartReadTimeout))
+	_ = rc.SetWriteDeadline(time.Now().Add(h.PartReadTimeout + 30*time.Second))
 	if err := h.svc.PutPart(r.Context(), chi.URLParam(r, "id"), n, r.Header.Get(DeviceIDHeader), r.Header.Get(PartSHA256Header), r.Body); err != nil {
 		h.writeError(w, err)
 		return

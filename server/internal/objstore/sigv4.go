@@ -96,15 +96,26 @@ func canonicalQuery(q url.Values) string {
 	if len(q) == 0 {
 		return ""
 	}
-	pairs := make([]string, 0, len(q))
+	type kv struct{ k, v string }
+	pairs := make([]kv, 0, len(q))
 	for k, vs := range q {
 		ek := uriEncode(k, true)
 		for _, v := range vs {
-			pairs = append(pairs, ek+"="+uriEncode(v, true))
+			pairs = append(pairs, kv{ek, uriEncode(v, true)})
 		}
 	}
-	sort.Strings(pairs)
-	return strings.Join(pairs, "&")
+	// By encoded key, then value (not the joined "k=v": "a-b" < "a=" would differ).
+	sort.Slice(pairs, func(i, j int) bool {
+		if pairs[i].k != pairs[j].k {
+			return pairs[i].k < pairs[j].k
+		}
+		return pairs[i].v < pairs[j].v
+	})
+	out := make([]string, len(pairs))
+	for i, p := range pairs {
+		out[i] = p.k + "=" + p.v
+	}
+	return strings.Join(out, "&")
 }
 
 // encodePath URI-encodes every segment of an object path ('/' kept).

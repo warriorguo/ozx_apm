@@ -39,7 +39,10 @@ type Config struct {
 	Region    string // default us-east-1
 	AccessKey string
 	SecretKey string
-	// Timeout of one request (default 60 s; a part is at most 8 MiB).
+	// Timeout of one request (default 60 s; a body is at most 8 MiB), except
+	// GetObject's body, which is streamed for as long as the caller's context
+	// allows (a download to a slow browser); its headers must still arrive
+	// within it.
 	Timeout time.Duration
 }
 
@@ -51,6 +54,7 @@ type Client struct {
 	accessKey string
 	secretKey string
 	http      *http.Client
+	timeout   time.Duration
 	now       func() time.Time
 	// retryDelay between attempts (tests shorten it).
 	retryDelay time.Duration
@@ -101,15 +105,18 @@ func New(cfg Config, httpClient *http.Client) (*Client, error) {
 	if region == "" {
 		region = "us-east-1"
 	}
+	timeout := cfg.Timeout
+	if timeout <= 0 {
+		timeout = 60 * time.Second
+	}
 	if httpClient == nil {
-		timeout := cfg.Timeout
-		if timeout <= 0 {
-			timeout = 60 * time.Second
-		}
-		httpClient = &http.Client{Timeout: timeout}
+		// No client-wide Timeout: it would also cut a streamed download.
+		transport := http.DefaultTransport.(*http.Transport).Clone()
+		transport.ResponseHeaderTimeout = timeout
+		httpClient = &http.Client{Transport: transport}
 	}
 	return &Client{base: u, bucket: cfg.Bucket, region: region, accessKey: cfg.AccessKey, secretKey: cfg.SecretKey,
-		http: httpClient, now: time.Now, retryDelay: 300 * time.Millisecond}, nil
+		http: httpClient, timeout: timeout, now: time.Now, retryDelay: 300 * time.Millisecond}, nil
 }
 
 // Bucket returns the bucket name.
@@ -128,6 +135,7 @@ type request struct {
 	body    []byte
 	retry   bool // idempotent: retried on transport errors and 5xx
 	okCodes []int
+	stream  bool // the body is read by the caller for as long as its context allows
 }
 
 func (c *Client) url(key string, query url.Values) *url.URL {
@@ -154,6 +162,13 @@ func (c *Client) do(ctx context.Context, r request) (*http.Response, error) {
 		payloadHash = SHA256Hex(r.body)
 	}
 	var lastErr error
+	if !r.stream {
+		// The whole exchange, body included, within the timeout: the (small)
+		// body is read here, before the deadline is released.
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, c.timeout*time.Duration(attempts))
+		defer cancel()
+	}
 	for i := 0; i < attempts; i++ {
 		if i > 0 {
 			select {
@@ -187,6 +202,18 @@ func (c *Client) do(ctx context.Context, r request) (*http.Response, error) {
 			continue
 		}
 		if resp.StatusCode/100 == 2 || containsInt(r.okCodes, resp.StatusCode) {
+			if !r.stream {
+				body, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
+				resp.Body.Close()
+				if err != nil {
+					lastErr = fmt.Errorf("s3 %s %s: %w", r.op, r.key, err)
+					if r.retry {
+						continue
+					}
+					return nil, lastErr
+				}
+				resp.Body = io.NopCloser(bytes.NewReader(body))
+			}
 			return resp, nil
 		}
 		e := readError(resp, r.op, r.key)
@@ -246,7 +273,7 @@ func (c *Client) PutObject(ctx context.Context, key string, data []byte, content
 
 // GetObject opens the object; the caller closes the reader.
 func (c *Client) GetObject(ctx context.Context, key string) (io.ReadCloser, int64, error) {
-	resp, err := c.do(ctx, request{op: "get", method: http.MethodGet, key: key, retry: true})
+	resp, err := c.do(ctx, request{op: "get", method: http.MethodGet, key: key, retry: true, stream: true})
 	if err != nil {
 		return nil, 0, err
 	}
@@ -270,11 +297,20 @@ func (c *Client) GetRange(ctx context.Context, key string, off, n int64) ([]byte
 		return nil, fmt.Errorf("s3 get-range %s: %w", key, err)
 	}
 	if resp.StatusCode == http.StatusOK && off > 0 {
-		// A store that ignored the range sent the whole object.
-		if int64(len(data)) <= off {
-			return nil, nil
+		// A store that ignored the range sends the whole object: skip to off.
+		resp.Body.Close()
+		resp, err = c.do(ctx, request{op: "get-range", method: http.MethodGet, key: key, retry: true})
+		if err != nil {
+			return nil, err
 		}
-		data = data[off:]
+		defer resp.Body.Close()
+		if _, err := io.CopyN(io.Discard, resp.Body, off); err != nil {
+			return nil, fmt.Errorf("s3 get-range %s: the object is shorter than %d bytes: %w", key, off, err)
+		}
+		data, err = io.ReadAll(io.LimitReader(resp.Body, n+1))
+		if err != nil {
+			return nil, fmt.Errorf("s3 get-range %s: %w", key, err)
+		}
 	}
 	if int64(len(data)) > n {
 		data = data[:n]

@@ -59,7 +59,8 @@ const (
 	MaxParts          = 10000
 	MinArchiveBytes   = 22 // an empty zip
 	MaxSessionJSON    = 64 << 10
-	MaxCreateBody     = MaxSessionJSON + 16<<10
+	// A create body: session.json JSON-escaped (up to 6 bytes per byte) and the rest.
+	MaxCreateBody     = 6*MaxSessionJSON + 16<<10
 	assemblyPartBytes = 8 << 20 // S3 multipart part size of the assembly (>= 5 MiB)
 	maxArchiveEntries = 50000
 	maxRawPerArchive  = 64 // uncompressed bytes may be at most this many times the archive (zip bombs)
@@ -85,6 +86,7 @@ type Objects interface {
 	GetObject(ctx context.Context, key string) (io.ReadCloser, int64, error)
 	GetRange(ctx context.Context, key string, off, n int64) ([]byte, error)
 	DeleteObject(ctx context.Context, key string) error
+	HeadObject(ctx context.Context, key string) (int64, error)
 	ListObjects(ctx context.Context, prefix, startAfter string, max int) ([]objstore.Object, bool, error)
 	CreateMultipartUpload(ctx context.Context, key, contentType string) (string, error)
 	UploadPart(ctx context.Context, key, uploadID string, n int, data []byte) (string, error)
@@ -102,6 +104,7 @@ type Config struct {
 	MaxBytesPerDay     int64
 	MaxOpenUploads     int
 	ConcurrentParts    int // parts read and stored at once per process (each up to MaxPartBytes in memory)
+	CommitTimeout      time.Duration // one commit's assembly and checks (detached from the request)
 	ConcurrentCommits  int // assemblies at once per process (each 8 MiB in memory)
 	SlotWait           time.Duration
 	MetadataCacheTTL   time.Duration
@@ -134,7 +137,10 @@ func (c Config) withDefaults() Config {
 		c.MaxOpenUploads = 4
 	}
 	if c.ConcurrentParts <= 0 {
-		c.ConcurrentParts = 8
+		c.ConcurrentParts = 16
+	}
+	if c.CommitTimeout <= 0 {
+		c.CommitTimeout = 15 * time.Minute
 	}
 	if c.ConcurrentCommits <= 0 {
 		c.ConcurrentCommits = 2
@@ -143,7 +149,7 @@ func (c Config) withDefaults() Config {
 		c.SlotWait = 3 * time.Second
 	}
 	if c.MetadataCacheTTL <= 0 {
-		c.MetadataCacheTTL = 5 * time.Minute
+		c.MetadataCacheTTL = time.Minute
 	}
 	if c.MaxMetadataEntries <= 0 {
 		c.MaxMetadataEntries = 4096
@@ -187,8 +193,9 @@ type Service struct {
 	partSlots   chan struct{}
 	commitSlots chan struct{}
 
-	mu    sync.Mutex
-	cache map[string]cachedUpload
+	mu      sync.Mutex
+	cache   map[string]cachedUpload
+	commits map[string]*commitRun
 }
 
 type cachedUpload struct {
@@ -204,7 +211,7 @@ func New(store Store, obj Objects, cfg Config, logger *zap.Logger) *Service {
 	}
 	return &Service{store: store, obj: obj, cfg: cfg, logger: logger, now: time.Now,
 		partSlots: make(chan struct{}, cfg.ConcurrentParts), commitSlots: make(chan struct{}, cfg.ConcurrentCommits),
-		cache: map[string]cachedUpload{}}
+		cache: map[string]cachedUpload{}, commits: map[string]*commitRun{}}
 }
 
 // SetClock replaces the clock (tests).
@@ -378,7 +385,9 @@ func (s *Service) validateCreate(req CreateRequest, now time.Time) (models.Sessi
 		return f, badRequest("sha256 must be 64 lower-case hex digits")
 	}
 	if len(req.SessionJSON) > MaxSessionJSON {
-		return f, badRequest("session_json is longer than %d bytes", MaxSessionJSON)
+		// Kept out of the index (the recording itself has it): never a
+		// reason to refuse the recording.
+		req.SessionJSON = ""
 	}
 	if req.FileCount < 0 || req.RawBytes < 0 {
 		return f, badRequest("file_count and raw_bytes must not be negative")
@@ -493,6 +502,7 @@ func (s *Service) remember(f models.SessionFile) {
 	if len(s.cache) >= s.cfg.MaxMetadataEntries {
 		s.cache = map[string]cachedUpload{}
 	}
+	f.SessionJSON = "" // the cache serves authorization and sizes only
 	s.cache[f.UploadID] = cachedUpload{f: f, at: s.now()}
 }
 
@@ -685,18 +695,56 @@ func (s *Service) Commit(ctx context.Context, uploadID string, req CommitRequest
 		}
 		return nil, &Error{Status: http.StatusConflict, Message: fmt.Sprintf("%d parts missing", int(f.PartCount)-len(received)), Missing: missing}
 	}
+	// The assembly runs on its own context and deadline: a client that
+	// gives up (its timeout, a lost network) does not make it start over,
+	// and its retry waits for the same run (one per upload and process).
+	s.mu.Lock()
+	run, running := s.commits[uploadID]
+	if !running {
+		run = &commitRun{done: make(chan struct{})}
+		s.commits[uploadID] = run
+		go func() {
+			defer func() {
+				s.mu.Lock()
+				delete(s.commits, uploadID)
+				s.mu.Unlock()
+				close(run.done)
+			}()
+			cctx, cancel := context.WithTimeout(context.Background(), s.cfg.CommitTimeout)
+			defer cancel()
+			run.state, run.err = s.runCommit(cctx, *f)
+		}()
+	}
+	s.mu.Unlock()
+	select {
+	case <-run.done:
+		return run.state, run.err
+	case <-ctx.Done():
+		return nil, retryLater(http.StatusServiceUnavailable, 15, "commit in progress, retry")
+	}
+}
+
+type commitRun struct {
+	done  chan struct{}
+	state *UploadState
+	err   error
+}
+
+// runCommit joins, verifies and completes an upload whose parts are all stored.
+func (s *Service) runCommit(ctx context.Context, f models.SessionFile) (*UploadState, error) {
+	uploadID := f.UploadID
 	if !s.acquire(ctx, s.commitSlots) {
 		return nil, retryLater(http.StatusServiceUnavailable, 10, "busy, retry")
 	}
 	defer func() { <-s.commitSlots }()
 
-	digest, err := s.assemble(ctx, *f)
+	digest, err := s.assemble(ctx, f)
 	if err != nil {
 		s.logger.Error("session files: assembly failed", zap.String("upload_id", uploadID), zap.Error(err))
 		return nil, retryLater(http.StatusServiceUnavailable, 10, "object store error, retry")
 	}
 	if digest != f.SHA256 {
-		s.fail(ctx, *f, "the joined archive's SHA-256 is "+digest)
+		s.fail(ctx, f, "the joined archive's SHA-256 is "+digest)
 		return nil, reject(http.StatusUnprocessableEntity, "checksum_mismatch", "the joined archive does not match its SHA-256")
 	}
 	files, raw, verr := ValidateArchive(newObjectReaderAt(ctx, s.obj, f.ObjectKey), int64(f.SizeBytes), f.RecordingName)
@@ -706,10 +754,10 @@ func (s *Service) Commit(ctx context.Context, uploadID string, req CommitRequest
 			s.logger.Error("session files: reading the archive back failed", zap.String("upload_id", uploadID), zap.Error(verr))
 			return nil, retryLater(http.StatusServiceUnavailable, 10, "object store error, retry")
 		}
-		s.fail(ctx, *f, "invalid archive: "+verr.Error())
+		s.fail(ctx, f, "invalid archive: "+verr.Error())
 		return nil, reject(http.StatusUnprocessableEntity, "invalid_archive", "invalid archive: %v", verr)
 	}
-	done := *f
+	done := f
 	now := s.now().UTC()
 	done.Status = models.SessionFileComplete
 	done.Version = models.SessionFileVersion(done.Status, now)
@@ -721,6 +769,18 @@ func (s *Service) Commit(ctx context.Context, uploadID string, req CommitRequest
 		return nil, storageError(err)
 	}
 	s.forget(uploadID)
+	// A privacy deletion or the cleaner may have removed the upload while it
+	// was joined (they delete the objects, then the rows): if the archive is
+	// gone now, the row just written must go too, so nothing of the subject
+	// is left indexed.
+	if _, err := s.obj.HeadObject(ctx, f.ObjectKey); objstore.IsNotFound(err) {
+		s.logger.Warn("session files: the upload was deleted while it was committed", zap.String("upload_id", uploadID))
+		if derr := s.store.DeleteSessionFileRows(ctx, []string{uploadID}); derr != nil {
+			s.logger.Error("session files: delete the row of a deleted upload", zap.String("upload_id", uploadID), zap.Error(derr))
+		}
+		s.deletePrefix(ctx, s.TmpPrefix(uploadID))
+		return nil, &Error{Status: http.StatusNotFound, Message: "the upload was deleted while it was committed"}
+	}
 	s.deletePrefix(ctx, s.TmpPrefix(uploadID))
 	s.logger.Info("session files: upload complete", zap.String("upload_id", uploadID), zap.String("git_commit", f.GitCommit),
 		zap.Uint64("size_bytes", f.SizeBytes), zap.Int("files", files), zap.Uint64("raw_bytes", raw))

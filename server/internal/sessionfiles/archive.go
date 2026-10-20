@@ -2,7 +2,9 @@ package sessionfiles
 
 import (
 	"archive/zip"
+	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -88,6 +90,11 @@ func ValidateArchive(r io.ReaderAt, size int64, recording string) (int, uint64, 
 	if !hasSession {
 		return 0, 0, fmt.Errorf("%ssession.json is missing", root)
 	}
+	// Extractors that stream the archive read the local headers, not the
+	// central directory: their names must be the same (checked above).
+	if err := checkLocalHeaders(r, size); err != nil {
+		return 0, 0, err
+	}
 	if limit := uint64(size) * maxRawPerArchive; raw > limit && raw > 64<<20 {
 		return 0, 0, fmt.Errorf("uncompressed size %d is more than %d times the archive", raw, maxRawPerArchive)
 	}
@@ -159,4 +166,66 @@ func (r *objectReaderAt) ReadAt(p []byte, off int64) (int, error) {
 		}
 	}
 	return n, nil
+}
+
+// checkLocalHeaders compares every entry's local header name with its
+// central directory name (no ZIP64: the SDK never writes it, and archives
+// are far below 4 GiB). A mismatch, a missing header or an absurd extra
+// field is an invalid archive.
+func checkLocalHeaders(r io.ReaderAt, size int64) error {
+	tailLen := int64(65557)
+	if tailLen > size {
+		tailLen = size
+	}
+	tail := make([]byte, tailLen)
+	if _, err := r.ReadAt(tail, size-tailLen); err != nil && err != io.EOF {
+		return err
+	}
+	eocd := bytes.LastIndex(tail, []byte{0x50, 0x4b, 0x05, 0x06})
+	if eocd < 0 || len(tail)-eocd < 22 {
+		return fmt.Errorf("no end of central directory")
+	}
+	le := binary.LittleEndian
+	entries := int(le.Uint16(tail[eocd+10:]))
+	cdSize := int64(le.Uint32(tail[eocd+12:]))
+	cdOff := int64(le.Uint32(tail[eocd+16:]))
+	if cdOff == 0xFFFFFFFF || cdSize == 0xFFFFFFFF || entries == 0xFFFF || cdOff+cdSize > size {
+		return fmt.Errorf("ZIP64 or inconsistent central directory")
+	}
+	cd := make([]byte, cdSize)
+	if _, err := r.ReadAt(cd, cdOff); err != nil && err != io.EOF {
+		return err
+	}
+	pos := 0
+	for i := 0; i < entries; i++ {
+		if pos+46 > len(cd) || le.Uint32(cd[pos:]) != 0x02014b50 {
+			return fmt.Errorf("central directory entry %d unreadable", i)
+		}
+		nameLen := int(le.Uint16(cd[pos+28:]))
+		extraLen := int(le.Uint16(cd[pos+30:]))
+		commentLen := int(le.Uint16(cd[pos+32:]))
+		off := int64(le.Uint32(cd[pos+42:]))
+		if pos+46+nameLen > len(cd) {
+			return fmt.Errorf("central directory entry %d cut", i)
+		}
+		name := cd[pos+46 : pos+46+nameLen]
+		if off+30+int64(nameLen) > size {
+			return fmt.Errorf("entry %q: local header outside the archive", name)
+		}
+		local := make([]byte, 30+nameLen)
+		if _, err := r.ReadAt(local, off); err != nil && err != io.EOF {
+			return err
+		}
+		if le.Uint32(local) != 0x04034b50 {
+			return fmt.Errorf("entry %q: no local header at its offset", name)
+		}
+		if int(le.Uint16(local[26:])) != nameLen || !bytes.Equal(local[30:], name) {
+			return fmt.Errorf("entry %q: the local header names another file", name)
+		}
+		if le.Uint16(local[28:]) > 1024 {
+			return fmt.Errorf("entry %q: local extra field too long", name)
+		}
+		pos += 46 + nameLen + extraLen + commentLen
+	}
+	return nil
 }

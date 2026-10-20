@@ -55,7 +55,8 @@ namespace OzxApm.Network
         internal const float MaxHoldSeconds = 30f;
 
         private readonly ISessionHttpTransport _transport;
-        private volatile SessionHttpJob _posted;
+        // Handed over with Interlocked: posted by the worker, taken by Update, or withdrawn.
+        private SessionHttpJob _posted;
         private SessionHttpJob _active;
         private ISessionHttpRequest _request;
         private float _heldSince = -1f;
@@ -67,7 +68,7 @@ namespace OzxApm.Network
         }
 
         /// <summary>A request is posted or running.</summary>
-        public bool Busy => _posted != null || _active != null;
+        public bool Busy => Volatile.Read(ref _posted) != null || _active != null;
 
         /// <summary>Main thread, every frame. othersSending: the event or ops uploader has a request under way.</summary>
         public void Update(float now, bool othersSending)
@@ -78,7 +79,7 @@ namespace OzxApm.Network
                     Finish(null);
                 return;
             }
-            var job = _posted;
+            var job = Volatile.Read(ref _posted);
             if (job == null)
                 return;
             if (othersSending)
@@ -89,7 +90,8 @@ namespace OzxApm.Network
                     return;
             }
             _heldSince = -1f;
-            _posted = null;
+            if (Interlocked.CompareExchange(ref _posted, null, job) != job)
+                return; // withdrawn by the worker meanwhile
             _active = job;
             try
             {
@@ -126,7 +128,14 @@ namespace OzxApm.Network
             finally
             {
                 try { request?.Dispose(); } catch { }
-                job.Done.Set();
+                try
+                {
+                    job.Done.Set();
+                }
+                catch (ObjectDisposedException)
+                {
+                    // The worker gave up waiting for this one.
+                }
             }
         }
 
@@ -138,13 +147,13 @@ namespace OzxApm.Network
         {
             if (_closed)
                 return false;
-            _posted = job;
+            Volatile.Write(ref _posted, job);
             bool done = job.Done.WaitOne(waitMs);
             if (!done)
             {
-                // Not started yet: withdraw it (the main thread may be paused).
-                if (ReferenceEquals(_posted, job))
-                    _posted = null;
+                // Not started yet: withdraw it (the main thread may be paused);
+                // if Update took it just now, its result is simply not read.
+                Interlocked.CompareExchange(ref _posted, null, job);
             }
             return done && !_closed;
         }
@@ -153,13 +162,18 @@ namespace OzxApm.Network
         public void Close()
         {
             _closed = true;
-            var posted = _posted;
-            _posted = null;
+            var posted = Interlocked.Exchange(ref _posted, null);
             if (posted != null)
             {
                 posted.TransportError = true;
                 posted.Error = "closed";
-                posted.Done.Set();
+                try
+                {
+                    posted.Done.Set();
+                }
+                catch (ObjectDisposedException)
+                {
+                }
             }
             if (_active != null)
             {

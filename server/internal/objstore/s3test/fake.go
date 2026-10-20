@@ -43,6 +43,8 @@ type Server struct {
 	Requests map[string]int // op -> count
 	// Now is the clock of LastModified.
 	Now func() time.Time
+	// IgnoreRange answers ranged GETs with the whole object (200), as some stores do.
+	IgnoreRange bool
 }
 
 type object struct {
@@ -252,7 +254,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		}
 		data := o.data
 		status := http.StatusOK
-		if rg := r.Header.Get("Range"); rg != "" {
+		if rg := r.Header.Get("Range"); rg != "" && !s.IgnoreRange {
 			var a, b int64
 			if _, err := fmt.Sscanf(rg, "bytes=%d-%d", &a, &b); err != nil || a < 0 || a >= int64(len(data)) {
 				xmlError(w, http.StatusRequestedRangeNotSatisfiable, "InvalidRange", "bad range")
