@@ -4092,22 +4092,32 @@ is paused or `timeScale` is 0) relative to the recording's start, `frame` is
   game time **since the player started** (in a player build the recording
   start of AiTelemetry is the same moment within the first frames; the
   export's `session.json` says so in `timeBase`). `frame` = `Time.frameCount`.
-- Read live on the main thread (constant within a frame). Unity's Time API
-  is main-thread only: on another thread the values are those of the last
-  frame the SDK saw (`GameClock.Tick`, first thing in `ApmClient.Update`,
-  i.e. the frame running while that thread records). Before the first frame
-  (or outside Unity) there is none.
+- **Nothing runs per frame.** On the main thread the two values are read
+  when an event is created (constant within a frame) and published for
+  other threads (lock-free: one writer, a sequence counter, never a torn
+  pair; a unit test races a reader against 300 000 updates). Unity's Time
+  API is main-thread only: an event recorded on another thread (an
+  exception logged by a worker, a TrackEvent from a thread) gets the last
+  published pair: that of the main thread's last event, at the latest the
+  last perf sample (stamped on the main thread once per
+  `SamplingIntervalSeconds`, 1 s by default), so **at most one sampling
+  interval stale** (more only with perf sampling off and no main-thread
+  event since). Before the first main-thread event (or outside Unity) there
+  is none. (A first version read the clock in every `ApmClient.Update`: +0.011
+  ms `update_ms` p50 on an A33 IL2CPP release build, measured by the lead;
+  removed.)
 - Which events carry it: custom events sent one by one (the call's clock),
   exceptions (their first occurrence's, repeat counts the first repeat's),
   and events enqueued when they happen (perf samples, janks: the frame the
   jank was reported in, scene loads, startup, runs: EndRun's). Not: counts
   of calls beyond the budget and metric windows (they span many moments),
   crashes reported at the next launch.
-- Cost (Unity's Mono outside Unity, M-series Mac, the engine read replaced
-  by a delegate): `Tick` 0.021 us per frame, `Now` 0.007 us (main thread) /
-  0.021 us (other thread, an uncontended lock), 0 bytes; writing `t`/`frame`
-  0.1 us, 0 bytes. The two engine properties themselves (`Time.timeAsDouble`,
-  `Time.frameCount`) are internal calls of tens of ns, not measured here.
+- Cost: per frame none. Per event (Unity's Mono outside Unity, M-series
+  Mac, the engine read replaced by a delegate): `Now` on the main thread
+  0.008-0.010 us (read + publish), on another thread 0.006 us, 0 bytes;
+  writing `t`/`frame` 0.1 us, 0 bytes; plus the two engine properties
+  (`Time.timeAsDouble`, `Time.frameCount`, internal calls) per main-thread
+  event, not measurable outside Unity.
 
 Wire: `"t":12.4098,"frame":704` after the common fields; absent when there
 is none. Server: validated into `game_t Nullable(Float64)` / `frame

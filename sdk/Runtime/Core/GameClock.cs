@@ -14,20 +14,27 @@ namespace OzxApm.Core
     /// the game runs carries both, as the client saw them; the server never
     /// derives them.
     ///
-    /// Unity's Time API may only be read on the main thread. On the main thread
-    /// the values are read live (they are constant within a frame); on any
-    /// other thread they are those of the last frame the SDK saw
-    /// (<see cref="Tick"/>, every frame, from ApmClient.Update), which is the
-    /// frame running while that thread records. Before the first frame (or
-    /// outside Unity) there is no value and events carry none.
+    /// Nothing runs per frame. Unity's Time API may only be read on the main
+    /// thread: there the two values are read when an event is created (they
+    /// are constant within a frame) and published for other threads. On any
+    /// other thread an event gets the last published pair: from the main
+    /// thread's last event, at the latest the last perf sample (one every
+    /// ApmConfig.SamplingIntervalSeconds, stamped on the main thread), so it
+    /// is at most that interval old (more only when perf sampling is off and
+    /// no event was recorded on the main thread since). Before the first
+    /// main-thread event (or outside Unity) there is none.
     ///
-    /// Cost: two engine properties on the main thread, an uncontended lock
-    /// elsewhere; nothing is allocated.
+    /// The pair is published lock-free (one writer, the main thread; a
+    /// sequence counter so readers never see half of one update and half of
+    /// another). Cost: two engine properties per main-thread event, nothing
+    /// allocated.
     /// </summary>
     internal static class GameClock
     {
-        private static readonly object s_lock = new object();
         private static int s_mainThreadId = -1;
+        // Published pair, written by the main thread only. s_version is odd
+        // while a write is in progress.
+        private static int s_version;
         private static double s_time;
         private static int s_frame = -1;
 
@@ -35,39 +42,33 @@ namespace OzxApm.Core
         internal static Func<double> TimeForTests;
         internal static Func<int> FrameForTests;
 
-        /// <summary>Main thread (ApmClient.Initialize): remembers it and reads the clock.</summary>
+        /// <summary>Main thread (ApmClient.Initialize): remembers it and publishes the clock.</summary>
         internal static void Init()
         {
             Volatile.Write(ref s_mainThreadId, Environment.CurrentManagedThreadId);
-            Tick();
+            Refresh();
         }
 
-        /// <summary>Main thread, every frame: the values other threads read.</summary>
-        internal static void Tick()
+        /// <summary>Main thread: reads the clock and publishes it for other threads.</summary>
+        internal static void Refresh()
         {
-            if (!ReadLive(out double t, out int frame))
-                return;
-            lock (s_lock)
-            {
-                s_time = t;
-                s_frame = frame;
-            }
+            if (Environment.CurrentManagedThreadId == Volatile.Read(ref s_mainThreadId))
+                Now(out _, out _);
         }
 
         /// <summary>
         /// The game time and frame now (see the class comment); false when
-        /// there is none yet. Any thread.
+        /// there is none yet. Any thread; on the main thread it also publishes
+        /// the values for the other threads.
         /// </summary>
         internal static bool Now(out double t, out int frame)
         {
             if (Environment.CurrentManagedThreadId == Volatile.Read(ref s_mainThreadId) && ReadLive(out t, out frame))
-                return true;
-            lock (s_lock)
             {
-                t = s_time;
-                frame = s_frame;
+                Publish(t, frame);
+                return true;
             }
-            return frame >= 0;
+            return ReadPublished(out t, out frame);
         }
 
         /// <summary>Stamps evt with the game time and frame now, unless it has them or there are none.</summary>
@@ -79,6 +80,42 @@ namespace OzxApm.Core
             {
                 evt.game_t = t;
                 evt.frame = frame;
+            }
+        }
+
+        // Single writer (the main thread).
+        private static void Publish(double t, int frame)
+        {
+            if (Volatile.Read(ref s_frame) == frame && Volatile.Read(ref s_time) == t)
+                return; // another event of the same frame
+            int v = s_version;
+            Volatile.Write(ref s_version, v + 1); // odd: writing
+            Interlocked.MemoryBarrier();
+            Volatile.Write(ref s_time, t);
+            Volatile.Write(ref s_frame, frame);
+            Volatile.Write(ref s_version, v + 2);
+        }
+
+        private static bool ReadPublished(out double t, out int frame)
+        {
+            for (int attempt = 0; ; attempt++)
+            {
+                int v1 = Volatile.Read(ref s_version);
+                t = Volatile.Read(ref s_time);
+                frame = Volatile.Read(ref s_frame);
+                Interlocked.MemoryBarrier();
+                int v2 = Volatile.Read(ref s_version);
+                if (v1 == v2 && (v1 & 1) == 0)
+                    return frame >= 0;
+                if (attempt >= 100)
+                {
+                    // The writer is preempted mid-update for that long: no clock
+                    // rather than a torn pair.
+                    t = 0;
+                    frame = -1;
+                    return false;
+                }
+                Thread.SpinWait(4);
             }
         }
 
@@ -124,11 +161,9 @@ namespace OzxApm.Core
             TimeForTests = null;
             FrameForTests = null;
             Volatile.Write(ref s_mainThreadId, -1);
-            lock (s_lock)
-            {
-                s_time = 0;
-                s_frame = -1;
-            }
+            Volatile.Write(ref s_version, 0);
+            Volatile.Write(ref s_time, 0);
+            Volatile.Write(ref s_frame, -1);
         }
     }
 }

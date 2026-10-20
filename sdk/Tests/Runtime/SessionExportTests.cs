@@ -50,30 +50,72 @@ namespace OzxApm.Tests
             Assert.AreEqual(-1, evt.frame);
         }
 
+        // Nothing per frame: the main thread reads the clock when it records
+        // an event and publishes it; other threads get the last published pair.
         [Test]
-        public void MainThread_ReadsLive_OtherThreads_ReadTheLastTick()
+        public void MainThread_ReadsLive_OtherThreads_ReadTheLastMainThreadEvent()
         {
             GameClock.Init();
             _time = 20.5;
             _frame = 900;
-            Assert.IsTrue(GameClock.Now(out double t, out int frame));
-            Assert.AreEqual(20.5, t);
-            Assert.AreEqual(900, frame);
-
             double otherT = -1;
             int otherFrame = -1;
             var thread = new Thread(() => GameClock.Now(out otherT, out otherFrame));
             thread.Start();
             thread.Join();
-            Assert.AreEqual(12.345678, otherT, "the value of Init's frame");
+            Assert.AreEqual(12.345678, otherT, "published by Init");
             Assert.AreEqual(700, otherFrame);
 
-            GameClock.Tick();
+            Assert.IsTrue(GameClock.Now(out double t, out int frame), "a main-thread event reads live");
+            Assert.AreEqual(20.5, t);
+            Assert.AreEqual(900, frame);
             thread = new Thread(() => GameClock.Now(out otherT, out otherFrame));
             thread.Start();
             thread.Join();
-            Assert.AreEqual(20.5, otherT);
+            Assert.AreEqual(20.5, otherT, "and publishes it");
             Assert.AreEqual(900, otherFrame);
+
+            // Stamping an event on the main thread (a perf sample) publishes too.
+            _time = 21.5;
+            _frame = 960;
+            GameClock.Stamp(new PerfSampleEvent());
+            thread = new Thread(() => GameClock.Now(out otherT, out otherFrame));
+            thread.Start();
+            thread.Join();
+            Assert.AreEqual(21.5, otherT);
+            Assert.AreEqual(960, otherFrame);
+        }
+
+        // The published pair is never torn: a reader sees t and frame of the same update.
+        [Test]
+        public void PublishedPair_IsNeverTorn()
+        {
+            GameClock.Init();
+            int bad = 0, reads = 0;
+            bool stop = false;
+            var reader = new Thread(() =>
+            {
+                while (!Volatile.Read(ref stop))
+                {
+                    if (GameClock.Now(out double rt, out int rf))
+                    {
+                        reads++;
+                        if (rt != rf * 0.5)
+                            bad++;
+                    }
+                }
+            });
+            reader.Start();
+            for (int i = 1; i < 300000; i++)
+            {
+                _frame = i;
+                _time = i * 0.5;
+                GameClock.Now(out _, out _);
+            }
+            Volatile.Write(ref stop, true);
+            reader.Join();
+            Assert.AreEqual(0, bad, "torn reads of " + reads);
+            Assert.Greater(reads, 0);
         }
 
         [Test]
@@ -142,8 +184,8 @@ namespace OzxApm.Tests
             Assert.AreEqual("49031.140 -7.3 null", w.ToUtf8String());
         }
 
-        // Unity runtime (the constraint needs the profiler): the per-frame tick,
-        // reading the clock and writing t/frame allocate nothing.
+        // Unity runtime (the constraint needs the profiler): reading and
+        // publishing the clock and writing t/frame allocate nothing.
         [Test]
         public void ClockAndItsSerialization_DoNotAllocate()
         {
@@ -153,7 +195,7 @@ namespace OzxApm.Tests
             JsonSerializer.WriteEvent(w, evt);
             Assert.That(() =>
             {
-                GameClock.Tick();
+                GameClock.Refresh();
                 GameClock.Now(out _, out _);
                 w.Clear();
                 JsonSerializer.WriteEvent(w, evt);

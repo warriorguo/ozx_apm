@@ -1487,9 +1487,6 @@ namespace OzxApm.Core
                 return;
             }
 
-            // The game clock for events recorded on other threads (APM-10).
-            GameClock.Tick();
-
             // Update collectors
             using (Markers.Collectors.Auto())
             {
