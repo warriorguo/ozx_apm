@@ -1,0 +1,70 @@
+<?xml version="1.0"?>
+<!--
+  APM-12: the read-only ClickHouse account Metabase (BI) uses for the
+  operations data. Install as an admin on the ClickHouse host:
+
+    sudo cp ozx_ops_readonly.xml /etc/clickhouse-server/users.d/
+    # set the password hash and the Metabase host below, then:
+    clickhouse-client -q "SHOW GRANTS FOR ozx_ops_ro"
+    clickhouse-client -q "SHOW SETTINGS PROFILES"      # lists ozx_ops_readonly
+
+  ClickHouse reloads users.d by itself (no restart). The account can only
+  SELECT the ops tables (no technical table, no device data, no write) and
+  every query is bounded (time, memory, rows read, concurrent queries).
+
+  Password: generate one, keep it in the secret store (Metabase needs it,
+  cmd/metabase-provision reads it from CH_PASSWORD), and put only its hash
+  here:
+    PW=$(openssl rand -hex 24); echo -n "$PW" | sha256sum | cut -d' ' -f1
+
+  readonly = 1: no writes, no DDL, no SET. If Metabase's ClickHouse driver
+  fails with "Cannot modify ... setting in readonly mode" (some driver
+  versions set session settings), use readonly = 2 (still no writes or DDL);
+  the constraints below keep the limits from being raised either way.
+-->
+<clickhouse>
+    <profiles>
+        <ozx_ops_readonly>
+            <readonly>1</readonly>
+            <!-- One dashboard query; FINAL over a year of ops_events at
+                 today's volume takes well under this. -->
+            <max_execution_time>60</max_execution_time>
+            <max_memory_usage>2000000000</max_memory_usage>
+            <max_rows_to_read>2000000000</max_rows_to_read>
+            <max_bytes_to_read>200000000000</max_bytes_to_read>
+            <max_result_rows>1000000</max_result_rows>
+            <max_concurrent_queries_for_user>8</max_concurrent_queries_for_user>
+            <constraints>
+                <readonly><min>1</min></readonly>
+                <max_execution_time><max>60</max></max_execution_time>
+                <max_memory_usage><max>2000000000</max></max_memory_usage>
+                <max_rows_to_read><max>2000000000</max></max_rows_to_read>
+                <max_bytes_to_read><max>200000000000</max></max_bytes_to_read>
+                <max_result_rows><max>1000000</max></max_result_rows>
+                <max_concurrent_queries_for_user><max>8</max></max_concurrent_queries_for_user>
+            </constraints>
+        </ozx_ops_readonly>
+    </profiles>
+
+    <users>
+        <ozx_ops_ro>
+            <!-- REPLACE with the sha256 of the password (see above). -->
+            <password_sha256_hex>REPLACE_WITH_SHA256_OF_THE_PASSWORD</password_sha256_hex>
+            <networks>
+                <!-- REPLACE with the address Metabase connects from (a Docker
+                     container on this host: its bridge network, e.g.
+                     172.17.0.0/16). -->
+                <ip>127.0.0.1</ip>
+            </networks>
+            <profile>ozx_ops_readonly</profile>
+            <quota>default</quota>
+            <grants>
+                <query>GRANT SELECT ON ozx_apm.ops_events</query>
+                <query>GRANT SELECT ON ozx_apm.ops_player_days</query>
+                <query>GRANT SELECT ON ozx_apm.ops_players</query>
+                <query>GRANT SELECT ON ozx_apm.ops_fx_rates</query>
+                <query>GRANT SELECT ON ozx_apm.ops_ad_reports</query>
+            </grants>
+        </ozx_ops_ro>
+    </users>
+</clickhouse>
