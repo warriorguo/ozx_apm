@@ -38,6 +38,12 @@ namespace OzxApm.Collectors
         private long _startWallMs;
         private ContextSnapshot _runStartContext;
         private long _runStartWallMs;
+        // The game clock (APM-10) of that first slow frame: its start
+        // (GameClock.PreviousFrame), like the wall-clock time above; frame -1: none.
+        private double _startGameT;
+        private int _startFrame = -1;
+        private double _runStartGameT;
+        private int _runStartFrame = -1;
 
         // Counters, read by ApmClient.GetStats (main thread writes, any thread reads).
         internal long Detected;
@@ -86,6 +92,8 @@ namespace OzxApm.Collectors
             _sincePollMs = 0f;
             _lastPollClockMs = 0;
             _startContext = null;
+            _startFrame = -1;
+            _runStartFrame = -1;
             _suspended = _paused || _unfocused;
             if (_suspended)
                 _tracker.Suspend();
@@ -195,6 +203,8 @@ namespace OzxApm.Collectors
                 {
                     _startContext = null;
                     _runStartContext = null;
+                    _startFrame = -1;
+                    _runStartFrame = -1;
                 }
             }
             _tracker.ResetBaseline();
@@ -212,11 +222,15 @@ namespace OzxApm.Collectors
                 // frameMs ago, in this context. Only slow frames get here.
                 _runStartContext = GameContext.Current;
                 _runStartWallMs = Timeline.NowMs() - (long)frameMs;
+                if (!GameClock.PreviousFrame(out _runStartGameT, out _runStartFrame))
+                    _runStartFrame = -1;
             }
             if (_tracker.StartedThisFrame)
             {
                 _startContext = _runStartContext;
                 _startWallMs = _runStartWallMs;
+                _startGameT = _runStartGameT;
+                _startFrame = _runStartFrame;
             }
             if (ended)
                 ReportJank(episode);
@@ -309,8 +323,12 @@ namespace OzxApm.Collectors
             LastSlowFrames = episode.SlowFrames;
             var context = _startContext;
             long startMs = _startWallMs;
+            double startGameT = _startGameT;
+            int startFrame = _startFrame;
             _startContext = null;
             _runStartContext = null;
+            _startFrame = -1;
+            _runStartFrame = -1;
 
             // Without technical consent (e.g. the flush at Stop when it was
             // revoked) the event would be dropped at enqueue: not counted as sent.
@@ -333,6 +351,10 @@ namespace OzxApm.Collectors
                 recent_gc_alloc_kb = gcAllocKb,
                 recent_events = RecentEvents(_client != null ? _client.Timeline : TimelineForTests, startMs),
                 ctx = context,
+                // APM-10: the game clock of the first slow frame (not of the
+                // frame the jank is sent in); none (-1): stamped at enqueue.
+                game_t = startFrame >= 0 ? startGameT : 0,
+                frame = startFrame,
             };
 
             if (_client != null)

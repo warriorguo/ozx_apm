@@ -118,6 +118,53 @@ namespace OzxApm.Tests
             Assert.Greater(reads, 0);
         }
 
+        // APM-21 + APM-10: a jank carries the game clock of its first slow
+        // frame (the frame before the one whose deltaTime reported it, like
+        // its wall-clock time and context), not of the frame it is sent in.
+        [Test]
+        public void Jank_HasTheGameClockOfItsFirstSlowFrame()
+        {
+            GameClock.Init();
+            double delta = 1.0 / 60;
+            GameClock.DeltaForTests = () => delta;
+            var d = new JankDetector(new ApmConfig(), null) { SentForTests = new List<JankEvent>(), TimelineForTests = new Timeline() };
+            d.StartWith(60, 0);
+            void Frame(float ms)
+            {
+                _frame++;
+                delta = ms / 1000.0;
+                _time += delta;
+                d.UpdateWith(ms, 60, 0);
+            }
+            _frame = 100;
+            _time = 10.0;
+            for (int i = 0; i < 60; i++)
+                Frame(16.7f);
+            int framesBefore = _frame;
+            double timeBefore = _time;
+            Frame(30f); // the first slow frame: reported in frame framesBefore + 1
+            Frame(30f); // now a jank
+            for (int i = 0; i < 20; i++)
+                Frame(16.7f);
+            d.OnSceneLoaded(); // flush if still open
+            Assert.AreEqual(1, d.SentForTests.Count);
+            var e = d.SentForTests[0];
+            Assert.AreEqual(framesBefore, e.frame, "the slow frame is the one before the frame that saw it");
+            Assert.AreEqual(timeBefore, e.game_t, 1e-6, "its start");
+            StringAssert.Contains("\"frame\":" + framesBefore, JsonSerializer.SerializeEvent(e));
+
+            // No clock (outside the main thread's Init): none, stamped at enqueue as before.
+            GameClock.ResetForTests();
+            var d2 = new JankDetector(new ApmConfig(), null) { SentForTests = new List<JankEvent>(), TimelineForTests = new Timeline() };
+            d2.StartWith(60, 0);
+            for (int i = 0; i < 60; i++)
+                d2.UpdateWith(16.7f, 60, 0);
+            d2.UpdateWith(150f, 60, 0);
+            d2.OnSceneLoaded();
+            Assert.AreEqual(1, d2.SentForTests.Count);
+            Assert.AreEqual(-1, d2.SentForTests[0].frame);
+        }
+
         [Test]
         public void Stamp_KeepsAnExistingClock()
         {

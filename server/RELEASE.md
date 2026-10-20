@@ -4108,8 +4108,12 @@ is paused or `timeScale` is 0) relative to the recording's start, `frame` is
   removed.)
 - Which events carry it: custom events sent one by one (the call's clock),
   exceptions (their first occurrence's, repeat counts the first repeat's),
-  and events enqueued when they happen (perf samples, janks: the frame the
-  jank was reported in, scene loads, startup, runs: EndRun's). Not: counts
+  janks (APM-21: their **first slow frame**, as their wall-clock time and
+  context: read in the frame whose `deltaTime` reported it, so `frame` =
+  `Time.frameCount - 1` and `t` = `Time.timeAsDouble - Time.deltaTime`,
+  i.e. the slow frame's start; one more engine read, only on a slow frame
+  that starts a possible jank), and events enqueued when they happen (perf
+  samples, scene loads, startup, runs: EndRun's). Not: counts
   of calls beyond the budget and metric windows (they span many moments),
   crashes reported at the next launch.
 - Cost: per frame none. Per event (Unity's Mono outside Unity, M-series

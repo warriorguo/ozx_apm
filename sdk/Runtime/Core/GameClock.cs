@@ -71,6 +71,47 @@ namespace OzxApm.Core
             return ReadPublished(out t, out frame);
         }
 
+        /// <summary>
+        /// Main thread: the clock of the frame before this one, i.e. the frame
+        /// whose duration this frame's Time.deltaTime reports (a jank's first
+        /// slow frame, APM-21: its start is Time.time - Time.deltaTime, its
+        /// number frameCount - 1). False off the main thread or without a clock.
+        /// </summary>
+        internal static bool PreviousFrame(out double t, out int frame)
+        {
+            if (Environment.CurrentManagedThreadId != Volatile.Read(ref s_mainThreadId) || !Now(out t, out frame))
+            {
+                t = 0;
+                frame = -1;
+                return false;
+            }
+            double delta;
+            var testDelta = DeltaForTests;
+            if (testDelta != null)
+            {
+                delta = testDelta();
+            }
+            else
+            {
+                try
+                {
+                    delta = ReadEngineDelta();
+                }
+                catch
+                {
+                    delta = 0;
+                }
+            }
+            t = Math.Max(0, t - (delta > 0 ? delta : 0));
+            frame = Math.Max(0, frame - 1);
+            return true;
+        }
+
+        internal static Func<double> DeltaForTests;
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private static double ReadEngineDelta() => Time.deltaTime;
+
         /// <summary>Stamps evt with the game time and frame now, unless it has them or there are none.</summary>
         internal static void Stamp(OzxApm.Models.BaseEvent evt)
         {
@@ -160,6 +201,7 @@ namespace OzxApm.Core
         {
             TimeForTests = null;
             FrameForTests = null;
+            DeltaForTests = null;
             Volatile.Write(ref s_mainThreadId, -1);
             Volatile.Write(ref s_version, 0);
             Volatile.Write(ref s_time, 0);
