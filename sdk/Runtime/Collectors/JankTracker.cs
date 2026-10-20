@@ -373,12 +373,13 @@ namespace OzxApm.Collectors
             float old = _ring[_head];
             _ring[_head] = frameMs;
             _head = (_head + 1) % BaselineFrames;
-            // Remove old from the sorted array, then insert the new value.
-            int i = Array.BinarySearch<float>(_sorted, 0, _count, old);
-            if (i < 0)
-                i = ~i; // cannot happen; keeps the array consistent anyway
-            if (i < _count - 1)
-                Array.Copy(_sorted, i + 1, _sorted, i, _count - 1 - i);
+            // Remove old from the sorted array, then insert the new value. Plain
+            // loops over 31 floats: no generic comparer or Array call on IL2CPP.
+            int i = 0;
+            while (i < _count - 1 && _sorted[i] != old)
+                i++;
+            for (; i < _count - 1; i++)
+                _sorted[i] = _sorted[i + 1];
             Insert(frameMs, _count - 1);
         }
 
@@ -396,25 +397,40 @@ namespace OzxApm.Collectors
     }
 
     /// <summary>
-    /// At most MaxPerMinute janks sent per minute of the tracker's clock (a
-    /// fixed window); the others are counted, not sent.
+    /// At most MaxPerMinute janks sent in any 60 s of the detector's clock (a
+    /// sliding window: the times of the last MaxPerMinute janks sent); the
+    /// others are counted, not sent. Called once per jank, not per frame.
     /// </summary>
     internal sealed class JankBudget
     {
         internal const double WindowMs = 60000;
-        private double _windowStart = double.NegativeInfinity;
-        private int _used;
+        private double[] _sent = new double[0];
+        private int _count;
+        private int _oldest;
+        private double _last = double.NegativeInfinity;
 
         internal bool TryTake(double nowMs, int maxPerMinute)
         {
-            if (nowMs - _windowStart >= WindowMs || nowMs < _windowStart)
-            {
-                _windowStart = nowMs;
-                _used = 0;
-            }
-            if (_used >= maxPerMinute)
+            if (maxPerMinute <= 0)
                 return false;
-            _used++;
+            if (_sent.Length != maxPerMinute || nowMs < _last)
+            {
+                // A new limit, or a new clock (the detector restarted): start over.
+                _sent = new double[maxPerMinute];
+                _count = 0;
+                _oldest = 0;
+            }
+            _last = nowMs;
+            if (_count < _sent.Length)
+            {
+                _sent[(_oldest + _count) % _sent.Length] = nowMs;
+                _count++;
+                return true;
+            }
+            if (nowMs - _sent[_oldest] < WindowMs)
+                return false;
+            _sent[_oldest] = nowMs;
+            _oldest = (_oldest + 1) % _sent.Length;
             return true;
         }
     }

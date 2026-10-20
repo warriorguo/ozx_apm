@@ -83,6 +83,8 @@ namespace OzxApm.Collectors
             _targetFrameRate = targetFrameRate;
             _vSyncCount = vSyncCount;
             _tracker.TargetFrameMs = TargetFrameMs(targetFrameRate);
+            _sincePollMs = 0f;
+            _lastPollClockMs = 0;
             _startContext = null;
             _suspended = _paused || _unfocused;
             if (_suspended)
@@ -100,31 +102,84 @@ namespace OzxApm.Collectors
             return targetFrameRate > 0 && targetFrameRate <= 1000 ? 1000f / targetFrameRate : 0f;
         }
 
+        /// <summary>
+        /// targetFrameRate and vSyncCount are engine calls (the device check
+        /// measured +0.03 ms per frame reading them every frame): read once per
+        /// PollIntervalMs of frames, and on the first frame after a resume,
+        /// focus or scene load.
+        /// </summary>
+        internal const float PollIntervalMs = 1000f;
+        private float _sincePollMs;
+        private double _lastPollClockMs;
+        private int _frameCounter;
+        /// <summary>The detector's own time in a sampled frame (1 in SelfCheckEvery), Stopwatch ticks.</summary>
+        internal long LastSampledTicks;
+        internal const int SelfCheckEvery = 64;
+
         public void Update()
         {
             if (!_isActive)
                 return;
+            // A cheap self-check: one frame in 64 is timed (two timestamp reads).
+            bool timed = (++_frameCounter & (SelfCheckEvery - 1)) == 0;
+            long t0 = timed ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
             // Unscaled: Time.timeScale (slow motion, a pause menu at 0) does not change it.
-            UpdateWith(Time.unscaledDeltaTime * 1000f, Application.targetFrameRate, QualitySettings.vSyncCount);
+            float frameMs = Time.unscaledDeltaTime * 1000f;
+            _sincePollMs += frameMs > 0f ? frameMs : 0f;
+            if (_sincePollMs >= PollIntervalMs)
+            {
+                _sincePollMs = 0f;
+                PollFrameRate(Application.targetFrameRate, QualitySettings.vSyncCount);
+            }
+            Feed(frameMs);
+            if (timed)
+                LastSampledTicks = System.Diagnostics.Stopwatch.GetTimestamp() - t0;
         }
 
-        /// <summary>One frame of frameMs with the engine's current target frame rate and vSyncCount.</summary>
+        /// <summary>One frame of frameMs, the frame rate settings read in the same frame (tests).</summary>
         internal void UpdateWith(float frameMs, int target, int vSync)
         {
             if (!_isActive)
                 return;
+            PollFrameRate(target, vSync);
+            Feed(frameMs);
+        }
 
-            // A new target frame rate (e.g. a 60 fps setting) is a new rhythm,
-            // not a jank: a jank in progress ends, the baseline starts again.
-            if (target != _targetFrameRate || vSync != _vSyncCount)
+        /// <summary>
+        /// A new target frame rate (e.g. a 60 fps setting) is a new rhythm, not
+        /// a jank: the baseline starts again. A jank in progress that began
+        /// since the previous reading may be the new rhythm itself (60 -> 30
+        /// fps makes every frame slow until it is seen): dropped; an older one
+        /// is sent.
+        /// </summary>
+        internal void PollFrameRate(int target, int vSync)
+        {
+            if (!_isActive)
+                return;
+            double previousPoll = _lastPollClockMs;
+            _lastPollClockMs = _tracker.ClockMs;
+            if (target == _targetFrameRate && vSync == _vSyncCount)
+                return;
+            _targetFrameRate = target;
+            _vSyncCount = vSync;
+            if (_tracker.Flush(out JankEpisode episode))
             {
-                _targetFrameRate = target;
-                _vSyncCount = vSync;
-                FlushJank();
-                _tracker.ResetBaseline();
-                _tracker.TargetFrameMs = TargetFrameMs(target);
+                if (episode.StartMs < previousPoll)
+                    ReportJank(episode);
+                else
+                {
+                    _startContext = null;
+                    _runStartContext = null;
+                }
             }
+            _tracker.ResetBaseline();
+            _tracker.TargetFrameMs = TargetFrameMs(target);
+        }
 
+        internal void Feed(float frameMs)
+        {
+            if (!_isActive)
+                return;
             bool ended = _tracker.Frame(frameMs, out JankEpisode episode);
             if (_tracker.RunStartedThisFrame)
             {
@@ -174,6 +229,7 @@ namespace OzxApm.Collectors
                 return;
             FlushJank();
             _tracker.SkipSceneLoad();
+            _sincePollMs = PollIntervalMs; // a scene may set its own frame rate
         }
 
         private void UpdateSuspended()
@@ -192,6 +248,7 @@ namespace OzxApm.Collectors
             else
             {
                 _tracker.Resume();
+                _sincePollMs = PollIntervalMs; // settings may have changed meanwhile
             }
         }
 

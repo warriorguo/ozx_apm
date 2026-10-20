@@ -104,6 +104,8 @@ namespace OzxApm.Core
         public float LastJankMaxFrameMs;
         public int LastJankFrames;
         public int LastJankSlowFrames;
+        /// <summary>The jank detector's own time in its last sampled frame (one in 64), microseconds.</summary>
+        public double JankUpdateUs;
         /// <summary>"release", "dev" or "editor"; null before Initialize.</summary>
         public string BuildType;
         /// <summary>False in the Unity Editor unless ApmConfig.UploadInEditor.</summary>

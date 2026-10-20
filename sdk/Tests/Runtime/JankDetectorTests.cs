@@ -421,8 +421,18 @@ namespace OzxApm.Tests
                 Assert.IsTrue(b.TryTake(1000 + i, 3));
             Assert.IsFalse(b.TryTake(2000, 3));
             Assert.IsFalse(b.TryTake(60999, 3));
-            Assert.IsTrue(b.TryTake(61000, 3), "a new minute");
-            Assert.IsFalse(b.TryTake(61001, 0));
+            Assert.IsTrue(b.TryTake(61000, 3), "60 s after the first");
+            Assert.IsTrue(b.TryTake(61001, 3), "60 s after the second");
+            Assert.IsFalse(b.TryTake(61001.5, 3), "the third was sent at 1002");
+            Assert.IsTrue(b.TryTake(61002, 3));
+            Assert.IsFalse(b.TryTake(61003, 3), "sliding: 3 in the last 60 s");
+            Assert.IsFalse(b.TryTake(61004, 0));
+            // Any 60 s, not calendar minutes: 25 janks 1.5 s apart -> 20 sent.
+            var c = new JankBudget();
+            int sent = 0;
+            for (int i = 0; i < 25; i++)
+                if (c.TryTake(50000 + i * 1500, 20)) sent++;
+            Assert.AreEqual(20, sent);
         }
 
         // ---- The detector: events, context, pause, focus, target frame rate ----
@@ -572,6 +582,55 @@ namespace OzxApm.Tests
             Frames(d, 150f, 1, 60, 1);
             Frames(d, Fps60, 60, 60, 1);
             Assert.AreEqual(1, d.SentForTests.Count);
+        }
+
+        // As in Update: the frame rate settings are read once a second, not every frame.
+        private static void FramesPolled(JankDetector d, float ms, int frames, int target, ref float sincePoll)
+        {
+            for (int i = 0; i < frames; i++)
+            {
+                sincePoll += ms;
+                if (sincePoll >= JankDetector.PollIntervalMs)
+                {
+                    sincePoll = 0f;
+                    d.PollFrameRate(target, 0);
+                }
+                d.Feed(ms);
+            }
+        }
+
+        [Test]
+        public void Detector_TargetChangeSeenUpToASecondLate_IsNotAJank()
+        {
+            var d = NewDetector();
+            float since = 0f;
+            FramesPolled(d, Fps60, 300, 60, ref since);
+            FramesPolled(d, 33.3f, 600, 30, ref since);   // slow until the next reading
+            FramesPolled(d, Fps60, 600, 60, ref since);
+            Assert.AreEqual(0, d.SentForTests.Count);
+            Assert.AreEqual(0, d.Detected);
+        }
+
+        [Test]
+        public void Detector_JankBeforeTheLastReading_IsSentAtATargetChange()
+        {
+            var d = NewDetector();
+            float since = 0f;
+            FramesPolled(d, Fps60, 300, 60, ref since);
+            since = 0f;
+            d.PollFrameRate(60, 0);                        // a reading
+            FramesPolled(d, 30f, 3, 60, ref since);        // a jank begins after it...
+            d.PollFrameRate(30, 0);                        // ...and the target changes: dropped
+            Assert.AreEqual(0, d.SentForTests.Count);
+            FramesPolled(d, 33.3f, 120, 30, ref since);
+            d.PollFrameRate(30, 0);
+            d.Feed(150f);                                  // a jank before the reading below
+            d.Feed(33.3f);
+            d.PollFrameRate(30, 0);
+            d.Feed(33.3f);
+            d.PollFrameRate(60, 0);                        // change: the jank began before the previous reading
+            Assert.AreEqual(1, d.SentForTests.Count);
+            Assert.AreEqual(150f, d.SentForTests[0].duration_ms);
         }
 
         [Test]
