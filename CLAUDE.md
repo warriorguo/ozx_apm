@@ -88,8 +88,9 @@ net_type, country (optional)
 | `crash` | type, stack, tombstone/minidump ref, last_breadcrumbs |
 
 ### Jank Definition
-- Single frame > 50ms = jank event
-- Consecutive frames > 33ms = sustained jank
+- A frame is slow when it exceeds max(1.5x, +8 ms) of the expected frame time (running average of normal frames, never below 1000/targetFrameRate)
+- Jank = slow frames < 250 ms apart totalling > 50 ms (a single 150 ms frame is one jank); capped at 5 s, at most 20 per minute (APM-21)
+- Not janks: the first frames after start/resume/focus, scene-load frames, frame-rate changes
 - On jank: capture scene/level, last 10s GC count/alloc/peak frame time
 
 ## Metrics Focus Areas
