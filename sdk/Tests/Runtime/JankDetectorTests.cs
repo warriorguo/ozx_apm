@@ -653,12 +653,21 @@ namespace OzxApm.Tests
             Frames(d, 80f, 1);
             Frames(d, Fps30, 30);
             Assert.AreEqual(1, d.Detected);
-            Assert.That(() => d.UpdateWith(Fps30, -1, 0), Is.Not.AllocatingGCMemory());
-            Assert.That(() => d.UpdateWith(80f, -1, 0), Is.Not.AllocatingGCMemory());
-            Assert.That(() => d.UpdateWith(Fps30, -1, 0), Is.Not.AllocatingGCMemory());
+            // Statement lambdas (an expression lambda returning a value is an
+            // ActualValueDelegate, which the constraint refuses), each run once
+            // before it is measured.
+            TestDelegate normal = () => { d.UpdateWith(Fps30, -1, 0); };
+            TestDelegate slow = () => { d.UpdateWith(80f, -1, 0); };
+            normal(); slow(); normal();
+            Assert.That(normal, Is.Not.AllocatingGCMemory());
+            Assert.That(slow, Is.Not.AllocatingGCMemory());
+            Assert.That(normal, Is.Not.AllocatingGCMemory());
             var t = Warm(Fps30);
-            Assert.That(() => t.Frame(Fps30, out _), Is.Not.AllocatingGCMemory());
-            Assert.That(() => t.Frame(90f, out _), Is.Not.AllocatingGCMemory());
+            TestDelegate trackerNormal = () => { t.Frame(Fps30, out _); };
+            TestDelegate trackerSlow = () => { t.Frame(90f, out _); };
+            trackerNormal(); trackerSlow(); trackerNormal();
+            Assert.That(trackerNormal, Is.Not.AllocatingGCMemory());
+            Assert.That(trackerSlow, Is.Not.AllocatingGCMemory());
         }
     }
 }
