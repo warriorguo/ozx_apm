@@ -15,17 +15,42 @@ Application Performance Monitoring system for Unity games. Track performance, cr
 ## Architecture
 
 ```
-┌─────────────────┐     HTTPS/gzip      ┌─────────────────┐
-│   Unity Game    │ ──────────────────► │   Go Server     │
-│   (SDK)         │     JSON events     │   (API)         │
-└─────────────────┘                     └────────┬────────┘
-                                                 │
-                                                 ▼
-                                        ┌─────────────────┐
-                                        │   ClickHouse    │
-                                        │   (Storage)     │
-                                        └─────────────────┘
+┌──────────────────────┐  events (HTTPS/gzip JSON)   ┌────────────────────────────┐
+│ Unity game + SDK     │ ──────────────────────────► │ Go server: ingest (:8080)  │
+│  technical queue     │  ops events (own queue)     │  dedup, fingerprints,      │
+│  ops queue (APM-12)  │ ──────────────────────────► │  symbolication, alerting   │
+│  session files       │  dev builds only (APM-13)   │                            │
+│  (dev builds)        │ ──────────────────────────► │                            │
+└──────────────────────┘                             └──────┬──────────────┬──────┘
+                                                            │              │
+┌──────────────────────┐  apmsym upload (APM-7)            ▼              ▼
+│ Build machine        │ ─────────────────────► ┌───────────────────┐ ┌───────────────────┐
+│  symbols.zip, maps   │   (admin API)          │ ClickHouse        │ │ S3-compatible     │
+└──────────────────────┘                        │  apm_* (30 days)  │ │ object storage    │
+                                                │  ops_* (365 days) │ │ (SeaweedFS/MinIO) │
+┌──────────────────────┐  /api (token-protected │  symbols, alerts  │ │ session recordings│
+│ Admin UI (React)     │  writes and downloads) └───┬───────────┬───┘ └─────────▲─────────┘
+│ crashes, exceptions, │ ◄──── Go server: admin ────┘           │               │
+│ time lines, health…  │       API (:8081) ─────────────────────┼───────────────┘
+└──────────────────────┘                                        │ read-only account
+                                                                ▼ (ops_* tables only)
+┌──────────────────────┐   alert webhooks (APM-8)   ┌───────────────────┐
+│ Slack / Feishu /     │ ◄───── Go server ──────    │ Metabase (BI)     │
+│ generic webhook      │                            │ ops dashboards    │
+└──────────────────────┘                            │ (APM-12)          │
+                                                    └───────────────────┘
 ```
+
+- **Go server**: one binary with two listeners. CI/CD app 36 runs ingest plus the
+  admin API; app 38 serves the admin UI behind nginx, with its own admin API.
+- **ClickHouse**: technical tables `apm_*` (30-day TTL, daily views kept a year),
+  operations tables `ops_*` (365-day TTL), symbols, issue states and the alert outbox.
+- **Object storage**: session recordings of development builds (APM-13). The
+  test environment uses SeaweedFS on n192, because MinIO no longer publishes
+  community images; any S3-compatible store works.
+- **Metabase**: reads only the `ops_*` tables through a read-only account
+  (`readonly = 2`). The dashboards are created by `cmd/metabase-provision`
+  (APM-12, `docs/ops-schema.md`).
 
 ## Quick Start
 
