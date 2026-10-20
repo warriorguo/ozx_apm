@@ -164,6 +164,7 @@ CREATE TABLE IF NOT EXISTS apm_exceptions (
     ctx_merged UInt8 DEFAULT 0,
     game_t Nullable(Float64),
     frame Nullable(Int64),
+    recovered UInt8 DEFAULT 0,
     INDEX idx_event_id event_id TYPE bloom_filter(0.001) GRANULARITY 1,
     INDEX idx_session_id session_id TYPE bloom_filter(0.01) GRANULARITY 1
 ) ENGINE = ReplacingMergeTree()
@@ -242,6 +243,7 @@ CREATE TABLE IF NOT EXISTS apm_custom_events (
     prop_types Map(LowCardinality(String), UInt8),
     game_t Nullable(Float64),
     frame Nullable(Int64),
+    recovered UInt8 DEFAULT 0,
     INDEX idx_event_id event_id TYPE bloom_filter(0.001) GRANULARITY 1,
     INDEX idx_session_id session_id TYPE bloom_filter(0.01) GRANULARITY 1
 ) ENGINE = ReplacingMergeTree()
@@ -278,6 +280,7 @@ CREATE TABLE IF NOT EXISTS apm_custom_metrics (
     ctx Map(LowCardinality(String), String),
     game_t Nullable(Float64),
     frame Nullable(Int64),
+    recovered UInt8 DEFAULT 0,
     INDEX idx_event_id event_id TYPE bloom_filter(0.001) GRANULARITY 1,
     INDEX idx_session_id session_id TYPE bloom_filter(0.01) GRANULARITY 1
 ) ENGINE = ReplacingMergeTree()
@@ -332,7 +335,8 @@ TTL toDateTime(timestamp) + INTERVAL 30 DAY;
 -- APM-3: error_seq, session_ms, unhandled, ctx_merged; APM-7: the crash
 -- columns from client_fingerprint to details; APM-9: the perf sample's
 -- memory columns from interval_ms to mem_rss_mb; APM-10: prop_types on
--- apm_custom_events, then game_t and frame on every event table). The APM-6 tables
+-- apm_custom_events, then game_t and frame on every event table; APM-24:
+-- recovered on apm_exceptions, apm_custom_events and apm_custom_metrics). The APM-6 tables
 -- (apm_custom_events, apm_custom_metrics) and APM-9's apm_runs have had all
 -- their columns from the start.
 -- Metadata only (existing parts are not rewritten), idempotent.
@@ -401,6 +405,7 @@ ALTER TABLE apm_exceptions ADD COLUMN IF NOT EXISTS unhandled LowCardinality(Str
 ALTER TABLE apm_exceptions ADD COLUMN IF NOT EXISTS ctx_merged UInt8 DEFAULT 0;
 ALTER TABLE apm_exceptions ADD COLUMN IF NOT EXISTS game_t Nullable(Float64);
 ALTER TABLE apm_exceptions ADD COLUMN IF NOT EXISTS frame Nullable(Int64);
+ALTER TABLE apm_exceptions ADD COLUMN IF NOT EXISTS recovered UInt8 DEFAULT 0;
 ALTER TABLE apm_crashes ADD COLUMN IF NOT EXISTS event_id String DEFAULT '';
 ALTER TABLE apm_crashes ADD COLUMN IF NOT EXISTS seq UInt64 DEFAULT 0;
 ALTER TABLE apm_crashes ADD COLUMN IF NOT EXISTS build_type LowCardinality(String) DEFAULT '';
@@ -438,6 +443,7 @@ ALTER TABLE apm_custom_events ADD COLUMN IF NOT EXISTS ctx Map(LowCardinality(St
 ALTER TABLE apm_custom_events ADD COLUMN IF NOT EXISTS prop_types Map(LowCardinality(String), UInt8);
 ALTER TABLE apm_custom_events ADD COLUMN IF NOT EXISTS game_t Nullable(Float64);
 ALTER TABLE apm_custom_events ADD COLUMN IF NOT EXISTS frame Nullable(Int64);
+ALTER TABLE apm_custom_events ADD COLUMN IF NOT EXISTS recovered UInt8 DEFAULT 0;
 ALTER TABLE apm_custom_metrics ADD COLUMN IF NOT EXISTS event_id String DEFAULT '';
 ALTER TABLE apm_custom_metrics ADD COLUMN IF NOT EXISTS seq UInt64 DEFAULT 0;
 ALTER TABLE apm_custom_metrics ADD COLUMN IF NOT EXISTS build_type LowCardinality(String) DEFAULT '';
@@ -447,6 +453,7 @@ ALTER TABLE apm_custom_metrics ADD COLUMN IF NOT EXISTS net_type LowCardinality(
 ALTER TABLE apm_custom_metrics ADD COLUMN IF NOT EXISTS ctx Map(LowCardinality(String), String);
 ALTER TABLE apm_custom_metrics ADD COLUMN IF NOT EXISTS game_t Nullable(Float64);
 ALTER TABLE apm_custom_metrics ADD COLUMN IF NOT EXISTS frame Nullable(Int64);
+ALTER TABLE apm_custom_metrics ADD COLUMN IF NOT EXISTS recovered UInt8 DEFAULT 0;
 ALTER TABLE apm_runs ADD COLUMN IF NOT EXISTS event_id String DEFAULT '';
 ALTER TABLE apm_runs ADD COLUMN IF NOT EXISTS seq UInt64 DEFAULT 0;
 ALTER TABLE apm_runs ADD COLUMN IF NOT EXISTS build_type LowCardinality(String) DEFAULT '';

@@ -212,6 +212,12 @@ type ExceptionOccurrenceInfo struct {
 	SessionMs LenientInt    `json:"session_ms"`
 	Unhandled LenientString `json:"unhandled"`
 	CtxMerged LenientBool   `json:"ctx_merged"`
+	// Recovered (APM-24): a repeat count the SDK recovered at the next launch
+	// from its on-device checkpoint, because the process died before the
+	// count's window closed; it holds the occurrences up to the last
+	// checkpoint. Same event_id as the window's final count, so only one of
+	// the two is ever stored.
+	Recovered LenientBool `json:"recovered"`
 }
 
 // LenientString decodes a JSON string; anything else reads as "".

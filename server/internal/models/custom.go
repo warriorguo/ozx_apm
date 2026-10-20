@@ -21,22 +21,25 @@ const (
 // they shared. Props are validated like the game context
 // (processor.NormalizeCustomEvent).
 type CustomEvent struct {
-	Timestamp   time.Time         `json:"-"`
-	EventID     string            `json:"event_id"`
-	Seq         uint64            `json:"seq"`
-	AppVersion  string            `json:"app_version"`
-	Platform    string            `json:"platform"`
-	DeviceModel string            `json:"device_model"`
-	OSVersion   string            `json:"os_version"`
-	SessionID   string            `json:"session_id"`
-	DeviceID    string            `json:"device_id"`
-	Scene       string            `json:"scene"`
-	Name        string            `json:"name"`
-	Count       LenientInt        `json:"count"`
-	Aggregated  LenientBool       `json:"aggregated"`
-	CtxMerged   LenientBool       `json:"ctx_merged"`
-	RawProps    json.RawMessage   `json:"props"`
-	Props       map[string]string `json:"-"`
+	Timestamp   time.Time   `json:"-"`
+	EventID     string      `json:"event_id"`
+	Seq         uint64      `json:"seq"`
+	AppVersion  string      `json:"app_version"`
+	Platform    string      `json:"platform"`
+	DeviceModel string      `json:"device_model"`
+	OSVersion   string      `json:"os_version"`
+	SessionID   string      `json:"session_id"`
+	DeviceID    string      `json:"device_id"`
+	Scene       string      `json:"scene"`
+	Name        string      `json:"name"`
+	Count       LenientInt  `json:"count"`
+	Aggregated  LenientBool `json:"aggregated"`
+	CtxMerged   LenientBool `json:"ctx_merged"`
+	// Recovered (APM-24): an aggregated count recovered from the SDK's
+	// checkpoint after the process died (see ExceptionOccurrenceInfo.Recovered).
+	Recovered LenientBool       `json:"recovered"`
+	RawProps  json.RawMessage   `json:"props"`
+	Props     map[string]string `json:"-"`
 	// PropTypes: the JSON type of the props that were not strings (APM-10):
 	// PropTypeNumber or PropTypeBool; Props holds their JSON text.
 	PropTypes map[string]uint8 `json:"-"`
@@ -70,6 +73,9 @@ type CustomMetric struct {
 	HistKeys    []int32     `json:"hist_keys"`
 	HistCounts  []uint64    `json:"hist_counts"`
 	CtxMerged   LenientBool `json:"ctx_merged"`
+	// Recovered (APM-24): the series up to the SDK's last checkpoint before
+	// the process died (window_ms then ends at that checkpoint).
+	Recovered LenientBool `json:"recovered"`
 	EventContext
 }
 

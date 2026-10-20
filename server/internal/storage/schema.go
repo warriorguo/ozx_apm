@@ -18,7 +18,8 @@ import (
 // event tables (apm_custom_events, apm_custom_metrics) and their daily
 // views, APM-7 the crash columns, APM-9 the perf sample's memory columns and
 // the apm_runs event table (no view), APM-10 the game clock columns (game_t,
-// frame) on every event table and prop_types on apm_custom_events; new tables are created by CREATE TABLE
+// frame) on every event table and prop_types on apm_custom_events, APM-24 the
+// recovered flag of windowed counts; new tables are created by CREATE TABLE
 // IF NOT EXISTS, which the service account may run.
 //
 // The event tables are ReplacingMergeTree with event_id appended to the sort
@@ -97,11 +98,32 @@ var customEventColumnsAPM10 = []string{
 	"prop_types Map(LowCardinality(String), UInt8)",
 }
 
+// recoveredColumnAPM24 marks a count the SDK recovered from its on-device
+// checkpoint after the process died before the count's window closed
+// (APM-24): the row holds what was counted up to the last checkpoint (at most
+// a few seconds before the death), not the whole window. 0 on every other
+// row, and on rows of older SDKs. Only the tables of windowed counts have it:
+// exception repeat counts, aggregated custom events, custom metric series.
+// The checkpoint and the window's final event of a count carry the same
+// event_id, so at most one of them is stored (APM-19's duplicate drop; the
+// ReplacingMergeTree for what slips through) and the daily views never see
+// both.
+const recoveredColumnAPM24 = "recovered UInt8 DEFAULT 0"
+
+// columnsAPM24 are the columns APM-24 added, after the clock columns.
+var columnsAPM24 = map[string][]string{
+	TableExceptions.Name:    {recoveredColumnAPM24},
+	TableCustomEvents.Name:  {recoveredColumnAPM24},
+	TableCustomMetrics.Name: {recoveredColumnAPM24},
+}
+
 // laterColumns are the columns of a table after eventColumns, in the order
-// they were added: its own added columns, then the clock columns.
+// they were added: its own added columns, the clock columns (APM-10), then
+// APM-24's.
 func laterColumns(table string) []string {
 	cols := append([]string{}, addedColumns[table]...)
-	return append(cols, clockColumnsAPM10...)
+	cols = append(cols, clockColumnsAPM10...)
+	return append(cols, columnsAPM24[table]...)
 }
 
 // perfColumnsAPM9 are the memory breakdown of a perf sample (APM-9; 0 on
@@ -776,7 +798,8 @@ func SchemaSQL() string {
 -- APM-3: error_seq, session_ms, unhandled, ctx_merged; APM-7: the crash
 -- columns from client_fingerprint to details; APM-9: the perf sample's
 -- memory columns from interval_ms to mem_rss_mb; APM-10: prop_types on
--- apm_custom_events, then game_t and frame on every event table). The APM-6 tables
+-- apm_custom_events, then game_t and frame on every event table; APM-24:
+-- recovered on apm_exceptions, apm_custom_events and apm_custom_metrics). The APM-6 tables
 -- (apm_custom_events, apm_custom_metrics) and APM-9's apm_runs have had all
 -- their columns from the start.
 -- Metadata only (existing parts are not rewritten), idempotent.

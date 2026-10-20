@@ -106,12 +106,12 @@ func TestSchemaStatements_ExceptionColumnsAPM4AndAPM3(t *testing.T) {
 	}
 	added := append(append([]string{}, exceptionColumnsAPM4...), exceptionColumnsAPM3...)
 	want := "    ctx Map(LowCardinality(String), String),\n    " + strings.Join(added, ",\n    ") + ",\n    " +
-		strings.Join(clockColumnsAPM10, ",\n    ") + ",\n    INDEX "
+		strings.Join(clockColumnsAPM10, ",\n    ") + ",\n    " + recoveredColumnAPM24 + ",\n    INDEX "
 	if !strings.Contains(create, want) {
 		t.Errorf("CREATE TABLE apm_exceptions: APM-4/APM-3 columns missing or out of order:\n%s", create)
 	}
-	// Then APM-10's clock columns.
-	alters = alters[:len(alters)-len(clockColumnsAPM10)]
+	// Then APM-10's clock columns and APM-24's recovered.
+	alters = alters[:len(alters)-len(clockColumnsAPM10)-1]
 	tail := alters[len(alters)-len(added):]
 	for i, col := range added {
 		if tail[i] != col {
@@ -206,6 +206,10 @@ func TestSchemaStatements_GameClockColumnsAPM10(t *testing.T) {
 		if table == "apm_custom_events" {
 			want = append([]string{"prop_types Map(LowCardinality(String), UInt8)"}, want...)
 		}
+		// APM-24's recovered flag follows them on the tables of windowed counts.
+		if table == "apm_exceptions" || table == "apm_custom_events" || table == "apm_custom_metrics" {
+			want = append(want, "recovered UInt8 DEFAULT 0")
+		}
 		if !strings.Contains(create, "    "+strings.Join(want, ",\n    ")+",\n    INDEX ") {
 			t.Errorf("%s: CREATE TABLE lacks %v last:\n%s", table, want, create)
 		}
@@ -217,6 +221,37 @@ func TestSchemaStatements_GameClockColumnsAPM10(t *testing.T) {
 			if tail[i] != want[i] {
 				t.Errorf("%s: ALTER %d: %q, want %q", table, i, tail[i], want[i])
 			}
+		}
+	}
+}
+
+// APM-24: the recovered flag on exactly the tables of windowed counts (the
+// SDK's checkpointed repeat counts, aggregated custom events, metric series),
+// last in CREATE TABLE and last among the ALTERs; no other table has it, and
+// no daily view reads it (a recovered row is a count like any other).
+func TestSchemaStatements_RecoveredColumnAPM24(t *testing.T) {
+	want := map[string]bool{"apm_exceptions": true, "apm_custom_events": true, "apm_custom_metrics": true}
+	for _, table := range eventTables {
+		var create, lastAlter string
+		for _, stmt := range schemaStatements {
+			if strings.HasPrefix(stmt, "CREATE TABLE IF NOT EXISTS "+table+" ") {
+				create = stmt
+			}
+			if strings.HasPrefix(stmt, "ALTER TABLE "+table+" ADD COLUMN") {
+				lastAlter = stmt
+			}
+		}
+		has := strings.Contains(create, "recovered UInt8 DEFAULT 0,\n    INDEX ")
+		if has != want[table] {
+			t.Errorf("%s: CREATE TABLE has recovered last = %v, want %v", table, has, want[table])
+		}
+		if want[table] != (lastAlter == "ALTER TABLE "+table+" ADD COLUMN IF NOT EXISTS recovered UInt8 DEFAULT 0") {
+			t.Errorf("%s: last ALTER %q", table, lastAlter)
+		}
+	}
+	for _, v := range materializedViews {
+		if strings.Contains(v.DDL, "recovered") {
+			t.Errorf("%s reads recovered", v.Name)
 		}
 	}
 }

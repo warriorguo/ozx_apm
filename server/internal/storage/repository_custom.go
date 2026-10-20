@@ -18,7 +18,7 @@ func (r *Repository) InsertCustomEvents(ctx context.Context, events []models.Cus
 		return nil
 	}
 	batch, err := r.newInsert(ctx, "INSERT INTO apm_custom_events (timestamp, app_version, platform, device_model, os_version, session_id, device_id, scene, "+
-		"name, count, aggregated, ctx_merged, props, event_id, seq, build_type, gpu, ram_class, net_type, ctx, prop_types, game_t, frame)")
+		"name, count, aggregated, ctx_merged, props, event_id, seq, build_type, gpu, ram_class, net_type, ctx, prop_types, game_t, frame, recovered)")
 	if err != nil {
 		return fmt.Errorf("prepare batch: %w", err)
 	}
@@ -47,6 +47,7 @@ func (r *Repository) InsertCustomEvents(ctx context.Context, events []models.Cus
 			propTypesColumn(e.PropTypes),
 			e.GameT, // APM-10: nil (NULL) without the client's clock
 			e.Frame,
+			boolColumn(bool(e.Recovered)), // APM-24
 		)
 		if err != nil {
 			return fmt.Errorf("append to batch: %w", err)
@@ -63,7 +64,7 @@ func (r *Repository) InsertCustomMetrics(ctx context.Context, rows []models.Cust
 	}
 	batch, err := r.newInsert(ctx, "INSERT INTO apm_custom_metrics (timestamp, app_version, platform, device_model, os_version, session_id, device_id, scene, "+
 		"name, unit, count, value_sum, value_min, value_max, window_ms, hist_version, hist_keys, hist_counts, ctx_merged, "+
-		"event_id, seq, build_type, gpu, ram_class, net_type, ctx, game_t, frame)")
+		"event_id, seq, build_type, gpu, ram_class, net_type, ctx, game_t, frame, recovered)")
 	if err != nil {
 		return fmt.Errorf("prepare batch: %w", err)
 	}
@@ -105,6 +106,7 @@ func (r *Repository) InsertCustomMetrics(ctx context.Context, rows []models.Cust
 			contextColumn(m.Context),
 			m.GameT, // APM-10: nil (NULL) without the client's clock
 			m.Frame,
+			boolColumn(bool(m.Recovered)), // APM-24
 		)
 		if err != nil {
 			return fmt.Errorf("append to batch: %w", err)
