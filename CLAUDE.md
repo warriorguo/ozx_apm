@@ -20,6 +20,15 @@ OZX APM is a Unity game Application Performance Monitoring system consisting of:
 - Offline queue with ring buffer + disk persistence for retry on next launch
 - Remote configuration for sampling rates, feature toggles, privacy controls
 
+### Every file and folder under `sdk/` has a `.meta`
+
+OZX pulls the SDK as a git package, which Unity treats as read-only: it never creates a missing
+`.meta` there, it ignores the asset instead — a folder without one drops everything in it (APM-27:
+`Runtime/` had none, so the `OzxApm` assembly did not exist). When adding a file or folder
+without the Unity Editor, add its `.meta` in the same commit (a fresh 32-hex guid from `uuidgen`,
+importer by type: `DefaultImporter` + `folderAsset: yes` for folders, `MonoImporter` for `.cs`,
+`AssemblyDefinitionImporter` for `.asmdef`). Check: `find sdk -mindepth 1 ! -name '*.meta' | while read f; do [ -e "$f.meta" ] || echo "$f"; done` prints nothing.
+
 ### Performance Budgets
 - CPU: < 0.3ms/frame steady state
 - Memory: < 5MB resident (including queues)
