@@ -207,8 +207,9 @@ namespace OzxApm.Core
         /// counted. If the process dies in the foreground (crash, kill, OOM) the
         /// next launch uploads them, so at most this many seconds of counts are
         /// lost instead of the whole minute. Clamped to 1..60 s; 0 (or less)
-        /// turns checkpoints off. Off the main thread; one small file rewritten
-        /// in place of the previous one. Default 5 s.
+        /// turns checkpoints off. Off the main thread; one small file per
+        /// collector rewritten in place of the previous one (a large one less
+        /// often: at most ~4 KB/s on average). Default 5 s.
         /// </summary>
         public float CountCheckpointIntervalSeconds { get; set; } = 5.0f;
 

@@ -241,6 +241,7 @@ namespace OzxApm.Network
             public readonly List<BaseEvent> Events = new List<BaseEvent>();
             public bool Collected;
             public bool HasFile; // worker's view: a .ckpt or .ckpt.tmp of this slot may exist
+            public long Bytes;   // size of its current file (0: none)
         }
 
         private CheckpointSlot[] _cpSlots = new CheckpointSlot[0]; // replaced under _lock; read by the worker
@@ -515,7 +516,33 @@ namespace OzxApm.Network
         }
 
         /// <summary>Test seam: the checkpoint interval has passed since the last collection.</summary>
-        internal void ExpireCheckpointIntervalForTests() => _cpLastTick = unchecked(Environment.TickCount - CheckpointIntervalMs - 1);
+        internal void ExpireCheckpointIntervalForTests() => ExpireCheckpointIntervalForTests(CheckpointIntervalMs + 1);
+        internal void ExpireCheckpointIntervalForTests(int agoMs) => _cpLastTick = unchecked(Environment.TickCount - agoMs);
+
+        /// <summary>
+        /// Flash wear bound: checkpoints are spaced so that at most this many
+        /// bytes a second are rewritten on average (the files' total size /
+        /// this), never closer than the interval. A typical file (one or two
+        /// repeating errors, 2-6 KB) is written every 5 s; a 64 KB one every
+        /// 16 s; the largest (256 KB per source) about once a minute, i.e. not
+        /// more often than its window closes anyway.
+        /// </summary>
+        internal const int CheckpointBytesPerSecond = 4 * 1024;
+
+        /// <summary>The spacing of checkpoints now (ms): the interval, or longer for large files (CheckpointBytesPerSecond).</summary>
+        internal int CheckpointSpacingMs
+        {
+            get
+            {
+                int interval = CheckpointIntervalMs;
+                long bytes = 0;
+                var slots = _cpSlots;
+                for (int i = 0; i < slots.Length; i++)
+                    bytes += slots[i].Bytes;
+                long byBytes = bytes * 1000 / CheckpointBytesPerSecond;
+                return (int)Math.Min(60000, Math.Max(interval, byBytes));
+            }
+        }
 
         /// <summary>Checkpoint files written in this process.</summary>
         internal long CheckpointWrites => Interlocked.Read(ref _cpWrites);
@@ -537,9 +564,9 @@ namespace OzxApm.Network
         {
             if (!_cpRequested || !_persistToDisk)
                 return int.MaxValue;
-            int interval = CheckpointIntervalMs;
-            if (interval <= 0 || _cpUrgent || _cpForce || !_cpCollectedOnce)
+            if (CheckpointIntervalMs <= 0 || _cpUrgent || _cpForce || !_cpCollectedOnce)
                 return 0;
+            int interval = CheckpointSpacingMs;
             int elapsed = unchecked(Environment.TickCount - _cpLastTick);
             return elapsed >= interval || elapsed < 0 ? 0 : interval - elapsed;
         }
@@ -713,6 +740,7 @@ namespace OzxApm.Network
             File.Move(slot.TmpPath, slot.Path);
             Interlocked.Increment(ref _cpWrites);
             Interlocked.Exchange(ref _cpLastBytes, _cpBuffer.Length);
+            slot.Bytes = _cpBuffer.Length;
             if (_cpBuffer.Capacity > MaxPooledBufferBytes)
             {
                 _cpBuffer.SetLength(0);
@@ -729,6 +757,7 @@ namespace OzxApm.Network
             if (File.Exists(slot.TmpPath))
                 File.Delete(slot.TmpPath);
             slot.HasFile = false;
+            slot.Bytes = 0;
             Interlocked.Exchange(ref _cpLastBytes, 0);
         }
 
@@ -2134,7 +2163,10 @@ namespace OzxApm.Network
                         }
                     }
                     foreach (var slot in _cpSlots)
+                    {
                         slot.HasFile = false;
+                        slot.Bytes = 0;
+                    }
                     Interlocked.Exchange(ref _cpLastBytes, 0);
                     foreach (var name in new[] { SeqFileName, SeqFileName + ".tmp" })
                     {

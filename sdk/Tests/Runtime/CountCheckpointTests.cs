@@ -431,6 +431,45 @@ namespace OzxApm.Tests
             Assert.AreEqual(0, CheckpointFiles().Length);
         }
 
+        // Flash wear: a large checkpoint is rewritten less often (on average at
+        // most CheckpointBytesPerSecond); a window close still deletes it at once.
+        [Test]
+        public void ALargeCheckpoint_IsRewrittenLessOften()
+        {
+            var big = Enumerable.Range(0, 15).Select(i =>
+            {
+                var e = Count("id" + i.ToString("D4", CultureInfo.InvariantCulture), 2);
+                e.stack = new string('x', 4000);
+                return e;
+            }).ToArray();
+            var store = NewStore();
+            var source = new FakeSource { Pending = () => big.Select(p => { var c = Count(p.event_id, p.count); c.stack = p.stack; return (BaseEvent)c; }).ToList() };
+            store.AddCheckpointSource(source);
+            store.RequestCheckpoint(false);
+            store.Pump();
+            long bytes = store.CheckpointLastBytes;
+            Assert.Greater(bytes, 60 * 1024);
+            int spacing = store.CheckpointSpacingMs;
+            Assert.AreEqual((int)(bytes * 1000 / OfflineStorage.CheckpointBytesPerSecond), spacing);
+            Assert.Greater(spacing, store.CheckpointIntervalMs);
+
+            source.Dirty = true;
+            store.RequestCheckpoint(false);
+            store.ExpireCheckpointIntervalForTests(); // 5 s: not enough for this size
+            store.Pump();
+            Assert.AreEqual(1, store.CheckpointWrites);
+            store.ExpireCheckpointIntervalForTests(spacing + 1);
+            store.Pump();
+            Assert.AreEqual(2, store.CheckpointWrites);
+
+            big = new ExceptionEvent[0]; // the window closed
+            source.Dirty = true;
+            store.RequestCheckpoint(true);
+            store.Pump();
+            Assert.AreEqual(0, CheckpointFiles().Length);
+            Assert.AreEqual(store.CheckpointIntervalMs, store.CheckpointSpacingMs);
+        }
+
         [Test]
         public void MemoryOnly_NeverCheckpoints()
         {
