@@ -5093,3 +5093,515 @@ uploads it); its consent semantics are APM-14's.
   shapes), the read-only account as an XML user (tested as an equivalent SQL
   user), a real CDN country header, real network report exports (the column
   mapping), iOS.
+
+## APM-13: session files of development builds (upload, object storage, retrieval; additive schema change)
+
+Deploy order: **server (apps 36 and 38, with the object store and the two
+secrets), then the admin UI, then development builds with the upload key.**
+Each step works without the next: without `OZX_S3_*` the server starts as
+before (uploads answer 503 and stay on the devices, the list answers 503, the
+Session files page says so); the previous admin UI works with this server;
+an SDK with this change against an older server gets 404/405 for the upload
+(retried with backoff, kept on the device up to 14 days); release builds
+never upload anything.
+
+OZX's verify-ticket checks changes against AiTelemetry recordings
+(`SessionFolder/<session>/`: `session.json`, `level*.json`, the channel JSONL
+files, `room<NN>_<roomId>/<enemy>_<id>-wave<k>_event.jsonl`). OZX-1281 records
+them in Android development builds too; this release brings them back: the
+SDK uploads a session directory, the server stores it in object storage
+(never in ClickHouse) and indexes it, and the admin lists it by git commit,
+build, device and time and downloads it as a zip of exactly that directory,
+which `scripts/ai_trace.py` and verify-ticket read unmodified.
+
+### Protocol (SDK -> ingest server)
+
+| Step | Request | Answer |
+|---|---|---|
+| create / resume | `POST /v1/session-files` JSON: `upload_id` (32 hex, the SDK's), `device_id`, `session_id`, `recording_name` (the directory's name), `app_version`, `build`, `build_type`, `platform`, `device_model`, `os_version`, `unity_version`, `sdk_version`, `git_commit`, `size_bytes`, `sha256`, `part_bytes`, `part_count`, `file_count`, `raw_bytes`, `session_json` (the file's text; a file over 64 KB is not sent, and the server indexes none rather than refusing) | `{"status":"uploading","received":[0,2,...],"part_count":N}`; `complete` when it was committed already |
+| part | `PUT /v1/session-files/{id}/parts/{n}`, body = bytes `[n*part_bytes, ...)` of the zip, `X-Apm-Device-Id`, `X-Apm-Part-Sha256` | 200; the part is stored as its own object |
+| commit | `POST /v1/session-files/{id}/commit` `{"device_id","sha256","size_bytes"}` | 200 complete; 409 `{"missing":[...]}` (send those, commit again) |
+
+Every request carries `X-Apm-Upload-Key` (and `X-App-Key` as `/v1/events`
+does: `middleware.Auth` applies when `auth.enabled`). Every step is
+idempotent and the server keeps no state in memory that matters: the state is
+the index row (ClickHouse) and the part objects (S3), so any replica answers
+any step (tested with two replicas: create on one, parts alternating, commit
+on the other, link from one, download from the other). A client that lost an
+answer repeats the step; after a restart it creates again (same id) and the
+server lists the parts it has.
+
+Why parts are objects of their own: S3 multipart parts must be 5 MiB or more
+(all but the last), too big for one request from a phone on a weak network
+and for proxies' 1 MB default body limit. The SDK sends 512 KB parts (64 KB -
+4 MiB accepted); the commit joins them into one object with S3 multipart
+(8 MiB parts, at most one in memory per commit; up to 8 MiB a single PUT),
+hashing while it joins.
+
+Answers the SDK acts on: a 4xx with `reject_code` drops the upload
+(`release_build` 403, `too_large` 413, `invalid_request` 400, `upload_conflict`
+409, `upload_failed` 409, `wrong_device` 403, `checksum_mismatch` 422,
+`invalid_archive` 422); 404 without one (the server forgot the upload: never
+created, or abandoned and cleaned) creates it again; everything else (no
+answer, 5xx, 429, 401, a part whose SHA-256 did not match) is retried with
+backoff (5 s doubling to 1 h, full jitter, `Retry-After` honoured; a 404 on create too). 401 (wrong
+or missing upload key) is retried, not dropped: a rotated key must not make dev
+builds throw recordings away.
+
+Limits (server): archive `session_files.max_archive_bytes` (512 MiB), parts
+64 KiB - 4 MiB and at most 10,000, session.json 64 KiB; per device per 24 h
+`max_uploads_per_device_per_day` (100) and `max_bytes_per_device_per_day`
+(4 GiB), at most `max_open_uploads_per_device` (4) not committed (429 with
+`Retry-After`); per process 16 parts read and stored at once (each in memory,
+<= 4 MiB: 64 MiB at most; a slot is held while the body arrives, so 16 very
+slow clients make others wait: 503 after 3 s, retried) and 2 commits (8 MiB
+each), 503 `Retry-After` when busy. The ingest server's 30 s read/write
+timeouts are extended for a part (2 min to read the body, 2.5 min to answer)
+and a commit (5 min). A commit's assembly and checks run detached from the
+request (15 min deadline, one run per upload and process): a client that gave
+up does not make it start over, its retry gets the result (503 "commit in
+progress" meanwhile); the global per-IP
+rate limit applies as to `/v1/events`. A part's body must have exactly the
+expected length and SHA-256 (corruption in transit: 400 without
+`reject_code`, sent again); S3 verifies each object's payload hash (SigV4
+signs the body's SHA-256).
+
+### Storage
+
+Bucket (`OZX_S3_BUCKET`, n192: `ozx-apm-sessions` on SeaweedFS 4.48,
+path-style, SigV4, region `us-east-1`), every key under `OZX_S3_PREFIX`
+(default `session-files/`):
+
+```
+session-files/tmp/<upload>/<000000..>            parts, deleted at commit (or by the cleaner)
+session-files/sessions/<yyyy>/<mm>/<dd>/<upload>.zip   the recording (day of the upload's start, UTC)
+```
+
+The commit checks, after joining: the SHA-256 the device computed while
+zipping (mismatch: the upload fails, its objects are deleted), and the zip's
+central directory (read back with ranged GETs): every entry under
+`<recording_name>/`, a clean relative path (no `..`, `.`, empty segment,
+backslash, colon, absolute path, duplicate), regular files and directories
+only (no links), Stored or Deflate, `<recording_name>/session.json`
+present, every local header naming the same file as its central directory
+entry (streaming extractors read the local headers), no ZIP64, at most 50,000 entries, uncompressed size at most 64 x the archive
+(above 64 MiB). Anything else fails the upload (`invalid_archive`): an
+archive in the store can only unzip to `<recording>/...`.
+
+S3 client: `internal/objstore`, standard library only (no new Go module). The
+operations needed are nine (put, get, ranged get, head, delete, list v2,
+multipart create/part/complete/abort, list multipart uploads); minio-go and
+AWS SDK v2 releases need a newer Go than this module (1.21, builder image
+1.22) and a dozen transitive modules. The signature is checked against AWS's
+four documented example signatures (GET object with Range, PUT object,
+`?lifecycle`, `?max-keys&prefix`) and against SeaweedFS by the integration
+tests; idempotent calls are retried 3 times on transport errors, 5xx and 429.
+Every call but a download's body has the 60 s timeout (headers and body);
+a download is streamed for as long as the request lasts (headers within
+60 s). Keys never appear in logs or errors.
+
+### Index: `apm_session_files`
+
+Created by `Migrate` (`CREATE TABLE IF NOT EXISTS`, within the `apm`
+account's grant; a failure is a warning `could not create the session files
+table` and the server starts), also in `scripts/migrate.sql`. **No existing
+table changes.**
+
+`upload_id, version, status, created_at, updated_at, expires_at, device_id,
+session_id, recording_name, app_version, app_build, build_type, platform,
+device_model, os_version, unity_version, sdk_version, git_commit, started_at,
+scene, data_source, data_pack_version, data_pack_sha256` (the last five from
+session.json), `size_bytes, part_bytes, part_count, sha256, file_count,
+raw_bytes, object_key, session_json, error`; bloom filter indexes on
+`git_commit`, `device_id`, `session_id`.
+`ReplacingMergeTree(version) PARTITION BY toYYYYMM(created_at) ORDER BY
+upload_id TTL expires_at + INTERVAL 30 DAY`. One row per upload and state
+(`uploading`, `failed`, `complete`); `version` = the state's rank << 48 |
+write time in ms, so a completed upload is never hidden by a late
+`uploading` row of a replica with a clock ahead (tested). Reads use `FINAL`
+(a small table: dev builds only). The TTL is a backstop a month after expiry;
+the cleaner deletes rows first (below).
+
+`git_commit`: the SDK's (`SessionUploadOptions.GitCommit`, else the game
+context key `gitCommit`), else session.json's `gitCommit`; anything not
+`[A-Za-z0-9._-]{1,80}` is dropped. The list filters by prefix
+(case-insensitive, at least 4 characters).
+
+### Retrieval (admin server, apps 36 and 38)
+
+- `GET /api/session-files` (token): the latest state of each upload, newest
+  first; `git_commit` (prefix), `build`, `app_version`, `build_type`,
+  `device_id`, `session_id` (repeatable or comma separated, up to 200),
+  `recording`, `status` (`complete` by default, `uploading`, `failed`,
+  `all`), `start_time` / `end_time` (RFC 3339, on the upload's start),
+  `limit` (100, at most 1000). No session.json in the list.
+- `GET /api/session-files/detail?upload_id=` (token): one upload with its session.json.
+- `POST /api/session-files/link` `{"upload_id"}` (token): `{"url":
+  "/api/session-files/download?upload_id=..&expires=..&sig=..", "expires_at",
+  "filename"}`, valid 5 minutes, for that upload only.
+- `GET /api/session-files/download?upload_id=` (token, or the link's
+  `expires` + `sig`): the zip, streamed from S3 (`Content-Type:
+  application/zip`, `Content-Disposition: attachment;
+  filename="<recording>.zip"`, `Content-Length`, `X-Apm-Sha256`,
+  `Cache-Control: no-store`); 409 for an upload not complete, 410 once
+  expired, 503 when S3 fails. The write deadline is extended to 30 minutes
+  for the download (the admin server's 30 s write timeout would cut a large
+  archive on a slow link); nginx in app 38 proxies it (its 30 s
+  `proxy_read_timeout` is between two reads).
+- `GET /api/session-files/available?session_id=..` (**no token**): which of
+  the sessions have a completed recording: session id, upload id, size, time;
+  never content, device, commit or session.json. The session time line
+  (APM-15) shows "Recording (N MB)" in its header and the exception detail page
+  (APM-11) on each occurrence (one request per page of occurrences), linked to
+  the Session files page filtered by that session.
+- Admin UI: **Session files** page (nav): asks for the token once per tab,
+  filters as the API, table (upload time, recording, commit, version and build,
+  device, archive size, files and raw size, state, a time line link placed at
+  session.json's `startedAt`), **Download** (asks for a link, then the browser
+  opens it).
+
+Unzipping: `unzip -q rec.zip -d /tmp/rec` gives `/tmp/rec/<session>/`; then
+`python3 scripts/ai_trace.py /tmp/rec/<session>`. Entry names are UTF-8 (zip
+flag 11); macOS's `unzip` 6.0 shows non-ASCII names wrongly, Python's
+`zipfile`, Go and `ditto -x -k` handle them (AiTelemetry's own names are ASCII).
+
+### Authentication and threat model
+
+What is protected: the recordings hold full game data of test sessions
+(positions, every damage line, level documents, data pack versions) and device
+ids. They are never public.
+
+- **Upload**: the upload key (`OZX_SESSION_FILES_UPLOAD_KEY`, header
+  `X-Apm-Upload-Key`, compared in constant time; uploads answer 503 while it
+  or the object store is not configured, 401 for a wrong or missing key,
+  logged with the remote address and reason, never the key). It is compiled
+  only into development builds (`ApmConfig.SessionFilesUploadKey`, injected by
+  OZX's dev build script; never in a release build or the repo). A release
+  build cannot upload at all (compiled out, run-time gate, the server
+  refuses build types other than dev/editor). Risk accepted: anyone with a dev
+  APK can extract the key and upload junk up to the per-device limits;
+  uploads are bound to the device id that created them (parts and commit from
+  another device id: 403), cost is bounded by the size and rate limits, and
+  the key is rotated by changing the secret and the dev build. The app key
+  (`auth.enabled`) applies on top when it is on.
+- **List, detail, link, download**: the admin token
+  (`OZX_ADMIN_SESSIONFILES_TOKEN`, `Authorization: Bearer`, constant time,
+  403 while not configured, 401 logged as for APM-14's token). The admin UI has
+  no login: the page asks for the token and keeps it in `sessionStorage` (this
+  tab only: gone when the tab closes, not shared with other tabs, never in
+  `localStorage`, a cookie or a URL). A download is a plain browser navigation,
+  which cannot carry the header, so the page asks `POST /link` (with the token)
+  for a URL signed with HMAC-SHA256 under a key derived from the token
+  (`HMAC(token, "ozx-apm session-files download link v1")`), over the upload
+  id and the expiry; it works 5 minutes, for that upload only (a link valid
+  longer than 5 minutes + 60 s, expired, for another upload or made with
+  another token is refused, 403, logged). Both admin deployments with the same
+  token accept each other's links. Rotating the token invalidates every link.
+- Residual risks: a link leaks for at most 5 minutes through browser history
+  or a proxy log (it names one recording); the token sits in the tab's
+  `sessionStorage` (an XSS in the admin UI could read it: the UI renders no
+  HTML from data); `available` tells anyone who can reach the admin API which
+  sessions have a recording and how big (the rest of the admin API is
+  unauthenticated already, APM-14's open risk); the admin API is reached over
+  the internal network without TLS unless the deployment adds it.
+- The S3 keys (`OZX_S3_ACCESS_KEY`, `OZX_S3_SECRET_KEY`) are bucket-scoped on
+  n192 (read, write, list, tagging on `ozx-apm-sessions`); never logged (the
+  start-up line has the endpoint, bucket, prefix and whether the two tokens are
+  set, nothing else).
+
+### Retention
+
+No bucket lifecycle rule is assumed (the server's key may not set one).
+Every `session_files.cleaner_interval` (1 h; first run 1-11 minutes after start,
+random) each process with the object store configured:
+
+1. deletes uploads past `expires_at` (upload start + `retention_days`, 30)
+   and uploads not committed within `incomplete_days` (7): objects first (the
+   archive, the parts), then the rows (`ALTER TABLE apm_session_files DELETE
+   WHERE upload_id IN ...`, `mutations_sync = 2`, the `ALTER DELETE` grant of
+   APM-14); a failure leaves the row for the next run, so no row ever points
+   to an object that the cleaner deleted unless the row deletion failed (then
+   the download answers 503 until the next run deletes the row);
+2. once a day sweeps the bucket prefix: parts older than `incomplete_days` + 1
+   day, archives older than a day that no row refers to (or whose row is
+   expired or failed), multipart uploads older than a day (an assembly
+   interrupted by a restart).
+
+Two processes (apps 36 and 38) running it at the same time is safe: every
+step is idempotent (tested: a second replica's run finds nothing). The
+expiry is per upload (`expires_at` written at the start); changing
+`retention_days` applies to new uploads.
+
+### Privacy (APM-14)
+
+`POST /api/privacy/delete` deletes the subject's recordings **before** the
+table rows: the objects (archive and parts), then their index rows.
+
+- `device_id`: the uploads of that device (`apm_session_files` has
+  `device_id`; the generic per-table deletion then finds no row left).
+- `player_id`: the recordings of the sessions the player's ops events name
+  (`ops_events.session_id`, APM-12: the session id is shared by the technical
+  and the ops data). A player's recordings are also found by its device id.
+- The response and `verify` have `session_files: {uploads_before,
+  uploads_after, error}`. An object store failure fails the request so it can
+  be run again: by device id the recordings' rows are kept (everything else
+  deleted); by player id **nothing** is deleted (the recordings are found
+  through the player's ops events, which must stay until they are gone).
+- A recording committed while its deletion runs: the commit checks the archive
+  is still there after writing its row and deletes the row if not (no index
+  row of a deleted recording is left). As for every table (APM-14), an upload
+  started after the deletion is not deleted: verify, run it again.
+- A deployment without the object store configured cannot delete recordings:
+  the response says so (`note`), and a device that has recordings fails with
+  `apm_session_files: kept: this server has no object store configured`.
+  Run deletions on a deployment with `OZX_S3_*` (both apps should have it).
+- On the device: technical `Denied` and `ResetDeviceId()` delete the queued
+  copies (zip, parts, state); the recording directories are the game's.
+
+### SDK
+
+`ApmSessionFiles.Upload(directory, options)` (README has the calls). Design:
+
+- **Release builds**: the uploader is created only under `#if UNITY_EDITOR ||
+  DEVELOPMENT_BUILD`; `Upload` returns null in a release player before
+  touching anything. Where it is compiled in, `Initialize` creates it only
+  when the engine reports the Editor or a Development Build (`Application.isEditor
+  || Debug.isDebugBuild`) **and** the SDK's build type is `dev` or `editor`
+  (`ApmConfig.BuildType = Release` disables it; `Dev` in a release player
+  cannot enable it), uploads are enabled (`UploadInEditor` in the Editor) and
+  `EnableSessionFileUpload` (on). Tests: the gate in every combination; on
+  Unity's Mono compiled as a release player (no `UNITY_EDITOR`, no
+  `DEVELOPMENT_BUILD`) `Upload` returns null, `GetUploads` is empty,
+  `IsAvailable` false; in EditMode with the engine answering "release player"
+  (Auto, Dev and Release build types) no uploader, no thread, no directory, no
+  request.
+- **Queue**: `<persistentDataPath>/ozx_apm_sessionfiles/`: per upload
+  `<id>.state` (key=value lines, rewritten atomically after every step),
+  `<id>.zip`, `<id>.session.json` (a copy, so the create request works after
+  AiTelemetry's retention deleted the directory), `<id>.part` (the part being
+  sent). A launch resumes what the state files describe and deletes files
+  without one. Limits: `MaxSessionFileStorageBytes` 512 MB of zips (a
+  recording waits for space; one larger than that is dropped),
+  `MaxPendingSessionFiles` 10 (`Upload` refuses more), `SessionFileMaxAgeDays`
+  14.
+- File names the server would refuse (`:`, `\`, over 512 bytes) fail the
+  upload before anything is sent. A session.json over 64 KB is not sent (the
+  index then has no summary; the recording keeps it).
+- **Thread**: one background thread `OzxApm.SessionFiles` (below normal
+  priority) zips, hashes, prepares parts and runs the protocol; it sleeps when
+  there is nothing to do. Zipping: the directory's regular files (no links, no
+  hidden files), sorted, under `<directory name>/`, Deflate (`Fastest`; Stored
+  where the runtime has no zlib), UTF-8 names, data descriptors (written in
+  one pass), SHA-256 computed while writing, 64 KB buffers; the directory is
+  snapshotted (names, sizes, times) before and after: if it changed (the
+  session is still being written), the zip is discarded and retried 10 s later,
+  and after 3 tries the upload is dropped ("upload it after AiTelemetry ended
+  the session").
+- **Main thread**: `ApmClient.Update` calls the uploader's `Update`: a field
+  read when nothing is posted; reachability once a second while an upload is
+  queued; a posted request is started (`UnityWebRequest`, the part sent from
+  its file with `UploadHandlerFile`: no managed copy of the part) only while
+  the event and ops uploaders are not sending (held at most 30 s), then polled.
+  Session file requests never delay the event and ops uploads.
+- **Network**: Wi-Fi/LAN only by default (`SessionFilesWifiOnly`), paced to
+  `SessionFilesBytesPerSecond` (512 KB/s) on average, parts of
+  `SessionFilePartBytes` (512 KB), no request while the app is paused.
+- **Consent**: technical consent `Granted` to send; `Undecided` queues and
+  keeps (sent once granted); `Denied` refuses `Upload`, aborts the request
+  under way and deletes the queue (also at `Initialize`).
+- `ApmClient.GetSessionId()` (new): OZX writes it into session.json as
+  `apmSessionId` when a recording starts; the upload's `session_id` is
+  `SessionUploadOptions.ApmSessionId`, else that, else the session `Upload`
+  was called in (a recording uploaded at the next launch would then point to
+  the wrong session: write `apmSessionId`).
+- `ApmStats`: `SessionFilesEnabled`, `SessionFilesPending`,
+  `SessionFilesCompleted`, `SessionFilesFailed`, `SessionFileBytesSent`,
+  `SessionFileLastError`.
+- OZX-1281 (what OZX must do): enable recording in development builds; write
+  `apmSessionId` into session.json; inject the upload key in the dev build
+  script; pass the commit (`SessionUploadOptions.GitCommit` or the context key
+  `gitCommit`, APM-10); call `ApmSessionFiles.Upload` after `EndSession` (and at
+  the next launch for directories a kill left, e.g. the newest one not marked
+  uploaded); keep AiTelemetry's retention (20 sessions) above the number of
+  recordings a tester makes offline.
+
+### Configuration and secrets (apps 36 and 38)
+
+Set on **both** apps (both run the admin server, privacy deletion and the
+cleaner; app 36 also the ingest server that receives uploads):
+
+| Variable | Value | Secret |
+|---|---|---|
+| `OZX_S3_ENDPOINT` | `http://192.168.0.192:18333` | no |
+| `OZX_S3_BUCKET` | `ozx-apm-sessions` | no |
+| `OZX_S3_REGION` | `us-east-1` (default) | no |
+| `OZX_S3_ACCESS_KEY` | the bucket-scoped key | **yes** |
+| `OZX_S3_SECRET_KEY` | its secret | **yes** |
+| `OZX_SESSION_FILES_UPLOAD_KEY` | e.g. `openssl rand -hex 32`; the same value goes into OZX's dev build script | **yes** (app 36; app 38 does not receive uploads) |
+| `OZX_ADMIN_SESSIONFILES_TOKEN` | e.g. `openssl rand -hex 32`, the same on both apps (links work across them) | **yes** |
+
+Optional: `OZX_S3_PREFIX` (`session-files/`), `OZX_SESSION_FILES_RETENTION_DAYS`
+(30), `OZX_SESSION_FILES_INCOMPLETE_DAYS` (7),
+`OZX_SESSION_FILES_MAX_ARCHIVE_BYTES` (536870912),
+`OZX_SESSION_FILES_MAX_UPLOADS_PER_DEVICE_PER_DAY` (100),
+`OZX_SESSION_FILES_MAX_BYTES_PER_DEVICE_PER_DAY` (4294967296),
+`OZX_SESSION_FILES_MAX_OPEN_UPLOADS_PER_DEVICE` (4),
+`OZX_SESSION_FILES_CLEANER_INTERVAL` (`1h`; `0` disables the cleaner in that
+process). Pods need no volume (nothing is stored locally). Check after deploy:
+the start-up log has `session files enabled` with the endpoint, bucket,
+`upload_key_set` (true on app 36) and `admin_token_set` true; `curl
+http://<admin>/api/session-files` answers 401 (not 403/503), with the token 200.
+
+Ingress / proxy in front of the ingest server: request bodies up to 4 MiB
+(the SDK sends 512 KB: the 1 MB nginx default is enough) and 2.5 min for a
+part, 5 min for a commit.
+
+### Cost
+
+SDK, Unity's Mono outside Unity (M-series Mac, `/tmp/claude-501/apm13/bench`):
+
+| Path | Time | Allocated |
+|---|---|---|
+| `Update` per frame, uploader idle | 0.01 us | 0 (1M calls: 40 B, the bench's own) |
+| Zipping + SHA-256 of a 50 MB session directory (worker thread) | 0.49 s (100 MB/s; 12.7 MB zip, 24 %) | ~0.22-0.33 MB per archive, independent of its size (5 MB: the same) |
+| `Upload` call (main thread) | a few objects and a lock; no IO | ~1 KB |
+
+- Memory: the 64 KB buffer, the deflater's state, FileStream buffers and the
+  central directory entries (~100 B per file) while zipping; one part file on
+  disk; nothing proportional to the archive in memory. Disk: the zip (here
+  24 % of the directory) until uploaded.
+- Main thread while uploading: per part one request start (`UnityWebRequest`
+  with an `UploadHandlerFile`), a poll per frame, one completion; a part every
+  ~1 s at the default rate. Not measured on a device yet (device plan, step 6).
+- Server: per part one S3 PUT (and a ClickHouse read per minute per upload:
+  the row is cached), per commit a list, the parts read back, 1 + N/8MiB
+  writes, a few ranged reads of the central directory, one insert. The cleaner:
+  one query and the deletions per hour, a bucket listing per day.
+
+### Rolling deploy and rollback
+
+Old and new binaries serve side by side: the old one has no session file
+routes (the SDK gets 404 and keeps the recordings) and ignores the table and
+the bucket. **Rollback:** redeploy the previous server and admin UI; no
+schema action; the table and the bucket keep their content (uploads are then
+refused, recordings expire only while a new binary's cleaner runs: delete the
+prefix by hand after a permanent rollback, and `DROP TABLE
+ozx_apm.apm_session_files`). SDK: a build without this change ignores
+`ozx_apm_sessionfiles/` (a later build resumes it). Removing the env vars
+disables the feature (uploads 503, kept on the devices; list 503/403).
+
+### Verification for the lead
+
+```bash
+cd server
+# Unit (no ClickHouse, no S3):
+go vet ./... && GOCACHE=$TMPDIR/gocache go test -race -short ./...
+# with OZX's ai_trace.py on the SDK-written fixture:
+OZX_AI_TRACE=/Users/andrew/Codes/github.com/warriorguo/ozx_base/scripts/ai_trace.py go test ./internal/sessionfiles -run SDKArchive -v
+# Integration, per ClickHouse version, with the local SeaweedFS S3 (any key works there):
+for p in 19026 19024 19023; do
+  OZX_TEST_CH_PORT=$p OZX_TEST_S3_ENDPOINT=http://127.0.0.1:19533 OZX_TEST_S3_BUCKET=ozx-apm-test \
+  OZX_AI_TRACE=/Users/andrew/Codes/github.com/warriorguo/ozx_base/scripts/ai_trace.py \
+  go test ./tests/integration/ -count=1 2>&1 | tail -5
+done
+```
+
+`tests/integration/apm13_test.go`: `TestAPM13_IndexQueries` (ClickHouse only:
+every index query, the version order, the ALTER DELETE, the table found by
+privacy deletion), `TestAPM13_UploadListDownload` and
+`TestAPM13_ResumeExpiryAndPrivacy` (skip without `OZX_TEST_S3_ENDPOINT`: a 20
+MB recording through two replicas, S3 multipart, list by commit, link and
+download across replicas, unzipped and compared file by file, ai_trace.py on
+it; resume; deletion by device and by player; expiry by two replicas). The
+bucket is created if missing; objects go under a unique prefix and are
+deleted after the test. `privacy_test.go` now expects `apm_session_files`
+among the device tables.
+
+SDK: EditMode (`SessionFileClientTests` need the Unity runtime: the run-time
+gate through `ApmClient`, an upload in the Editor, consent, reset, no
+allocation per frame), `SessionFileTests.cs` (`SessionArchiveTests`,
+`SessionFileUploaderTests`, `SessionFileGateTests`) also run on Unity's Mono.
+Device: `/tmp/claude-501/apm13/DEVICE_PLAN.md`.
+
+### Verified
+
+- Server: `go vet ./...`, `go test -race -short ./...` (all packages pass; 42
+  new tests): SigV4 against AWS's four example signatures, URI and query
+  canonicalization; the S3 client against an in-memory S3 that checks every
+  signature independently and the payload hash (round trip, ranged reads also
+  from a store that ignores Range, listing pages, multipart incl. S3's 5 MiB
+  rule, retries, no retry of create-multipart, wrong secret, streamed GET past
+  the timeout); the protocol (small and 19 MB archives, S3 multipart, resume
+  after a restart, missing parts, every validation and refusal, conflicts,
+  per-device limits, part errors, store errors, checksum mismatch, 12 kinds of
+  bad archives incl. zip slip, symlinks, a local header naming another file,
+  assembly failure aborting the multipart upload, a commit outliving its
+  request, an upload deleted during its commit); expiry (abandoned, expired,
+  store failure keeps the row, a second replica), the bucket sweep (orphans,
+  foreign keys untouched, open multipart uploads), privacy purge by device and
+  by player; both routers end to end (keys, release refusal, 409 missing,
+  list by commit, no storage keys in the list, availability without token,
+  download by token and by signed link, tampered links, not configured);
+  the admin handler (tokens, expired and foreign links, 409/410/404/400/503);
+  privacy with recordings (objects before rows, failures keep what is needed,
+  no object store, verify); config; schema (migrate.sql regenerated).
+- **The SDK's own archive** (`internal/sessionfiles/testdata/sdk_session_apm13.zip`,
+  written by `SessionArchive` on Unity's Mono with zlib): Go reads it (CRC of
+  every entry), the validator accepts it, it uploads, and **ai_trace.py reads the
+  unzipped directory**: `PLAYER DEATHS` 1 (t 30.0833, quick_sand_worm,
+  f0_room_1_0), 0 anomalies (`OZX_AI_TRACE=... go test ./internal/sessionfiles -run SDKArchive`).
+- SDK: compiles at C# 8 (Android; iOS; with `UNITY_2021_2_OR_NEWER` and
+  `DEVELOPMENT_BUILD`; with `UNITY_EDITOR`); on Unity's Mono outside Unity all
+  runtime tests pass except the known environment failure
+  (`JsonSerializerTests` needs JSONSerializeModule) and the fixture writer
+  (ignored without its variable): 353 pass, 27 new (`SessionArchiveTests` 6,
+  `SessionFileUploaderTests` 19, `SessionFileGateTests` 2, the release-player
+  test included: this harness compiles without `UNITY_EDITOR` and
+  `DEVELOPMENT_BUILD`); the gate tests also with `DEVELOPMENT_BUILD`. Archive
+  contents checked against `ZipArchive` (Deflate and Stored), the uploader
+  against an in-process server (parts, resume after a kill: each part sent
+  once, offline, Wi-Fi only, retries, reject codes, 404 recreate with backoff,
+  missing parts, consent, the hold behind the event uploader, too old, pending
+  limit, the main-thread handoff never throwing).
+- Admin UI: `tsc`, vitest 197 (16 new: the API module, the page: token
+  prompt, list, filters in the URL, download through the link, 401 asks
+  again; the recording links, batched), `vite build`.
+- A code review (another agent) found 14 problems, all fixed with tests where
+  testable: downloads cut at 60 s by the store client's timeout, a commit
+  restarting whenever its client gave up, a privacy deletion racing a commit
+  leaving an index row, archives checked on the central directory only, a
+  failed purge by player id deleting the ops events that locate the
+  recordings, an oversized session.json dropping the recording, the
+  metadata cache holding session.json, a store ignoring Range failing valid
+  uploads, query parameters sorted as "k=v", expiry skipping objects of an
+  earlier prefix; in the SDK a disposed wait handle that could throw out of
+  consent Denied and Shutdown (now neither the handle is disposed nor can the
+  uploader's exceptions escape those paths), a 404 on create retried without
+  backoff, file names the server refuses uploaded first. Accepted as
+  documented: part slots held while a slow body arrives; parts accepted for up
+  to a minute (cache) after an upload was deleted (orphans removed by the sweep).
+- Cost on Unity's Mono (bench above). Driver for the device:
+  `/tmp/claude-501/apm13/ApmTestDriver.cs` (compile-checked), plan and script
+  `/tmp/claude-501/apm13/DEVICE_PLAN.md`, `t13.sh`.
+
+### Not verified (for the lead)
+
+- The integration tests (`tests/integration/apm13_test.go`) on ClickHouse
+  26.1/24.1/23.8 and against SeaweedFS 4.48 (no ClickHouse or S3 reachable
+  from the sandbox): the SigV4 client has met AWS's documented signatures and a
+  fake, not a real store; the SQL (`FINAL`, `IN ?`, `startsWith(lower(...))`,
+  the DateTime comparisons, the ALTER DELETE) has not met a server.
+  `privacy_test.go`'s expected table count changed (+1, `apm_session_files`).
+- SeaweedFS specifics: multipart complete, `start-after`, `ListMultipartUploads`
+  (`?uploads&prefix`; if the bucket-scoped key may not list multipart uploads,
+  the sweep logs a warning and skips that step), ranged GETs, error XML.
+- Unity EditMode (`SessionFileClientTests`: the run-time gate through
+  `ApmClient`, the Editor upload, consent, reset, no allocation per frame).
+- The device (`DEVICE_PLAN.md`): both acceptance runs, the release no-op on a
+  real release build, kill and resume, the cost while uploading, `DeflateStream`
+  and `UploadHandlerFile` under IL2CPP on Android, zipping speed on the A33.
+- The admin page in a real browser (jsdom only), the nginx proxy of app 38 with
+  a large download, the deployments (secrets, the bucket-scoped key's
+  permissions), OZX-1281's side (recording in dev builds, `apmSessionId`, the
+  dev build script injecting the key), verify-ticket on a downloaded recording
+  (its inputs are the files ai_trace.py read), iOS.

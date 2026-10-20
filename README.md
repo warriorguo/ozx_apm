@@ -268,6 +268,51 @@ ApmClient.Event("loot.drop").Str("item", item).Str("src", "enemy").Bool("pin", f
   only counted and are not in the channel files. Details, the line format and
   what OZX must send: `server/RELEASE.md` (APM-10).
 
+### Session files of development builds (APM-13, for OZX-1281 and verify-ticket)
+
+A development build uploads its AiTelemetry recordings (OZX's
+`SessionFolder/<session>/`: `session.json`, `level*.json`, the channel JSONL
+files, the `room<NN>_<roomId>/` directories) so that verify-ticket can check
+phone-only issues; a download from the admin is a zip of exactly that directory.
+
+```csharp
+var config = new ApmConfig { /* ... */ };
+#if DEVELOPMENT_BUILD
+config.SessionFilesUploadKey = BuildSecrets.ApmSessionFilesKey; // OZX_SESSION_FILES_UPLOAD_KEY, injected by the dev build script
+#endif
+ApmClient.Initialize(config);
+
+// When AiTelemetry starts a recording: tie it to the APM session (the admin links them).
+//   session.json += "apmSessionId": ApmClient.GetSessionId()
+// After AiTelemetry.EndSession() (or at the next launch for a recording a kill cut short):
+string uploadId = ApmSessionFiles.Upload(sessionDirectory,
+    new SessionUploadOptions { GitCommit = BuildInfo.GitCommit });  // null when not possible (logged)
+foreach (var u in ApmSessionFiles.GetUploads()) Debug.Log(u);       // Queued / Packed / Uploading / Done / Failed
+```
+
+- **Development and editor builds only.** In a release player the uploader is
+  compiled out (`#if UNITY_EDITOR || DEVELOPMENT_BUILD`) and `Upload` returns
+  null: no thread, no file, no request. At run time it also needs the engine to
+  report the Editor or a Development Build and the build type `dev`/`editor`
+  (`ApmConfig.BuildType = Dev` in a release player does not enable it); the
+  server refuses any other build type.
+- Call it once the directory is complete: the SDK zips a copy on a background
+  thread and gives up (after 3 tries) if the directory keeps changing. It never
+  changes or deletes the directory (AiTelemetry's own retention does).
+- Reliable like the event queue: the zip and its state wait on disk
+  (`<persistentDataPath>/ozx_apm_sessionfiles/`, at most
+  `MaxSessionFileStorageBytes` 512 MB, `MaxPendingSessionFiles` 10, dropped
+  after `SessionFileMaxAgeDays` 14), are sent in 512 KB parts when online,
+  resume after a kill or a lost network (the server says which parts it has),
+  and wait while the event and ops uploaders are sending. Defaults: Wi-Fi only
+  (`SessionFilesWifiOnly`), 512 KB/s (`SessionFilesBytesPerSecond`).
+- Needs technical consent; `Denied` and `ResetDeviceId` delete the queued copies.
+- The player cannot read `.git`: pass the commit (`SessionUploadOptions.GitCommit`,
+  else the game context key `gitCommit`, else session.json's `gitCommit`).
+- Find and download: the admin's **Session files** page (filter by git commit,
+  build, device, time; token `OZX_ADMIN_SESSIONFILES_TOKEN`), or the API below.
+  Design, protocol, limits, auth: `server/RELEASE.md` (APM-13).
+
 ### Privacy consent
 
 Two categories, each `Undecided`, `Granted` or `Denied`: `Technical`
@@ -557,6 +602,27 @@ no row in it). One export at a time; limits and format: `server/RELEASE.md`.
 curl -o session.zip "http://localhost:8081/api/sessions/export?session_id=$SESSION_ID"
 unzip session.zip -d /tmp/s && python3 scripts/ai_trace.py /tmp/s/*/
 ```
+
+### Session files (APM-13)
+
+Upload (ingest server, SDK): `POST /v1/session-files`, `PUT
+/v1/session-files/{id}/parts/{n}`, `POST /v1/session-files/{id}/commit`, with
+`X-Apm-Upload-Key` (`OZX_SESSION_FILES_UPLOAD_KEY`). Retrieval (admin server,
+`Authorization: Bearer $OZX_ADMIN_SESSIONFILES_TOKEN`):
+
+```bash
+H="Authorization: Bearer $OZX_ADMIN_SESSIONFILES_TOKEN"
+# by git commit (prefix, at least 4 characters), newest first:
+curl -sS -H "$H" "http://<admin>/api/session-files?git_commit=6116e2e" | jq '.session_files[] | {upload_id, recording_name, git_commit, app_version, app_build, device_model, created_at, size_bytes}'
+# other filters: build, app_version, build_type, device_id, session_id, recording, status (complete|uploading|failed|all), start_time, end_time, limit
+curl -sS -H "$H" -o rec.zip "http://<admin>/api/session-files/download?upload_id=$UPLOAD_ID"
+mkdir -p /tmp/rec && unzip -q rec.zip -d /tmp/rec        # -> /tmp/rec/<session>/session.json, *.jsonl, room*/
+python3 scripts/ai_trace.py /tmp/rec/<session>           # in the OZX repo
+```
+
+- **GET /api/session-files/detail?upload_id=** - one upload with its session.json (token)
+- **POST /api/session-files/link** `{"upload_id":"..."}` - a download URL valid 5 minutes (token; what the admin UI uses)
+- **GET /api/session-files/available?session_id=..** - which sessions have a recording (no token: ids, sizes, times)
 
 ## Event Types
 
