@@ -323,9 +323,11 @@ namespace OzxApm.Tests
         [Test]
         public void InactiveEvent_DoesNotAllocate()
         {
-            ApmClient.Event("warmup").Str("a", "b").Send();
-            Assert.That(() => { ApmClient.Event("x").Str("a", "b").Num("n", 1.5).Vec("p", 1, 2).Bool("b", true).Send(); },
-                Is.Not.AllocatingGCMemory());
+            // Run once before measuring: the first run of a method creates its
+            // string literals ("x", "a", ...), which the runtime counts.
+            TestDelegate send = () => { ApmClient.Event("x").Str("a", "b").Num("n", 1.5).Vec("p", 1, 2).Bool("b", true).Send(); };
+            send();
+            Assert.That(send, Is.Not.AllocatingGCMemory());
         }
 
         [Test]
