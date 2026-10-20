@@ -11,6 +11,7 @@ import (
 
 	"go.uber.org/zap"
 
+	"github.com/warriorguo/ozx_apm/server/internal/config"
 	"github.com/warriorguo/ozx_apm/server/internal/fingerprint"
 	"github.com/warriorguo/ozx_apm/server/internal/models"
 	"github.com/warriorguo/ozx_apm/server/internal/processor"
@@ -66,21 +67,50 @@ type IngestHandler struct {
 	// symbols names the native frames of crashes from uploaded symbols for
 	// the fingerprint (APM-7); nil when the store has no symbol tables.
 	symbols *symbols.Symbolizer
+
+	// Ops events (APM-12): nil opsStore when the store has no ops tables.
+	opsStore      OpsStore
+	ops           *processor.OpsNormalizer
+	opsSeen       *opsSeen
+	countryHeader string
+	now           func() time.Time
 }
 
+// NewIngestHandler is NewIngestHandlerWithOps with the default ops
+// configuration (config.DefaultOpsContextKeys, no country header).
 func NewIngestHandler(repo *storage.Repository, logger *zap.Logger) *IngestHandler {
-	return newIngestHandler(repo, logger)
+	return newIngestHandlerOps(repo, logger, config.OpsConfig{})
+}
+
+// NewIngestHandlerWithOps creates the ingest handler with the ops data
+// configuration (APM-12: context whitelist, trusted country header).
+func NewIngestHandlerWithOps(repo *storage.Repository, logger *zap.Logger, ops config.OpsConfig) *IngestHandler {
+	return newIngestHandlerOps(repo, logger, ops)
 }
 
 func newIngestHandler(repo EventStore, logger *zap.Logger) *IngestHandler {
+	return newIngestHandlerOps(repo, logger, config.OpsConfig{})
+}
+
+func newIngestHandlerOps(repo EventStore, logger *zap.Logger, ops config.OpsConfig) *IngestHandler {
 	h := &IngestHandler{
-		repo:      repo,
-		validator: processor.NewValidator(),
-		enricher:  processor.NewEnricher(),
-		logger:    logger,
+		repo:          repo,
+		validator:     processor.NewValidator(),
+		enricher:      processor.NewEnricher(),
+		logger:        logger,
+		ops:           processor.NewOpsNormalizer(ops.OpsContextKeys()),
+		opsSeen:       newOpsSeen(),
+		countryHeader: strings.TrimSpace(ops.CountryHeader),
+		now:           ops.Now,
+	}
+	if h.now == nil {
+		h.now = time.Now
 	}
 	if st, ok := repo.(symbols.Store); ok {
 		h.symbols = symbols.NewSymbolizer(st, crashSymbolCacheSize)
+	}
+	if st, ok := repo.(OpsStore); ok {
+		h.opsStore = st
 	}
 	return h
 }
@@ -168,6 +198,9 @@ type EventWrapper struct {
 	Type      string `json:"type"`
 	Timestamp int64  `json:"timestamp"` // Unix milliseconds
 	EventID   string `json:"event_id"`  // set by SDKs that can de-duplicate retries
+	// Ops: a custom event of the SDK's ops queue (APM-12), stored in
+	// ops_events only.
+	Ops models.LenientBool `json:"ops"`
 }
 
 // IngestResponse tells the client what happened to the batch.
@@ -251,6 +284,8 @@ func (h *IngestHandler) IngestEvents(w http.ResponseWriter, r *http.Request) {
 		customs     []models.CustomEvent
 		metricRows  []models.CustomMetric
 		runs        []models.Run
+		opsEvents   []models.OpsEvent
+		opsStats    processor.ContextStats
 		errors      []string
 		rejected    int
 		hasEventIDs bool
@@ -281,6 +316,13 @@ func (h *IngestHandler) IngestEvents(w http.ResponseWriter, r *http.Request) {
 		clientIP   = r.RemoteAddr // In production, extract from X-Forwarded-For
 	)
 	defer symBudget.close()
+	// APM-12: the receive time of ops events, and the country a trusted
+	// proxy reported for this request (ops.country_header).
+	received := h.now()
+	headerCountry := ""
+	if h.countryHeader != "" {
+		headerCountry = r.Header.Get(h.countryHeader)
+	}
 	if salvaged {
 		addError("batch was not valid JSON; salvaged the well-formed events")
 	}
@@ -409,6 +451,27 @@ func (h *IngestHandler) IngestEvents(w http.ResponseWriter, r *http.Request) {
 			crashes = append(crashes, event)
 
 		case models.EventTypeCustomEvent:
+			if wrapper.Ops {
+				// APM-12: an ops event, stored in ops_events only.
+				if h.opsStore == nil {
+					reject(i, "ops events are not supported by this store")
+					continue
+				}
+				var event models.OpsEvent
+				if err := json.Unmarshal(rawEvent, &event); err != nil {
+					reject(i, "invalid fields")
+					continue
+				}
+				event.ClientTime = time.UnixMilli(wrapper.Timestamp)
+				stats, err := h.ops.Normalize(&event, received, headerCountry)
+				opsStats.Add(stats)
+				if err != nil {
+					reject(i, err.Error())
+					continue
+				}
+				opsEvents = append(opsEvents, event)
+				continue
+			}
 			var event models.CustomEvent
 			if err := json.Unmarshal(rawEvent, &event); err != nil {
 				reject(i, "invalid fields")
@@ -487,6 +550,10 @@ func (h *IngestHandler) IngestEvents(w http.ResponseWriter, r *http.Request) {
 		addError("props: " + strconv.Itoa(propStats.Dropped) + " entries dropped, " +
 			strconv.Itoa(propStats.Truncated) + " values truncated (the context's limits)")
 	}
+	if opsStats.Dropped > 0 || opsStats.Truncated > 0 {
+		addError("ops events: " + strconv.Itoa(opsStats.Dropped) + " property or context entries dropped, " +
+			strconv.Itoa(opsStats.Truncated) + " values truncated (the context's limits)")
+	}
 
 	// Drop events that are already stored or repeated in this batch (APM-19).
 	ctx := r.Context()
@@ -526,6 +593,13 @@ func (h *IngestHandler) IngestEvents(w http.ResponseWriter, r *http.Request) {
 	runs, d = dedupe(ctx, h.repo, h.logger, storage.TableRuns, runs,
 		func(e *models.Run) eventKey { return eventKey{e.EventID, e.AppVersion, e.EndReason, e.Timestamp} })
 	add(d)
+	// APM-12: every valid ops event of the request feeds the derived rows
+	// (idempotent), the new ones go to ops_events.
+	opsValid := opsEvents
+	opsEvents, d = dedupe(ctx, h.repo, h.logger, storage.TableOpsEvents, opsEvents,
+		func(e *models.OpsEvent) eventKey { return eventKey{e.EventID, e.AppVersion, e.Name, e.ClientTime} })
+	add(d)
+	opsDups := d
 	if dups.total() > 0 {
 		h.logger.Info("dropped duplicate events",
 			zap.Int("duplicates", dups.total()),
@@ -576,6 +650,32 @@ func (h *IngestHandler) IngestEvents(w http.ResponseWriter, r *http.Request) {
 	insert("custom events", len(customs), func() error { return h.repo.InsertCustomEvents(ctx, customs) })
 	insert("custom metrics", len(metricRows), func() error { return h.repo.InsertCustomMetrics(ctx, metricRows) })
 	insert("runs", len(runs), func() error { return h.repo.InsertRuns(ctx, runs) })
+	if len(opsValid) > 0 {
+		// APM-12: the new events, then the derived rows of all of them. If
+		// the rows fail, the request's ops events count as failed (the SDK
+		// resends; the events are then duplicates and the rows are written).
+		before := failed
+		insert("ops events", len(opsEvents), func() error { return h.opsStore.InsertOpsEvents(ctx, opsEvents) })
+		if failed == before {
+			days, players, commit := h.opsSeen.opsRows(opsValid)
+			err := h.insertWithRetry(ctx, func() error { return h.opsStore.InsertOpsPlayerDays(ctx, days) })
+			if err == nil {
+				err = h.insertWithRetry(ctx, func() error { return h.opsStore.InsertOpsPlayers(ctx, players) })
+			}
+			if err != nil {
+				h.logger.Error("failed to insert ops player rows", zap.Error(err), zap.Int("count", len(opsValid)), zap.String("sdk_version", sdkVersion))
+				addError("storage error: ops players")
+				// Every ops event of the request was counted as accepted
+				// (inserted, or a duplicate): none of them is.
+				accepted -= len(opsValid)
+				failed += len(opsValid)
+				dups.inBatch -= opsDups.inBatch
+				dups.stored -= opsDups.stored
+			} else {
+				h.opsSeen.remember(commit)
+			}
+		}
+	}
 
 	if moreErrors > 0 {
 		errors = append(errors, "... and "+strconv.Itoa(moreErrors)+" more")
@@ -614,6 +714,7 @@ func (h *IngestHandler) IngestEvents(w http.ResponseWriter, r *http.Request) {
 		zap.Int("dedup_lookup_failed", dups.lookupFailed),
 		zap.Int("rejected", rejected),
 		zap.Int("failed", failed),
+		zap.Int("ops_events", len(opsValid)),
 		zap.Int("ctx_dropped", ctxStats.Dropped),
 		zap.Int("ctx_truncated", ctxStats.Truncated),
 		zap.Any("rejected_types", rejTypes),

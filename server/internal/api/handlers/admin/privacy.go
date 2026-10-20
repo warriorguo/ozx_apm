@@ -140,10 +140,7 @@ func parsePrivacyRequest(r *http.Request) (models.PrivacyRequest, string, error)
 	}
 	column, ok := models.PrivacyIDTypes[req.IDType]
 	if !ok {
-		if req.IDType == "player_id" {
-			return req, "", errors.New("id_type player_id: no player id is stored yet (APM-12); use device_id")
-		}
-		return req, "", fmt.Errorf("unknown id_type %q (supported: device_id)", req.IDType)
+		return req, "", fmt.Errorf("unknown id_type %q (supported: device_id, player_id)", req.IDType)
 	}
 	if strings.TrimSpace(req.ID) == "" {
 		return req, "", errors.New("id is required")

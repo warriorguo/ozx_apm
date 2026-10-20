@@ -9,11 +9,13 @@ import (
 // Privacy deletion (APM-14): delete every stored row of one data subject.
 
 // PrivacyIDTypes maps the id types the deletion API accepts to the column
-// that holds them. Only device_id exists today; APM-12 adds "player_id"
-// (column player_id in ops_events) here and nothing else has to change:
-// the tables are found by column name (storage.PrivacyTables).
+// that holds them: device_id (the technical tables, APM-14) and player_id
+// (the ops tables ops_events, ops_player_days and ops_players, APM-12; the
+// SDK's ApmClient.GetPlayerId). The tables are found by column name
+// (storage.PrivacyTables). A player's data is under both ids: delete both.
 var PrivacyIDTypes = map[string]string{
 	"device_id": "device_id",
+	"player_id": "player_id",
 }
 
 // MaxPrivacyIDLength bounds the id in a deletion request. SDK device ids are

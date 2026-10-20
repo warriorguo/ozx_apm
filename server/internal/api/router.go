@@ -42,7 +42,7 @@ func NewRouter(cfg *config.Config, repo *storage.Repository, logger *zap.Logger)
 		}
 
 		// Ingest handler
-		ingestHandler := handlers.NewIngestHandler(repo, logger)
+		ingestHandler := handlers.NewIngestHandlerWithOps(repo, logger, cfg.Ops)
 		r.Post("/events", ingestHandler.IngestEvents)
 
 		// Query handlers

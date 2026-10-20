@@ -41,10 +41,36 @@ func newFakeStore() *fakePrivacyStore {
 }
 
 func (f *fakePrivacyStore) PrivacyTables(ctx context.Context, column string) ([]string, error) {
-	if column != "device_id" {
-		return nil, fmt.Errorf("column %s", column)
+	switch column {
+	case "device_id":
+		return []string{"apm_crashes", "apm_janks", "apm_perf_samples"}, nil
+	case "player_id": // APM-12
+		return []string{"ops_events", "ops_player_days", "ops_players"}, nil
 	}
-	return []string{"apm_crashes", "apm_janks", "apm_perf_samples"}, nil
+	return nil, fmt.Errorf("column %s", column)
+}
+
+// APM-12: id_type player_id deletes from the tables with a player_id column.
+func TestPrivacyDelete_PlayerID(t *testing.T) {
+	store := newFakeStore()
+	store.rows["ops_events"] = map[string]uint64{"p-1": 7, "p-2": 1}
+	store.rows["ops_player_days"] = map[string]uint64{"p-1": 2}
+	store.rows["ops_players"] = map[string]uint64{"p-1": 1}
+	h := NewPrivacyHandler(store, zap.NewNop(), testToken)
+	w := postPrivacy(h.Delete, `{"id_type":"player_id","id":"p-1"}`, "p-1")
+	if w.Code != http.StatusOK {
+		t.Fatalf("%d %s", w.Code, w.Body.String())
+	}
+	d := decodeDeletion(t, w)
+	if d.Status != "done" || d.IDType != "player_id" || d.RowsDeleted != 10 || len(d.Tables) != 3 || d.Tables[0].Table != "ops_events" {
+		t.Errorf("%+v", d)
+	}
+	if store.rows["ops_events"]["p-2"] != 1 || store.rows["apm_crashes"]["dev-a"] != 2 {
+		t.Error("other players and the technical tables must be untouched")
+	}
+	if strings.Contains(w.Body.String(), "p-1") || store.audit[0].IDType != "player_id" {
+		t.Errorf("the id must not be echoed; audit %+v", store.audit)
+	}
 }
 
 func (f *fakePrivacyStore) CountPrivacyRows(ctx context.Context, table, column, id string) (uint64, error) {
@@ -167,7 +193,7 @@ func TestPrivacyDelete_ValidatesTheRequest(t *testing.T) {
 		`not json`:                                  "JSON",
 		`{"id":""}`:                                 "id is required",
 		`{"id":"  "}`:                               "id is required",
-		`{"id_type":"player_id","id":"p"}`:          "APM-12",
+		`{"id_type":"player_id","id":""}`:           "id is required",
 		`{"id_type":"email","id":"x"}`:              "unknown id_type",
 		`{"id":"a\u0000b"}`:                         "control",
 		`{"id":"` + strings.Repeat("x", 300) + `"}`: "longer",
