@@ -59,6 +59,8 @@ export async function getSummary(params: FilterParams): Promise<DashboardSummary
       total_sessions: 0,
       total_events: 0,
       crash_count: 0,
+      crashed_sessions: 0,
+      crashed_session_rate: 0,
       crash_rate: 0,
       exception_count: 0,
       jank_count: 0,

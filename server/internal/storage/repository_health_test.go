@@ -103,6 +103,43 @@ func TestSessionHealthQuery_UserKills(t *testing.T) {
 	}
 }
 
+// APM-22: the dashboard counts sessions and crashed sessions from the
+// session health's rows with its defaults (every session table, the
+// default crash types, kills by the player left out), per version.
+func TestDashboardVersionsQuery_IsTheHealthDefinition(t *testing.T) {
+	q, args := dashboardVersionsQuery(evilFilter())
+	checkBound(t, "dashboard", q, args)
+	inner, innerArgs := sessionHealthRows(evilFilter(), "app_version", nil, HealthOptions{})
+	if !strings.Contains(q, inner) || len(args) != len(innerArgs) {
+		t.Errorf("not the health rows:\n%s", q)
+	}
+	parts := len(healthSessionTables) + 2
+	if n := strings.Count(q, "timestamp >= fromUnixTimestamp64Milli(toInt64(?))"); n != parts {
+		t.Errorf("%d parts with the range, want %d", n, parts)
+	}
+	for _, tbl := range append(append([]EventTable{}, healthSessionTables...), TableExceptions, TableCrashes) {
+		if !strings.Contains(q, "FROM "+tbl.Name+" WHERE") {
+			t.Errorf("no part for %s", tbl.Name)
+		}
+	}
+	user := "(crash_type = 'killed' AND exit_reason IN ('USER_REQUESTED', 'USER_STOPPED'))"
+	if !strings.Contains(q, "countIf(crash_type IN ? AND NOT "+user+") > 0) AS crashed") {
+		t.Errorf("kills by the player counted: %s", q)
+	}
+	var set []any
+	for _, a := range args {
+		if s, ok := a.(clickhouse.GroupSet); ok && len(s.Value) > 0 && s.Value[0] == "native" {
+			set = s.Value
+		}
+	}
+	if fmt.Sprint(set) != "[native java oom killed]" {
+		t.Errorf("crash types %v", set)
+	}
+	if !strings.Contains(q, "uniqExactIf(sid, sc = 1)") || !strings.Contains(q, "max(crashed) AS sc") || !strings.Contains(q, "GROUP BY value\n") {
+		t.Errorf("crashed sessions per version: %s", q)
+	}
+}
+
 func TestFillHealthRates(t *testing.T) {
 	row := models.SessionHealthRow{Sessions: 200, Users: 50, CrashedSessions: 3, CrashedUsers: 2, ANRSessions: 1, ExceptionSessions: 40, Exceptions: 90}
 	fillHealthRates(&row)

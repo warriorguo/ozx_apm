@@ -4,10 +4,19 @@ export interface TimeRange {
   end: string
 }
 
+// Crash figures of the dashboard (APM-22). Sessions and crashed sessions
+// are counted as the session health (APM-9) counts them with its defaults.
 export interface VersionStats {
   version: string
   session_count: number
+  // Crash reports of any type (also ANRs, unknown exits, force-stops).
   crash_count: number
+  // Sessions with a crash (native, java, oom, killed; not force-stops).
+  // Absent from a server before APM-22.
+  crashed_sessions?: number
+  // crashed_sessions / session_count: a fraction (0.08 = 8%).
+  crashed_session_rate?: number
+  // Deprecated: crash reports per 1000 sessions (not a fraction).
   crash_rate: number
 }
 
@@ -22,6 +31,9 @@ export interface DashboardSummary {
   total_sessions: number
   total_events: number
   crash_count: number
+  crashed_sessions?: number
+  crashed_session_rate?: number
+  // Deprecated: crash reports per 1000 sessions (not a fraction).
   crash_rate: number
   exception_count: number
   jank_count: number

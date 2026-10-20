@@ -368,3 +368,42 @@ func TestPlatformStats_JSON(t *testing.T) {
 		t.Errorf("expected avg_fps=%f, got %f", stats.AvgFPS, decoded.AvgFPS)
 	}
 }
+
+// APM-22: 2 crashed sessions of 25 is 8% (0.08), not 8000%; the deprecated
+// crash_rate stays crash reports per 1000 sessions.
+func TestCrashRates_Units(t *testing.T) {
+	rate, perThousand := CrashRates(25, 2, 2)
+	if rate != 0.08 || perThousand != 80 {
+		t.Errorf("25 sessions, 2 crashed: rate %v per 1000 %v, want 0.08 80", rate, perThousand)
+	}
+	// Several crash reports in one session: the fraction counts the session once.
+	rate, perThousand = CrashRates(10, 1, 3)
+	if rate != 0.1 || perThousand != 300 {
+		t.Errorf("rate %v per 1000 %v", rate, perThousand)
+	}
+	if rate, perThousand = CrashRates(0, 0, 4); rate != 0 || perThousand != 0 {
+		t.Errorf("no sessions: %v %v", rate, perThousand)
+	}
+	if rate, _ = CrashRates(2, 3, 3); rate != 1 {
+		t.Errorf("never above 1: %v", rate)
+	}
+}
+
+func TestDashboardSummary_CrashFieldNames(t *testing.T) {
+	data, err := json.Marshal(DashboardSummary{CrashedSessions: 2, CrashedSessionRate: 0.08, CrashRate: 80,
+		TopVersions: []VersionStats{{Version: "1.0", CrashedSessions: 2, CrashedSessionRate: 0.08, CrashRate: 80}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]interface{}
+	if err := json.Unmarshal(data, &m); err != nil {
+		t.Fatal(err)
+	}
+	if m["crashed_sessions"] != 2.0 || m["crashed_session_rate"] != 0.08 || m["crash_rate"] != 80.0 {
+		t.Errorf("summary %s", data)
+	}
+	v := m["top_versions"].([]interface{})[0].(map[string]interface{})
+	if v["crashed_sessions"] != 2.0 || v["crashed_session_rate"] != 0.08 || v["crash_rate"] != 80.0 {
+		t.Errorf("version %v", v)
+	}
+}

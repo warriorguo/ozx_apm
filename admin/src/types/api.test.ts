@@ -17,7 +17,9 @@ describe('API Types', () => {
       total_sessions: 1000,
       total_events: 50000,
       crash_count: 10,
-      crash_rate: 0.01,
+      crashed_sessions: 8,
+      crashed_session_rate: 0.008, // a fraction: 0.8% of sessions crashed
+      crash_rate: 10, // deprecated: crash reports per 1000 sessions
       exception_count: 100,
       jank_count: 50,
       avg_fps: 58.5,
@@ -27,7 +29,8 @@ describe('API Types', () => {
     }
 
     expect(summary.total_sessions).toBe(1000)
-    expect(summary.crash_rate).toBe(0.01)
+    expect(summary.crashed_session_rate).toBe(0.008)
+    expect(summary.crash_rate).toBe(10)
   })
 
   it('TimeSeriesResponse type is correctly structured', () => {

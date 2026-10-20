@@ -78,20 +78,50 @@ func (r *Repository) GetDashboardSummary(ctx context.Context, f models.AdminFilt
 
 	whereClause, args := adminWhere(f)
 
-	// Get session count from perf_samples (unique sessions)
-	sessionQuery := fmt.Sprintf(`
-		SELECT toInt64(uniqExact(session_id)) as sessions, toInt64(count()) as events, %s as avg_fps
+	perfQuery := fmt.Sprintf(`
+		SELECT toInt64(count()) as events, %s as avg_fps
 		FROM apm_perf_samples %s
 	`, finiteFloat("avg(fps)"), whereClause)
 
-	if err := r.client.conn.QueryRow(ctx, sessionQuery, args...).Scan(&summary.TotalSessions, &summary.TotalEvents, &summary.AvgFPS); err != nil {
-		return nil, fmt.Errorf("sessions: %w", err)
+	if err := r.client.conn.QueryRow(ctx, perfQuery, args...).Scan(&summary.TotalEvents, &summary.AvgFPS); err != nil {
+		return nil, fmt.Errorf("perf samples: %w", err)
 	}
 
-	crashQuery := fmt.Sprintf(`SELECT toInt64(count()) FROM apm_crashes %s`, whereClause)
-	if err := r.client.conn.QueryRow(ctx, crashQuery, args...).Scan(&summary.CrashCount); err != nil {
+	// Sessions and crashed sessions per version, as the session health
+	// (APM-9) counts them (APM-22: the dashboard counted perf-sample
+	// sessions and every crash report, and called crashes per 1000 sessions
+	// a percentage). A session has one version, so the totals are the sums.
+	versions, err := r.dashboardVersions(ctx, f)
+	if err != nil {
+		return nil, err
+	}
+	crashesByVersion := map[string]int64{}
+	crashQuery := fmt.Sprintf(`SELECT app_version, toInt64(count()) FROM apm_crashes %s GROUP BY app_version LIMIT 10000`, whereClause)
+	err = r.queryRows(ctx, crashQuery, args, func(rows driver.Rows) error {
+		var v string
+		var n int64
+		if err := rows.Scan(&v, &n); err != nil {
+			return err
+		}
+		crashesByVersion[v] = n
+		summary.CrashCount += n
+		return nil
+	})
+	if err != nil {
 		return nil, fmt.Errorf("crash count: %w", err)
 	}
+	for i := range versions {
+		v := &versions[i]
+		summary.TotalSessions += v.SessionCount
+		summary.CrashedSessions += v.CrashedSessions
+		v.CrashCount = crashesByVersion[v.Version]
+		v.CrashedSessionRate, v.CrashRate = models.CrashRates(v.SessionCount, v.CrashedSessions, v.CrashCount)
+	}
+	summary.CrashedSessionRate, summary.CrashRate = models.CrashRates(summary.TotalSessions, summary.CrashedSessions, summary.CrashCount)
+	if len(versions) > dashboardTopVersions {
+		versions = versions[:dashboardTopVersions]
+	}
+	summary.TopVersions = append(summary.TopVersions, versions...)
 
 	excWhere, excArgs := tableWhere(TableExceptions.Name, f)
 	excQuery := fmt.Sprintf(`SELECT toInt64(sum(count)) FROM apm_exceptions %s`, excWhere)
@@ -109,35 +139,7 @@ func (r *Repository) GetDashboardSummary(ctx context.Context, f models.AdminFilt
 		return nil, fmt.Errorf("avg startup: %w", err)
 	}
 
-	// Calculate crash rate
-	if summary.TotalSessions > 0 {
-		summary.CrashRate = float64(summary.CrashCount) / float64(summary.TotalSessions) * 1000
-	}
-
-	// Get top versions
-	versionQuery := fmt.Sprintf(`
-		SELECT
-			app_version,
-			toInt64(uniqExact(session_id)) as session_count
-		FROM apm_perf_samples %s
-		GROUP BY app_version
-		ORDER BY session_count DESC, app_version
-		LIMIT 5
-	`, whereClause)
-
-	err := r.queryRows(ctx, versionQuery, args, func(rows driver.Rows) error {
-		var vs models.VersionStats
-		if err := rows.Scan(&vs.Version, &vs.SessionCount); err != nil {
-			return err
-		}
-		summary.TopVersions = append(summary.TopVersions, vs)
-		return nil
-	})
-	if err != nil {
-		return nil, fmt.Errorf("top versions: %w", err)
-	}
-
-	// Get top platforms
+	// Get top platforms (sessions with perf samples, next to their FPS)
 	platformQuery := fmt.Sprintf(`
 		SELECT
 			platform,
@@ -162,6 +164,44 @@ func (r *Repository) GetDashboardSummary(ctx context.Context, f models.AdminFilt
 	}
 
 	return summary, nil
+}
+
+// dashboardTopVersions is the number of versions the dashboard lists.
+const dashboardTopVersions = 5
+
+// dashboardVersionsQuery counts per version the sessions and the crashed
+// sessions of the session health's rows (sessionHealthRows with its default
+// crash types, kills by the player left out), most sessions first.
+func dashboardVersionsQuery(f models.AdminFilter) (string, []interface{}) {
+	inner, args := sessionHealthRows(f, "app_version", nil, HealthOptions{})
+	return fmt.Sprintf(`SELECT value, toInt64(uniqExact(sid)) AS sessions, toInt64(uniqExactIf(sid, sc = 1))
+		FROM (
+			SELECT value, sid, max(crashed) AS sc
+			FROM (%s)
+			GROUP BY value, sid
+		)
+		GROUP BY value
+		ORDER BY sessions DESC, value
+		LIMIT 10000`, inner), args
+}
+
+// dashboardVersions returns every version's sessions and crashed sessions
+// (the crash counts and rates are left to the caller).
+func (r *Repository) dashboardVersions(ctx context.Context, f models.AdminFilter) ([]models.VersionStats, error) {
+	query, args := dashboardVersionsQuery(f)
+	out := []models.VersionStats{}
+	err := r.queryRows(ctx, query, args, func(rows driver.Rows) error {
+		var vs models.VersionStats
+		if err := rows.Scan(&vs.Version, &vs.SessionCount, &vs.CrashedSessions); err != nil {
+			return err
+		}
+		out = append(out, vs)
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("sessions per version: %w", err)
+	}
+	return out, nil
 }
 
 // GetTimeSeries returns time series data for a metric. interval is one of a

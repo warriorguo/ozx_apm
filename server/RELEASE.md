@@ -4307,3 +4307,105 @@ columns after a permanent rollback (admin; mutations):
 - The export's cost at production volume; the admin link in a browser
   (jsdom only); verify-ticket on an export (it is a skill run by an agent in
   the OZX repo; its inputs are the files above, checked by name and format).
+
+## APM-22: the dashboard's crash rate is a fraction of sessions, counted as the Health page counts it (no schema change)
+
+### The bug
+
+Browser check after APM-5 (n192): 2 crashes in 25 sessions showed "Crash
+Rate 8000.00%" (should be 8%). `GetDashboardSummary` returned `crash_rate`
+= crash reports / sessions x 1000 (per 1000 sessions); the Dashboard's
+`formatPercent` reads a fraction and multiplied by 100; the red threshold
+`> 0.01` was written as a fraction too. Also: `top_versions[].crash_rate`
+and `crash_count` were never filled (always "0.00% crash rate", green),
+and the dashboard's definitions differed from APM-9's session health:
+sessions were only those with perf samples, and every crash report counted
+(ANRs, unknown exits, force-stops by the player, several per session).
+
+### Fix
+
+- **One unit for every rate the admin shows: a fraction 0..1**, formatted
+  as a percentage. The dashboard's figure is now **crashed sessions /
+  sessions**, from the same per-session rows as `GET /api/health/sessions`
+  with its defaults (`sessionHealthRows`, shared; one query per version):
+  a session is any session with a row in the range (perf samples,
+  startups, janks, custom events and metrics, runs, exceptions, crashes);
+  a crashed session has a crash of type `native`, `java`, `oom` or `killed`,
+  not a kill by the player (`USER_REQUESTED`/`USER_STOPPED`); ANRs and
+  `unknown` exits are not crashes. So the dashboard's rate is 1 - the
+  Health page's crash-free sessions under the same filter (the integration
+  test checks it per version; Health splits a version further by build
+  type, so with `build_type=all` compare the sums).
+- The admin: card "Crash Rate (sessions)" = `crashed_session_rate`
+  ("2 of 25 sessions crashed"), red above 1% of sessions crashed
+  (`CRASH_RATE_DANGER = 0.01`, a fraction); per version "x% sessions
+  crashed"; the "Crash Count" card is now "Crash Reports" ("every type,
+  also ANRs and force-stops"); "n/a" against a server without the new
+  field.
+- Checked, unchanged: the Health page (fractions, `formatPercent`), the
+  Funnel's conversions (fractions), the APM-8 crash rate spike alert (a
+  fraction: crashed sessions / sessions, `crash_rate_min_rate` 0.005 =
+  0.5%, the webhook text formats it as a percentage "of sessions
+  crashed"). No other admin page shows a crash rate (Crashes and the crash
+  detail show counts); README documents no summary API.
+
+### API compatibility (`GET /api/summary`)
+
+- New: `crashed_sessions`, `crashed_session_rate` (fraction), on the
+  summary and on every `top_versions[]` row; `top_versions[].crash_count`
+  is now filled (crash reports of the version, any type).
+- `crash_rate` is **kept, deprecated, same unit**: crash reports per 1000
+  sessions (also filled per version now). Not changed in place, so an old
+  admin against the new server still renders (wrongly, as before) instead
+  of silently changing meaning; the admin is the only known consumer (the
+  route is not documented in README), so it can be removed later.
+- Changed meaning: `total_sessions` and `top_versions[].session_count` are
+  now sessions with any row (were: with perf samples), so they agree with
+  the Health page; a session that crashed before its first perf sample now
+  counts. Top versions are ordered by these sessions. `top_platforms[]
+  .session_count` stays sessions with perf samples (it sits next to the
+  platform's FPS); `total_events` stays the number of perf samples.
+- Not aligned on purpose: the APM-8 crash rate spike alert still counts
+  every crash report's session (ANRs, unknown exits and force-stops too),
+  over perf samples, startups and crashes (already noted in APM-9). Its
+  unit is the same fraction; making its definition the Health page's is a
+  behaviour change of the alert (a separate ticket if wanted).
+
+### Cost
+
+The summary's session count was one `uniqExact(session_id)` over perf
+samples; it is now the Health page's union of 8 tables grouped per session
+(over the dashboard's range, default 24 h, no range limit, not in the
+analysis slots: the dashboard is the landing page). Perf samples dominate
+the rows, so the expected cost is of the same order; not measured.
+
+### Rolling deploy and rollback
+
+No schema change. Deploy the server (app 36) before the admin (app 38): a
+new admin against an old server shows "n/a" for the rate (never the old
+8000%). Rollback: either side independently.
+
+### Verified
+
+- `go vet ./...`, `go test -race -short ./...` (376 top-level tests pass,
+  61 skipped: integration without ClickHouse). New: `TestCrashRates_Units`
+  (25 sessions / 2 crashed = 0.08, per 1000 = 80, at most 1, 0 without
+  sessions), `TestDashboardSummary_CrashFieldNames`,
+  `TestDashboardVersionsQuery_IsTheHealthDefinition` (the health's rows,
+  every table part, kills by the player excluded, default crash types
+  bound, nothing from the request in the SQL text).
+- Admin: `tsc --noEmit`, `vitest run` (30 files, 181 tests; new
+  `Dashboard.test.tsx`: 8.00% for 2 of 25 and no "8000", red/green at
+  the 1% threshold, per-version rates, 0.5% green, "n/a" from an old
+  server), `npm run build`.
+
+### Not verified (for the lead)
+
+- The integration tests: `tests/integration/apm22_test.go` (25 sessions /
+  2 crashed = 8%; force-stop, ANR, unknown, two crashes in one session, a
+  session without perf samples, a dev build; equal to
+  `/api/health/sessions` per version; both insert paths) and the updated
+  `admin_test.go` (summary and per-version crash figures, empty range): not
+  run (the sandbox cannot reach ClickHouse).
+- The browser check on n192 and the summary's query time at production
+  volume.

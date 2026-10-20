@@ -139,7 +139,13 @@ func TestAdminSummary_ReturnsRealCounts(t *testing.T) {
 	if !near(s.AvgFPS, 40) || !near(s.AvgStartupMs, 1750) || !near(s.CrashRate, 1000) {
 		t.Errorf("avg_fps %v avg_startup_ms %v crash_rate %v, want 40 1750 1000", s.AvgFPS, s.AvgStartupMs, s.CrashRate)
 	}
-	if len(s.TopVersions) != 2 || s.TopVersions[0].Version != "1.0" || s.TopVersions[0].SessionCount != 2 || s.TopVersions[1].SessionCount != 1 {
+	// APM-22: crashed sessions and their fraction, also per version.
+	if s.CrashedSessions != 3 || !near(s.CrashedSessionRate, 1) {
+		t.Errorf("crashed_sessions %d crashed_session_rate %v, want 3 1", s.CrashedSessions, s.CrashedSessionRate)
+	}
+	if len(s.TopVersions) != 2 || s.TopVersions[0].Version != "1.0" || s.TopVersions[0].SessionCount != 2 || s.TopVersions[1].SessionCount != 1 ||
+		s.TopVersions[0].CrashCount != 2 || s.TopVersions[0].CrashedSessions != 2 || !near(s.TopVersions[0].CrashedSessionRate, 1) ||
+		!near(s.TopVersions[0].CrashRate, 1000) || s.TopVersions[1].CrashCount != 1 || s.TopVersions[1].CrashedSessions != 1 {
 		t.Errorf("top_versions %+v", s.TopVersions)
 	}
 	if len(s.TopPlatforms) != 2 || s.TopPlatforms[0].Platform != "Android" || s.TopPlatforms[0].SessionCount != 2 ||
@@ -150,7 +156,7 @@ func TestAdminSummary_ReturnsRealCounts(t *testing.T) {
 	params := lastHour()
 	params.Set("platform", "iOS")
 	getAdmin(t, router, "/api/summary", params, &s)
-	if s.TotalSessions != 1 || s.CrashCount != 1 || s.ExceptionCount != 1 || s.JankCount != 1 || !near(s.AvgFPS, 20) {
+	if s.TotalSessions != 1 || s.CrashCount != 1 || s.CrashedSessions != 1 || s.ExceptionCount != 1 || s.JankCount != 1 || !near(s.AvgFPS, 20) {
 		t.Errorf("iOS: %+v", s)
 	}
 }
@@ -167,7 +173,8 @@ func TestAdminAPI_EmptyRangeGivesZeros(t *testing.T) {
 
 	var s models.DashboardSummary
 	getAdmin(t, router, "/api/summary", empty, &s)
-	if s.TotalSessions != 0 || s.AvgFPS != 0 || s.AvgStartupMs != 0 || s.CrashCount != 0 {
+	if s.TotalSessions != 0 || s.AvgFPS != 0 || s.AvgStartupMs != 0 || s.CrashCount != 0 || s.CrashedSessions != 0 || s.CrashedSessionRate != 0 ||
+		s.CrashRate != 0 || s.TopVersions == nil || len(s.TopVersions) != 0 {
 		t.Errorf("summary: %+v", s)
 	}
 	for _, metric := range []string{"fps", "frame_time", "startup"} {

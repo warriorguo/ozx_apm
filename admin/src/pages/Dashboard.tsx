@@ -5,6 +5,23 @@ import { useFilters } from '../hooks/useFilters'
 import { useSummary, useTimeSeries } from '../hooks/useApi'
 import { formatNumber, formatPercent, formatMs } from '../utils/format'
 
+// APM-22: the crash rate is crashed sessions / sessions, a fraction (0.08 =
+// 8%), counted as the Health page counts them (crash-free sessions = 1 -
+// this). The server's crash_rate is crash reports per 1000 sessions and is
+// not shown (it read 8000% for 2 crashes in 25 sessions).
+// Above this fraction of crashed sessions the rate is shown in red.
+export const CRASH_RATE_DANGER = 0.01
+
+// The crashed-session rate as a percentage; "n/a" from a server before
+// APM-22 (no crashed_session_rate).
+export function crashRateText(rate: number | undefined): string {
+  return rate === undefined || !Number.isFinite(rate) ? 'n/a' : formatPercent(rate)
+}
+
+export function crashRateIsHigh(rate: number | undefined): boolean {
+  return rate !== undefined && rate > CRASH_RATE_DANGER
+}
+
 export function Dashboard() {
   const { queryParams } = useFilters()
 
@@ -30,10 +47,14 @@ export function Dashboard() {
               color="default"
             />
             <StatCard
-              title="Crash Rate"
-              value={formatPercent(summary.crash_rate)}
-              subtitle={`${summary.crash_count} crashes`}
-              color={summary.crash_rate > 0.01 ? 'danger' : 'success'}
+              title="Crash Rate (sessions)"
+              value={crashRateText(summary.crashed_session_rate)}
+              subtitle={
+                summary.crashed_sessions === undefined
+                  ? `${summary.crash_count} crash reports`
+                  : `${formatNumber(summary.crashed_sessions)} of ${formatNumber(summary.total_sessions)} sessions crashed`
+              }
+              color={crashRateIsHigh(summary.crashed_session_rate) ? 'danger' : 'success'}
             />
             <StatCard
               title="Average FPS"
@@ -64,8 +85,9 @@ export function Dashboard() {
               color={summary.jank_count > 50 ? 'warning' : 'default'}
             />
             <StatCard
-              title="Crash Count"
+              title="Crash Reports"
               value={formatNumber(summary.crash_count)}
+              subtitle="Every type, also ANRs and force-stops"
               color={summary.crash_count > 0 ? 'danger' : 'success'}
             />
           </div>
@@ -116,11 +138,12 @@ export function Dashboard() {
                         {formatNumber(v.session_count)} sessions
                       </span>
                       <span
+                        data-testid={`version-crash-rate-${v.version}`}
                         className={`${
-                          v.crash_rate > 0.01 ? 'text-red-500' : 'text-green-500'
+                          crashRateIsHigh(v.crashed_session_rate) ? 'text-red-500' : 'text-green-500'
                         }`}
                       >
-                        {formatPercent(v.crash_rate)} crash rate
+                        {crashRateText(v.crashed_session_rate)} sessions crashed
                       </span>
                     </div>
                   </div>

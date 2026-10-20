@@ -66,14 +66,14 @@ var healthTypeColumns = []healthTypeColumn{
 // startup anyway). A session counts if any of its rows is in the range.
 var healthSessionTables = []EventTable{TablePerfSamples, TableStartups, TableJanks, TableCustomEvents, TableCustomMetrics, TableRuns}
 
-// sessionHealthQuery builds the query: per table, one row per (group,
-// build type, session) with what the session had (crash flags, exception
-// count, crashes per type), then the groups over the sessions.
-func sessionHealthQuery(f models.AdminFilter, g CustomGroup, opt HealthOptions) (string, []interface{}, error) {
-	expr, exprArgs, err := groupValue(g)
-	if err != nil {
-		return "", nil, err
-	}
+// sessionHealthRows is the inner query of the session health: per table,
+// one row per (group value, build type, session) with what the session had
+// (crash flags, exception count, crashes per type), as a UNION ALL with the
+// columns value, bt, sid, dev, crashed, anr, exc, t0..tN. expr is the group
+// value's SQL (no request input in it: placeholders, bound by exprArgs).
+// The dashboard (APM-22) counts its sessions and crashed sessions from the
+// same rows, so its crash rate is this endpoint's.
+func sessionHealthRows(f models.AdminFilter, expr string, exprArgs []interface{}, opt HealthOptions) (string, []interface{}) {
 	crashTypes := opt.CrashTypes
 	if len(crashTypes) == 0 {
 		crashTypes = DefaultHealthCrashTypes
@@ -84,13 +84,11 @@ func sessionHealthQuery(f models.AdminFilter, g CustomGroup, opt HealthOptions) 
 	}
 	// Aliases never equal a column name (ClickHouse would substitute the
 	// aggregate for the column inside it): bt, sid, dev, crashed, anr, exc,
-	// t0..tN per table part; d, sc, sa, se, s0..sN per session.
-	var zeroTypes, typeCols, sessionSums, groupSums strings.Builder
+	// t0..tN per table part.
+	var zeroTypes, typeCols strings.Builder
 	for i, t := range healthTypeColumns {
 		fmt.Fprintf(&zeroTypes, ", toUInt64(0) AS t%d", i)
 		fmt.Fprintf(&typeCols, ", toUInt64(countIf(%s)) AS t%d", t.cond, i) // constants, not input
-		fmt.Fprintf(&sessionSums, ", sum(t%d) AS s%d", i, i)
-		fmt.Fprintf(&groupSums, ", toInt64(sum(s%d))", i)
 	}
 	var parts []string
 	var args []interface{}
@@ -111,8 +109,23 @@ func sessionHealthQuery(f models.AdminFilter, g CustomGroup, opt HealthOptions) 
 	// The crash types that count are bound; the per-type counts are constants.
 	part(TableCrashes.Name, "toUInt8(countIf("+crashedCond+") > 0)", "toUInt8(countIf(crash_type = 'anr') > 0)", "toUInt64(0)",
 		typeCols.String(), groupSet(crashTypes))
+	return strings.Join(parts, "\n\t\tUNION ALL\n\t\t"), args
+}
 
-	inner := strings.Join(parts, "\n\t\tUNION ALL\n\t\t")
+// sessionHealthQuery builds the query: the sessions of sessionHealthRows,
+// then the groups over the sessions.
+func sessionHealthQuery(f models.AdminFilter, g CustomGroup, opt HealthOptions) (string, []interface{}, error) {
+	expr, exprArgs, err := groupValue(g)
+	if err != nil {
+		return "", nil, err
+	}
+	// Aliases per session: d, sc, sa, se, s0..sN.
+	var sessionSums, groupSums strings.Builder
+	for i := range healthTypeColumns {
+		fmt.Fprintf(&sessionSums, ", sum(t%d) AS s%d", i, i)
+		fmt.Fprintf(&groupSums, ", toInt64(sum(s%d))", i)
+	}
+	inner, args := sessionHealthRows(f, expr, exprArgs, opt)
 	query := fmt.Sprintf(`SELECT value, bt,
 			toInt64(uniqExact(sid)) AS sessions, toInt64(uniqExact(d)),
 			toInt64(uniqExactIf(sid, sc = 1)), toInt64(uniqExactIf(d, sc = 1)),

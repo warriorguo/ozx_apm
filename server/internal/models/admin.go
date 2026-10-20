@@ -8,11 +8,25 @@ import (
 
 // Dashboard types
 
+// DashboardSummary: sessions and crashed sessions are those of the session
+// health (APM-9, GET /api/health/sessions with its defaults): a session is
+// any session with a row in the range, a crashed session one with a crash of
+// storage.DefaultHealthCrashTypes that was not a kill by the player (APM-22).
 type DashboardSummary struct {
-	TimeRange      TimeRange       `json:"time_range"`
-	TotalSessions  int64           `json:"total_sessions"`
-	TotalEvents    int64           `json:"total_events"`
-	CrashCount     int64           `json:"crash_count"`
+	TimeRange     TimeRange `json:"time_range"`
+	TotalSessions int64     `json:"total_sessions"`
+	TotalEvents   int64     `json:"total_events"` // perf samples
+	// CrashCount is every crash report in the range, of any type (also
+	// ANRs, unknown exits and kills by the player).
+	CrashCount int64 `json:"crash_count"`
+	// CrashedSessions are the sessions with a crash (the health's definition).
+	CrashedSessions int64 `json:"crashed_sessions"`
+	// CrashedSessionRate is CrashedSessions / TotalSessions, a fraction
+	// (0..1; 0.08 = 8%), as 1 - crash_free_sessions of the health.
+	CrashedSessionRate float64 `json:"crashed_session_rate"`
+	// CrashRate is deprecated (APM-22): crash reports per 1000 sessions,
+	// CrashCount / TotalSessions * 1000. Not a fraction; use
+	// CrashedSessionRate.
 	CrashRate      float64         `json:"crash_rate"`
 	ExceptionCount int64           `json:"exception_count"`
 	JankCount      int64           `json:"jank_count"`
@@ -27,11 +41,28 @@ type TimeRange struct {
 	End   time.Time `json:"end"`
 }
 
+// VersionStats is one version of the dashboard, with the units of
+// DashboardSummary.
 type VersionStats struct {
-	Version      string  `json:"version"`
-	SessionCount int64   `json:"session_count"`
-	CrashCount   int64   `json:"crash_count"`
-	CrashRate    float64 `json:"crash_rate"`
+	Version            string  `json:"version"`
+	SessionCount       int64   `json:"session_count"`
+	CrashCount         int64   `json:"crash_count"`
+	CrashedSessions    int64   `json:"crashed_sessions"`
+	CrashedSessionRate float64 `json:"crashed_session_rate"` // fraction 0..1
+	CrashRate          float64 `json:"crash_rate"`           // deprecated: crash reports per 1000 sessions
+}
+
+// CrashRates fills the rates from the counts: CrashedSessionRate a fraction
+// (at most 1), CrashRate (deprecated) crash reports per 1000 sessions.
+func CrashRates(sessions, crashedSessions, crashes int64) (crashedSessionRate, perThousand float64) {
+	if sessions <= 0 {
+		return 0, 0
+	}
+	crashedSessionRate = float64(crashedSessions) / float64(sessions)
+	if crashedSessionRate > 1 {
+		crashedSessionRate = 1
+	}
+	return crashedSessionRate, float64(crashes) / float64(sessions) * 1000
 }
 
 type PlatformStats struct {
