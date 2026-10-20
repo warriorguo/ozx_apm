@@ -688,3 +688,85 @@ CREATE TABLE IF NOT EXISTS apm_symbol_lines (
 PARTITION BY toYYYYMM(uploaded_at)
 ORDER BY (build_id, upload_id, addr)
 TTL toDateTime(uploaded_at) + INTERVAL 400 DAY;
+
+-- APM-12: operations data (one year, keyed by an anonymous player id; no
+-- device id, device details or IP). ops_player_days and ops_players are
+-- written by the ingest server, the rates and ad reports by imports. See
+-- internal/storage/schema.go (opsTables) and docs/ops-schema.md.
+
+CREATE TABLE IF NOT EXISTS ops_events (
+    event_id String,
+    name LowCardinality(String),
+    day Date,
+    event_time DateTime64(3),
+    client_time DateTime64(3),
+    server_time DateTime64(3),
+    seq UInt64,
+    player_id String,
+    session_id String,
+    app_version LowCardinality(String),
+    platform LowCardinality(String),
+    build_type LowCardinality(String),
+    channel LowCardinality(String),
+    country LowCardinality(String),
+    props Map(LowCardinality(String), String),
+    prop_types Map(LowCardinality(String), UInt8),
+    num_props Map(LowCardinality(String), Float64),
+    ctx Map(LowCardinality(String), String),
+    INDEX idx_event_id event_id TYPE bloom_filter(0.001) GRANULARITY 1,
+    INDEX idx_player_id player_id TYPE bloom_filter(0.01) GRANULARITY 1,
+    INDEX idx_client_time client_time TYPE minmax GRANULARITY 1
+) ENGINE = ReplacingMergeTree()
+PARTITION BY toYYYYMM(day)
+ORDER BY (name, day, event_id)
+TTL day + INTERVAL 365 DAY;
+
+CREATE TABLE IF NOT EXISTS ops_player_days (
+    day Date,
+    player_id String,
+    app_version LowCardinality(String),
+    platform LowCardinality(String),
+    build_type LowCardinality(String),
+    channel LowCardinality(String),
+    country LowCardinality(String),
+    INDEX idx_player_id player_id TYPE bloom_filter(0.01) GRANULARITY 1
+) ENGINE = ReplacingMergeTree()
+PARTITION BY toYYYYMM(day)
+ORDER BY (day, player_id)
+TTL day + INTERVAL 365 DAY;
+
+CREATE TABLE IF NOT EXISTS ops_players (
+    player_id String,
+    first_seen SimpleAggregateFunction(min, DateTime64(3)),
+    last_seen SimpleAggregateFunction(max, DateTime64(3)),
+    install_channel SimpleAggregateFunction(max, String),
+    platform SimpleAggregateFunction(max, String),
+    build_type SimpleAggregateFunction(max, String)
+) ENGINE = AggregatingMergeTree()
+ORDER BY player_id
+TTL toDateTime(last_seen) + INTERVAL 365 DAY;
+
+CREATE TABLE IF NOT EXISTS ops_fx_rates (
+    day Date,
+    currency LowCardinality(String),
+    usd_per_unit Float64,
+    source String,
+    imported_at DateTime
+) ENGINE = ReplacingMergeTree(imported_at)
+ORDER BY (currency, day);
+
+CREATE TABLE IF NOT EXISTS ops_ad_reports (
+    day Date,
+    network LowCardinality(String),
+    country LowCardinality(String),
+    placement String,
+    ad_unit String,
+    impressions UInt64,
+    revenue Float64,
+    currency LowCardinality(String),
+    source String,
+    imported_at DateTime
+) ENGINE = ReplacingMergeTree(imported_at)
+PARTITION BY toYYYYMM(day)
+ORDER BY (day, network, country, placement, ad_unit)
+TTL day + INTERVAL 365 DAY;

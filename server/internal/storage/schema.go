@@ -19,8 +19,9 @@ import (
 // views, APM-7 the crash columns, APM-9 the perf sample's memory columns and
 // the apm_runs event table (no view), APM-10 the game clock columns (game_t,
 // frame) on every event table and prop_types on apm_custom_events, APM-24 the
-// recovered flag of windowed counts; new tables are created by CREATE TABLE
-// IF NOT EXISTS, which the service account may run.
+// recovered flag of windowed counts, APM-12 the operations data tables
+// (ops_*, one year, keyed by player); new tables are created by CREATE
+// TABLE IF NOT EXISTS, which the service account may run.
 //
 // The event tables are ReplacingMergeTree with event_id appended to the sort
 // key (APM-19 phase B): a re-sent event has the same timestamp, app_version
@@ -686,7 +687,157 @@ func (c *ClickHouseClient) Migrate(ctx context.Context) error {
 	c.migratePrivacyAudit(ctx)
 	c.migrateAlertTables(ctx)
 	c.migrateSymbolTables(ctx)
+	c.migrateOpsTables(ctx)
 	return nil
+}
+
+// ------------------------------------------------------------------
+// Operations data (APM-12)
+//
+// Separate from the technical tables (CLAUDE.md privacy rules: business/ops
+// events are kept up to a year, minimized, keyed by an anonymous player id,
+// deletable per player): ops_events holds every ops event once (the
+// ingest-time duplicate drop by event_id, and ReplacingMergeTree with the
+// event id in the sort key for what slips through: queries use FINAL or
+// count distinct event ids). ops_player_days and ops_players are written at
+// ingest from the same events (not materialized views: they need no
+// privilege beyond the service account's INSERT, and the ingest writes them
+// in the same request), so DAU, new players and retention never scan
+// ops_events. ops_fx_rates and ops_ad_reports are imported (cmd/opsimport,
+// POST /api/ops/import/*). docs/ops-schema.md documents every column for
+// BI users.
+// ------------------------------------------------------------------
+
+// TableOpsEvents is the ops event table, with what the ingest-time duplicate
+// lookup filters on: app_version, the name (sort key), and the client time,
+// which is the same in every copy of an event (event_time and day may not
+// be: they fall back to the receive time when the device clock was wrong).
+var TableOpsEvents = EventTable{Name: "ops_events", KeyColumn: "name", TimeColumn: "client_time"}
+
+const opsEventsDDL = `CREATE TABLE IF NOT EXISTS ops_events (
+    event_id String,
+    name LowCardinality(String),
+    day Date,
+    event_time DateTime64(3),
+    client_time DateTime64(3),
+    server_time DateTime64(3),
+    seq UInt64,
+    player_id String,
+    session_id String,
+    app_version LowCardinality(String),
+    platform LowCardinality(String),
+    build_type LowCardinality(String),
+    channel LowCardinality(String),
+    country LowCardinality(String),
+    props Map(LowCardinality(String), String),
+    prop_types Map(LowCardinality(String), UInt8),
+    num_props Map(LowCardinality(String), Float64),
+    ctx Map(LowCardinality(String), String),
+    INDEX ` + EventIDIndexDDL + `,
+    INDEX idx_player_id player_id TYPE bloom_filter(0.01) GRANULARITY 1,
+    INDEX idx_client_time client_time TYPE minmax GRANULARITY 1
+) ENGINE = ReplacingMergeTree()
+PARTITION BY toYYYYMM(day)
+ORDER BY (name, day, event_id)
+TTL day + INTERVAL 365 DAY`
+
+// ops_player_days: one row per player and day with an ops event (several
+// until merged: read with FINAL, or count distinct player_id). The other
+// columns are one of the day's events' values.
+const opsPlayerDaysDDL = `CREATE TABLE IF NOT EXISTS ops_player_days (
+    day Date,
+    player_id String,
+    app_version LowCardinality(String),
+    platform LowCardinality(String),
+    build_type LowCardinality(String),
+    channel LowCardinality(String),
+    country LowCardinality(String),
+    INDEX idx_player_id player_id TYPE bloom_filter(0.01) GRANULARITY 1
+) ENGINE = ReplacingMergeTree()
+PARTITION BY toYYYYMM(day)
+ORDER BY (day, player_id)
+TTL day + INTERVAL 365 DAY`
+
+// ops_players: one row per player after merges (AggregatingMergeTree of
+// simple aggregates: read with FINAL, or GROUP BY player_id with min/max):
+// when the player was first and last seen, the install channel the SDK
+// reported (ApmConfig.Channel), the platform and the build type (the max:
+// "release" once any release build sent an event). The TTL removes a player
+// a year after they were last seen (the merged row's last_seen; a player who
+// returns later is a new player, like a reinstall).
+const opsPlayersDDL = `CREATE TABLE IF NOT EXISTS ops_players (
+    player_id String,
+    first_seen SimpleAggregateFunction(min, DateTime64(3)),
+    last_seen SimpleAggregateFunction(max, DateTime64(3)),
+    install_channel SimpleAggregateFunction(max, String),
+    platform SimpleAggregateFunction(max, String),
+    build_type SimpleAggregateFunction(max, String)
+) ENGINE = AggregatingMergeTree()
+ORDER BY player_id
+TTL toDateTime(last_seen) + INTERVAL 365 DAY`
+
+// ops_fx_rates: daily exchange rates (US dollars per unit of the currency),
+// imported; a re-import of a (currency, day) replaces it (FINAL). The
+// revenue SQL uses the latest rate on or before the event's day (ASOF JOIN).
+// No player data, no TTL.
+const opsFXRatesDDL = `CREATE TABLE IF NOT EXISTS ops_fx_rates (
+    day Date,
+    currency LowCardinality(String),
+    usd_per_unit Float64,
+    source String,
+    imported_at DateTime
+) ENGINE = ReplacingMergeTree(imported_at)
+ORDER BY (currency, day)`
+
+// ops_ad_reports: the ad networks' own daily figures per country and
+// placement/ad unit (exported from their consoles, imported), to reconcile
+// with the revenue the SDK tracked. A re-import of the same day, network,
+// country, placement and ad unit replaces it (FINAL).
+const opsAdReportsDDL = `CREATE TABLE IF NOT EXISTS ops_ad_reports (
+    day Date,
+    network LowCardinality(String),
+    country LowCardinality(String),
+    placement String,
+    ad_unit String,
+    impressions UInt64,
+    revenue Float64,
+    currency LowCardinality(String),
+    source String,
+    imported_at DateTime
+) ENGINE = ReplacingMergeTree(imported_at)
+PARTITION BY toYYYYMM(day)
+ORDER BY (day, network, country, placement, ad_unit)
+TTL day + INTERVAL 365 DAY`
+
+// opsTables are the ops tables in creation order.
+var opsTables = []struct{ Name, DDL string }{
+	{"ops_events", opsEventsDDL},
+	{"ops_player_days", opsPlayerDaysDDL},
+	{"ops_players", opsPlayersDDL},
+	{"ops_fx_rates", opsFXRatesDDL},
+	{"ops_ad_reports", opsAdReportsDDL},
+}
+
+// OpsTableNames lists the ops tables Migrate creates.
+func OpsTableNames() []string {
+	names := make([]string, len(opsTables))
+	for i, t := range opsTables {
+		names[i] = t.Name
+	}
+	return names
+}
+
+// migrateOpsTables creates the ops tables (CREATE TABLE IF NOT EXISTS, within
+// the service account's grant). A failure is logged and startup continues:
+// the technical data does not depend on them; ops events are then answered
+// 503 (retried by the SDK, nothing lost) until the table exists.
+func (c *ClickHouseClient) migrateOpsTables(ctx context.Context) {
+	for _, t := range opsTables {
+		if err := c.conn.Exec(ctx, t.DDL); err != nil {
+			c.logger.Warn("could not create an ops table; ops events are refused with 503 (and kept by the SDK) until it exists (RELEASE.md, APM-12)",
+				zap.String("table", t.Name), zap.Error(err))
+		}
+	}
 }
 
 // SymbolRetention is how long uploaded symbols are kept (TTL on the upload
@@ -857,6 +1008,15 @@ func SchemaSQL() string {
 -- stacks. See internal/storage/schema.go (symbolTables).
 `)
 	for _, t := range symbolTables {
+		sb.WriteString("\n" + t.DDL + ";\n")
+	}
+	sb.WriteString(`
+-- APM-12: operations data (one year, keyed by an anonymous player id; no
+-- device id, device details or IP). ops_player_days and ops_players are
+-- written by the ingest server, the rates and ad reports by imports. See
+-- internal/storage/schema.go (opsTables) and docs/ops-schema.md.
+`)
+	for _, t := range opsTables {
 		sb.WriteString("\n" + t.DDL + ";\n")
 	}
 	return sb.String()

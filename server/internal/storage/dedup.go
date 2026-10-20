@@ -17,6 +17,16 @@ import (
 type EventTable struct {
 	Name      string
 	KeyColumn string
+	// TimeColumn is the event time the lookup's range applies to; empty:
+	// "timestamp" (every event table). ops_events: client_time (APM-12).
+	TimeColumn string
+}
+
+func (t EventTable) timeColumn() string {
+	if t.TimeColumn == "" {
+		return "timestamp"
+	}
+	return t.TimeColumn
 }
 
 // The event tables and their sort-key prefix (app_version, KeyColumn, timestamp).
@@ -86,7 +96,8 @@ func buildEventIDLookup(q EventIDLookup) (string, []any, error) {
 		sb.WriteString(" IN ? AND ")
 		args = append(args, groupSet(q.Keys))
 	}
-	sb.WriteString("timestamp >= fromUnixTimestamp64Milli(toInt64(?)) AND timestamp <= fromUnixTimestamp64Milli(toInt64(?)) AND event_id IN ?")
+	tc := q.Table.timeColumn()
+	sb.WriteString(tc + " >= fromUnixTimestamp64Milli(toInt64(?)) AND " + tc + " <= fromUnixTimestamp64Milli(toInt64(?)) AND event_id IN ?")
 	args = append(args, q.MinTime.UnixMilli(), q.MaxTime.UnixMilli(), groupSet(q.EventIDs))
 	return sb.String(), args, nil
 }

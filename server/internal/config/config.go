@@ -17,6 +17,43 @@ type Config struct {
 	Auth        AuthConfig        `mapstructure:"auth"`
 	RateLimit   RateLimitConfig   `mapstructure:"ratelimit"`
 	Alert       AlertConfig       `mapstructure:"alert"`
+	Ops         OpsConfig         `mapstructure:"ops"`
+}
+
+// OpsConfig configures the operations data channel (APM-12): what ingest
+// copies from an ops event into ops_events.
+type OpsConfig struct {
+	// ContextKeys is the whitelist of game context keys (ApmClient.SetContext)
+	// stored with an ops event (ops_events.ctx); every other key is dropped at
+	// ingest. nil (not configured): DefaultOpsContextKeys; an empty list
+	// stores none. Environment: OZX_OPS_CONTEXT_KEYS, comma separated.
+	ContextKeys []string `mapstructure:"context_keys"`
+	// CountryHeader names a request header that a trusted proxy or CDN in
+	// front of the ingest server sets to the client's ISO 3166-1 alpha-2
+	// country (Cloudflare: CF-IPCountry). When it is set and the request
+	// carries a valid code, it wins over the country the SDK sent (the
+	// device's region setting). Empty: not used. The IP address itself is
+	// never stored. Environment: OZX_OPS_COUNTRY_HEADER.
+	CountryHeader string `mapstructure:"country_header"`
+	// Now replaces the ingest server's clock (the receive time of ops events)
+	// in tests. Not configurable.
+	Now func() time.Time `mapstructure:"-"`
+}
+
+// DefaultOpsContextKeys are the game context keys an ops event keeps when
+// ops.context_keys is not configured: the run and its place in the game
+// (runId, chapter, levelId, room, roomId) and the revives used in the run
+// (revivesUsed), by which ad events are analysed (OZX-1280). Nothing else of
+// the context (seeds, commits, data packs, counts) is operations data.
+var DefaultOpsContextKeys = []string{"runId", "chapter", "levelId", "room", "roomId", "revivesUsed"}
+
+// OpsContextKeys returns the configured whitelist, or the defaults when none
+// is configured.
+func (c OpsConfig) OpsContextKeys() []string {
+	if c.ContextKeys == nil {
+		return DefaultOpsContextKeys
+	}
+	return c.ContextKeys
 }
 
 type ServerConfig struct {
@@ -47,6 +84,12 @@ type AdminServerConfig struct {
 	// they require "Authorization: Bearer <token>" and are disabled while it
 	// is empty. Environment: OZX_SYMBOLS_UPLOAD_TOKEN. Never logged.
 	SymbolsToken string `mapstructure:"symbols_token"`
+	// OpsToken enables the operations data imports (APM-12: daily exchange
+	// rates and ad network reports, POST /api/ops/import/fx-rates and
+	// /api/ops/import/ad-report): they require "Authorization: Bearer
+	// <token>" and are disabled while it is empty. Environment:
+	// OZX_ADMIN_OPS_TOKEN. Never logged.
+	OpsToken string `mapstructure:"ops_token"`
 }
 
 type ClickHouseConfig struct {
@@ -178,6 +221,13 @@ func Load() (*Config, error) {
 	_ = viper.BindEnv("admin_server.alert_token", "OZX_ADMIN_ALERT_TOKEN")
 	viper.SetDefault("admin_server.symbols_token", "")
 	_ = viper.BindEnv("admin_server.symbols_token", "OZX_SYMBOLS_UPLOAD_TOKEN")
+	viper.SetDefault("admin_server.ops_token", "")
+	_ = viper.BindEnv("admin_server.ops_token", "OZX_ADMIN_OPS_TOKEN")
+
+	viper.SetDefault("ops.context_keys", DefaultOpsContextKeys)
+	_ = viper.BindEnv("ops.context_keys", "OZX_OPS_CONTEXT_KEYS")
+	viper.SetDefault("ops.country_header", "")
+	_ = viper.BindEnv("ops.country_header", "OZX_OPS_COUNTRY_HEADER")
 
 	viper.SetDefault("clickhouse.host", "localhost")
 	viper.SetDefault("clickhouse.port", 9000)

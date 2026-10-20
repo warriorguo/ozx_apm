@@ -2,6 +2,7 @@ package config
 
 import (
 	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -379,5 +380,44 @@ func TestLoad_AlertEnvironment(t *testing.T) {
 		a.AdminBaseURL != "https://apm-admin.example.com" || a.Interval != 30*time.Second || !a.IncludeDevBuilds ||
 		a.CrashRateMinSessions != 200 || a.CrashRateFactor != 3.5 || cfg.AdminServer.AlertToken != "tok" {
 		t.Fatalf("from the environment %+v (token set: %v)", a, cfg.AdminServer.AlertToken != "")
+	}
+}
+
+// APM-12: the ops context whitelist and country header come from config or
+// OZX_OPS_*; the import token from OZX_ADMIN_OPS_TOKEN (unset: disabled).
+func TestLoad_Ops(t *testing.T) {
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Ops.OpsContextKeys(); strings.Join(got, ",") != strings.Join(DefaultOpsContextKeys, ",") {
+		t.Errorf("default context keys %v", got)
+	}
+	if cfg.Ops.CountryHeader != "" || cfg.AdminServer.OpsToken != "" {
+		t.Errorf("defaults: header %q, token set %v", cfg.Ops.CountryHeader, cfg.AdminServer.OpsToken != "")
+	}
+	t.Setenv("OZX_OPS_CONTEXT_KEYS", "runId,chapter,bossId")
+	t.Setenv("OZX_OPS_COUNTRY_HEADER", "CF-IPCountry")
+	t.Setenv("OZX_ADMIN_OPS_TOKEN", "ops-tok")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Ops.OpsContextKeys(); strings.Join(got, ",") != "runId,chapter,bossId" {
+		t.Errorf("context keys from the environment %v", got)
+	}
+	if cfg.Ops.CountryHeader != "CF-IPCountry" || cfg.AdminServer.OpsToken != "ops-tok" {
+		t.Errorf("from the environment: header %q, token %v", cfg.Ops.CountryHeader, cfg.AdminServer.OpsToken == "ops-tok")
+	}
+}
+
+// A Config built in code (tests, tools) has no whitelist configured: the
+// defaults apply; an explicit empty list keeps no context key.
+func TestOpsContextKeys_NilAndEmpty(t *testing.T) {
+	if got := (OpsConfig{}).OpsContextKeys(); len(got) != len(DefaultOpsContextKeys) {
+		t.Errorf("nil: %v", got)
+	}
+	if got := (OpsConfig{ContextKeys: []string{}}).OpsContextKeys(); len(got) != 0 {
+		t.Errorf("empty: %v", got)
 	}
 }
