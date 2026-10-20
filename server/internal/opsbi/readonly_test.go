@@ -40,7 +40,7 @@ func TestReadonlyUser_GrantsExactlyTheOpsTables(t *testing.T) {
 		t.Fatal(err)
 	}
 	p := doc.Profiles.P
-	if p.Readonly != 1 || p.MaxExecutionTime <= 0 || p.MaxMemoryUsage <= 0 || p.MaxRowsToRead <= 0 || p.MaxConcurrentQuery <= 0 {
+	if p.Readonly != 2 || p.MaxExecutionTime <= 0 || p.MaxMemoryUsage <= 0 || p.MaxRowsToRead <= 0 || p.MaxConcurrentQuery <= 0 {
 		t.Errorf("profile %+v", p)
 	}
 	if doc.Users.U.Profile != "ozx_ops_readonly" {
