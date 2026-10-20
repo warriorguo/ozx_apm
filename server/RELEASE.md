@@ -4686,8 +4686,10 @@ deletion applies to its own data.
   slips through (two uploads of one id at the same moment, a failed lookup):
   queries use `FINAL` (or count distinct ids). Offline retries, aborted
   requests and lost answers therefore count once.
-- **Used by both sides, sent per consent.** With technical consent an ops event
-  is a breadcrumb on the time line (APM-6: exceptions and janks carry it).
+- **Used by both sides, sent per consent.** With technical **and** analytics
+  consent an ops event is a breadcrumb on the time line (APM-6: exceptions and
+  janks carry it); without analytics consent nothing of it is kept (its content
+  is business data) unless the game marked it `AlsoTechnical()`.
   `.AlsoTechnical()` also records it as a technical custom event (session time
   line, export), sent through the technical queue on its own, not held back by
   the custom event budget. So an event used by both is sent once per category
@@ -4710,7 +4712,9 @@ deletion applies to its own data.
   `PlayerPrefs.DeleteAll` is a new player (acceptable for now: an account id can
   replace it later). Separate from the device id: neither is derived from the
   other; the ops tables never hold the device id, the technical tables never
-  the player id. `ResetDeviceId` does not change it; `ResetPlayerId()` makes a
+  the player id. Analytics Denied also replaces the id in memory, so granting
+  again in the same process starts a new player (never the id support may have
+  deleted). `ResetDeviceId` does not change it; `ResetPlayerId()` makes a
   new player (deletes the queued ops events, which carry the old id, and starts
   a new session so no session id pairs the two). Analytics Denied removes it
   from PlayerPrefs (kept in memory for the process; a launch that stays denied
@@ -4738,7 +4742,11 @@ deletion applies to its own data.
   (`pause`, `quit`, `reset`) at every pause and at quit
   (`ApmConfig.OpsSessionEvents`). DAU, new players and retention therefore need
   no game code; session length is the largest `foreground_ms` of a session, or
-  its first-to-last event span when it was killed.
+  its first-to-last event span when it was killed. A new session that starts
+  on focus without a pause (focus lost longer than the timeout) ends the old one
+  with `reason` `timeout`. Known: a rewarded video longer than
+  `BackgroundTimeoutSeconds` (30 s) pauses the game and splits its session in two
+  (the APM-14 session rule, unchanged).
 - **Ads** (OZX-1280): `ApmAds.EntryShown / Click / Request / Show / Complete /
   Reward / Fail` send `ad_entry_show, ad_click, ad_request, ad_show,
   ad_complete, ad_reward, ad_fail` with `placement`, `network` (lower case),
@@ -4802,6 +4810,10 @@ SDK sending its clock offset learned from the server's `Date` header). UTC,
 not the player's local day: one calendar for all countries (as Firebase's
 default); a local-day view would need the time zone, which is not collected.
 
+Clamped events also feed `ops_player_days` with the day they were received on:
+a clamped event re-sent the next day (its first answer lost) makes the player
+active on both days (`ops_events` keeps one row).
+
 Duplicates and these rules: the sort key `(name, day, event_id)` and the
 partition (`toYYYYMM(day)`) use `day`, which for a clamped event depends on
 when it was received. Two copies of a clamped event that both pass the
@@ -4831,9 +4843,13 @@ its inner table would be an extra deletion target. Props and context are Map
 columns (`props['placement']`, `num_props['revenue']`, `ctx['chapter']`).
 The column reference for query writers: `docs/ops-schema.md`.
 
-`ops_players`' TTL runs on each row's `last_seen`: a player's rows merge into
-one (min/max) long before a year passes, so the merged row (latest
-`last_seen`) is what expires, a year after the player was last seen.
+`ops_players`' TTL runs on each row's `last_seen`. A player's rows normally
+merge into one (min/max) long before a year passes (the table is small and
+unpartitioned), so the merged row expires a year after the player was last
+seen; this is not guaranteed: if a player's first row was still in an unmerged
+part when it expired, `first_seen` moves forward and a long-tenure player
+reappears as new (rare; an `OPTIMIZE TABLE ops_players FINAL` now and then
+removes the risk).
 
 ### Privacy
 
@@ -4853,6 +4869,13 @@ one (min/max) long before a year passes, so the merged row (latest
   (found by their `player_id` column; same mechanism, audit and grant as APM-14).
   A player's technical data is under the device id: delete both.
 - The BI account reads only the five ops tables.
+- Known gaps: the network debug log (`LogLevel.Debug` only) also records ops
+  request bodies and is cleared by technical Denied, not by analytics Denied;
+  `EnableOfflineStorage = false` makes the ops queue memory-only too; after a
+  deletion by player id, a server process that wrote that player's day rows
+  before does not write them again for the rest of that day while the player
+  keeps playing (its cache; `ops_events` is complete, DAU/new players miss the
+  player until a restart or the next day).
 
 ### BI: Metabase on ClickHouse (for the lead and the ClickHouse admin)
 
@@ -4864,12 +4887,15 @@ and 26.1 by `tests/integration/apm12_test.go`), in the collection "OZX Ops":
 - **Funnels**: a funnel of up to five event names (filters `step1..step5`,
   window in seconds; ClickHouse `windowFunnel`, players in order).
 - **Ads**: ad impressions per DAU (and the share of players who saw one); ad
-  revenue per day and network (USD, estimated); ARPDAU by country; ARPDAU by
+  revenue per day and network (USD, estimated); ARPDAU by country (a
+  player-day counts in the country of one of its events); ARPDAU by
   placement; ad events by placement; the per-placement funnel entry shown ->
   click -> show -> complete -> reward; D1/D7 retention by ad views on the first
   day (0, 1-2, 3-5, 6+); tracked vs reported revenue per day, network and country
   (`over_threshold` = 1 above `threshold_pct`, default 10 %, or when only one
-  side has revenue).
+  side has revenue). Tracked revenue covers only players with analytics consent,
+  the reports everyone: with consent not granted by default the gap is the share
+  without consent, not a tracking error.
 
 Every question has the filters `days` (30) and `build` (`release`; `dev`,
 `editor`, `all`); dashboards map them for all their questions. Revenue in USD:
@@ -4921,8 +4947,11 @@ Setup:
    ```
    (`-dry-run` validates; the endpoints `POST /api/ops/import/fx-rates` and
    `/api/ops/import/ad-report` take the CSV as body.) A file is validated as a
-   whole (one bad line: 400 with its line number, nothing stored); re-importing
-   a day replaces it. Rates: USD per unit, e.g. from the ECB's daily reference
+   whole (one bad line: 400 with its line number, nothing stored). Report rows
+   with the same day, network, country, placement and ad unit (an export broken
+   down by device or format, unknown countries) are summed. Re-importing replaces
+   the rows with the same key; a row missing from the new file stays (re-import a
+   day complete to correct it). Rates: USD per unit, e.g. from the ECB's daily reference
    rates (EUR-based: convert); no external API is called at query time.
    Without the token the endpoints answer 403 and the log has
    `ops import API disabled: no token configured`.
@@ -4992,6 +5021,16 @@ uploads it); its consent semantics are APM-14's.
   consent; clearing one queue leaves the other; separate sequences; unique ids;
   the cap; `HasData`; the exact wire format (no device field even if set); the
   context whitelist; the technical copy bypassing the budget.
+- A code review (another agent) traced every expected number of the
+  integration tests against the SQL by hand (all matched) and found: a new
+  session started on focus over-counted its foreground time and never ended
+  the old one; network exports broken down further than the table's key lost
+  rows under `FINAL`; an ops event became a technical breadcrumb without
+  analytics consent; a re-granted analytics consent brought back a possibly
+  deleted player id; a `ResetPlayerId` race; session length taking the span over
+  the reported foreground time; docs contradicting the code. All fixed (with
+  tests where testable); the rest is listed under Privacy (known gaps), Time and
+  BI above.
 - Driver for the device: `/tmp/claude-501/apm12/ApmTestDriver.cs`
   (compile-checked), plan `/tmp/claude-501/apm12/DEVICE_PLAN.md`.
 

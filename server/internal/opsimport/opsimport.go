@@ -139,6 +139,11 @@ func ParseAdReport(r io.Reader, opt AdReportOptions) ([]models.OpsAdReport, erro
 		return ""
 	}
 	out := make([]models.OpsAdReport, 0, len(recs))
+	// Rows with the same table key (day, network, country, placement, ad unit)
+	// are summed: an export broken down further (device type, ad format, an
+	// unknown country) would otherwise keep one arbitrary row under FINAL.
+	type key struct{ day, network, country, placement, adUnit string }
+	seen := map[key]int{}
 	for n, rec := range recs {
 		line := n + 2
 		day, err := parseDate(get(rec, "date"))
@@ -169,11 +174,22 @@ func ParseAdReport(r io.Reader, opt AdReportOptions) ([]models.OpsAdReport, erro
 		if rev < 0 {
 			return nil, fmt.Errorf("line %d: revenue %q: want a number >= 0", line, get(rec, "revenue"))
 		}
-		out = append(out, models.OpsAdReport{
+		row := models.OpsAdReport{
 			Day: day, Network: network, Country: country(get(rec, "country")),
 			Placement: limit(get(rec, "placement"), 128), AdUnit: limit(get(rec, "ad_unit"), 128),
 			Impressions: uint64(imp), Revenue: rev, Currency: cur, Source: opt.Source,
-		})
+		}
+		k := key{day.Format(dateLayout), row.Network, row.Country, row.Placement, row.AdUnit}
+		if i, dup := seen[k]; dup {
+			if out[i].Currency != row.Currency {
+				return nil, fmt.Errorf("line %d: the same day, network, country, placement and ad unit as an earlier line in another currency (%s, %s)", line, out[i].Currency, row.Currency)
+			}
+			out[i].Impressions += row.Impressions
+			out[i].Revenue += row.Revenue
+			continue
+		}
+		seen[k] = len(out)
+		out = append(out, row)
 	}
 	return out, nil
 }

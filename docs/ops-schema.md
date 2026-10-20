@@ -53,7 +53,7 @@ clock far in the past). A clock that is a few hours or days *behind* cannot be
 told apart from offline play and counts on the earlier day.
 
 `seq` is the player's install-wide sequence number of ops events (1, 2, 3...):
-gaps mean events were lost on the device (only beyond a 4 MB backlog).
+gaps mean events were lost on the device (beyond a 4 MB backlog, more than 1000 events within 0.2 s, a failing disk); it starts again at 1 after the player id is reset or analytics consent was denied.
 
 ## Tables
 
@@ -98,7 +98,7 @@ Read with `uniqExact(player_id)` per `day`, or `FINAL`.
 |---|---|
 | `player_id` | |
 | `first_seen` | the player's first ops event (UTC); `toDate(toTimeZone(first_seen, 'UTC'))` is their first day |
-| `last_seen` | their latest activity (updated about once a day) |
+| `last_seen` | their latest activity (to within about an hour) |
 | `install_channel` | the channel of their events |
 | `platform`, `build_type` | `release` once any release build sent an event |
 
@@ -135,7 +135,7 @@ one row per day, network, country and placement (or ad unit); read with `FINAL`.
 | `apm_session_start` | at every launch and every return after 30 s in the background (with analytics consent; also when the player grants it during a session) | none |
 | `apm_session_end` | when the game goes to the background or quits (not when it is killed) | `foreground_ms` (number: time in the foreground in this session so far), `reason` (`pause`, `quit`, `reset`) |
 
-Session length = `greatest(max(foreground_ms of apm_session_end) / 1000, last event - first event)` per `session_id`.
+Session length per `session_id`: the largest `foreground_ms` of its `apm_session_end` events; for a session killed before it could send one, its last event minus its first. A rewarded video longer than 30 s (the app is in the background meanwhile) splits a session in two.
 
 ### Ads (ApmAds; rewarded video, OZX-1280)
 
@@ -239,4 +239,4 @@ go run ./cmd/opsimport ad-report -url https://apm-admin.example.com -network adm
   (`network`, `placement`, `ad_unit`, `currency` optional: `-network`, default USD);
   any other header names through `-map`. Numbers with `.` as decimal separator.
 - `-dry-run` checks a file without storing it. A file with one bad line is refused
-  as a whole (the message names the line). Importing the same day again replaces it.
+  as a whole (the message names the line). Rows with the same day, network, country, placement and ad unit in one file are summed. Importing again replaces the rows with the same key; a row missing from the new file stays (to correct a day, re-import it complete).

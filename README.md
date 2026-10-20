@@ -335,14 +335,15 @@ ApmClient.ResetPlayerId();                   // a new player: local ops events d
 - Sent with each event: name, properties, the anonymous **player id** (random,
   stable across launches, stored with analytics consent; not the device id; a
   reinstall is a new player), session, version, platform, build type, install
-  channel, a coarse country and the game context (the server keeps the keys of
-  its whitelist: `runId`, `chapter`, `levelId`, `room`, `roomId`,
-  `revivesUsed` by default). Never the device id, device details or scene.
+  channel, a coarse country and the game context keys of
+  `ApmConfig.OpsContextKeys` (`runId`, `chapter`, `levelId`, `room`, `roomId`,
+  `revivesUsed` by default; the server keeps those of its own whitelist,
+  `ops.context_keys`, the same list: add a key on both sides). Never the device id, device details or scene.
 - Automatic: `apm_session_start` at every session start and
   `apm_session_end` (`foreground_ms`) when the game goes to the background or
   quits (`ApmConfig.OpsSessionEvents`): DAU, new players, retention and session
   length need no game code.
-- With technical consent an ops event is also a breadcrumb on the time line;
+- With technical (and analytics) consent an ops event is also a breadcrumb on the time line;
   `AlsoTechnical()` also records it as a technical custom event (session time
   line, export). Each copy follows its own consent.
 - Ad events: `placement` is the game's slot name, `network` the ad network in

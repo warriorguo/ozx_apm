@@ -237,7 +237,7 @@ ORDER BY cday`,
 	},
 	{
 		Key: "sessions", Title: "Sessions per player and session length", Display: "table",
-		Description: "Sessions of the SDK (a launch, or a return after more than 30 s in the background). Length: the foreground time apm_session_end reports, or the time between the session's first and last ops event if the app was killed before it could send one.",
+		Description: "Sessions of the SDK (a launch, or a return after more than 30 s in the background). Length: the foreground time the session's last apm_session_end reports; for a session killed before it could send one, the time between its first and last ops event. A rewarded video longer than the session timeout (30 s in the background) splits a session in two.",
 		SQL: `SELECT first_day AS day,
     count() AS sessions,
     uniqExact(pid) AS players,
@@ -248,7 +248,8 @@ FROM (
     SELECT session_id,
         any(player_id) AS pid,
         min(day) AS first_day,
-        greatest(maxIf(num_props['foreground_ms'], name = '` + SessionEnd + `') / 1000,
+        if(countIf(name = '` + SessionEnd + `') > 0,
+            maxIf(num_props['foreground_ms'], name = '` + SessionEnd + `') / 1000,
             (toUnixTimestamp64Milli(max(event_time)) - toUnixTimestamp64Milli(min(event_time))) / 1000) AS length_s
     FROM ops_events FINAL
     WHERE day >= ` + utcToday + ` - {{days}} - 1 AND session_id != '' AND ` + build + `
@@ -271,7 +272,7 @@ ORDER BY day, events DESC`,
 	},
 	{
 		Key: "funnel", Title: "Custom funnel", Display: "bar",
-		Description: "Players who did the steps in order (event names; up to five, an empty step is left out), each within the window of the first step.",
+		Description: "Players who did the steps in order (event names; up to five; leave the last steps empty to use fewer: an empty step ends the funnel), each within the window of the first step.",
 		Dimensions:  []string{"event"}, Metrics: []string{"players"},
 		SQL: funnel("", "", []string{"name = {{step1}}", "name = {{step2}}", "name = {{step3}}", "name = {{step4}}", "name = {{step5}}"},
 			[]string{"{{step1}}", "{{step2}}", "{{step3}}", "{{step4}}", "{{step5}}"},
@@ -310,7 +311,7 @@ ORDER BY day, network`,
 	},
 	{
 		Key: "arpdau_country", Title: "Ad ARPDAU by country (USD)", Display: "table",
-		Description: "Estimated ad revenue per daily active player, per country (coarse country of the player: CDN header or device region).",
+		Description: "Estimated ad revenue per daily active player, per country (coarse country: CDN header or device region). A player's day counts in the country of one of the day's events; revenue of the day's events in another country is not shown here.",
 		SQL: `SELECT d.day AS day, d.cc AS country, d.dau AS dau,
     round(r.rev, 4) AS revenue_usd,
     round(r.rev / d.dau, 5) AS arpdau_usd
@@ -393,7 +394,7 @@ ORDER BY indexOf(['0', '1-2', '3-5', '6+'], bucket)`,
 	},
 	{
 		Key: "ad_reconciliation", Title: "Ad revenue: tracked vs network reports", Display: "table",
-		Description: "Per day, network and country: the revenue the SDK tracked (estimated, USD) against the network's own report (imported, USD). over_threshold = 1 where they differ by more than the threshold, or only one side has revenue.",
+		Description: "Per day, network and country: the revenue the SDK tracked (estimated, USD) against the network's own report (imported, USD). over_threshold = 1 where they differ by more than the threshold, or only one side has revenue. Tracked revenue covers only players with analytics consent, the reports every player: compare the trend, or expect a gap of the share without consent.",
 		SQL: `SELECT day, network, country,
     t_imps AS tracked_impressions, r_imps AS reported_impressions,
     round(t_usd, 4) AS tracked_usd, round(r_usd, 4) AS reported_usd,

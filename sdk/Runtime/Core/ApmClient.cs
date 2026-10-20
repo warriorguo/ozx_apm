@@ -388,7 +388,9 @@ namespace OzxApm.Core
         private void DeleteLocalOpsData()
         {
             _opsStorage?.Clear(true);
-            PlayerIdentity.Forget();
+            // A new id in memory (and none stored): granting again later in this
+            // process starts a new player, never the id support may have deleted.
+            _playerId = PlayerIdentity.Reset(false);
             _opsSessionStarted = null;
         }
 
@@ -541,9 +543,11 @@ namespace OzxApm.Core
 
         private string ResetPlayerIdInternal()
         {
+            // The new id first: an event enqueued on another thread meanwhile
+            // carries either id and is either deleted below or a new-id event.
+            _playerId = PlayerIdentity.Reset(_config.AnalyticsAllowed);
             _opsReporter?.CancelInFlight();
             _opsStorage?.Clear(true);
-            _playerId = PlayerIdentity.Reset(_config.AnalyticsAllowed);
             _sessionManager.StartNewSession();
             // No apm_session_end for the old session: it would pair the old
             // session with the new id.
@@ -928,8 +932,11 @@ namespace OzxApm.Core
         /// <code>
         /// ApmClient.OpsEvent("run_end").Str("result", "win").Int("chapter", 3).Num("duration_s", 312.5, 1).Send();
         /// </code>
-        /// Send returns false when nothing was recorded (no analytics consent and
-        /// no technical consent, an invalid name). Any thread; build and send on
+        /// Send returns true when the event was queued as an ops event (analytics
+        /// consent) or, with AlsoTechnical(), recorded as a technical custom event
+        /// (technical consent); false otherwise (also for an invalid name). Without
+        /// analytics consent nothing of it is kept, not even a breadcrumb, unless
+        /// AlsoTechnical() made it technical data. Any thread; build and send on
         /// one thread. Nothing is allocated when nothing would be recorded.
         /// </summary>
         public static ApmEvent OpsEvent(string name)
@@ -971,8 +978,11 @@ namespace OzxApm.Core
                     if (custom != null && custom.IsActive && custom.TrackEvent(name, props, kinds, true))
                         recorded = true;
                 }
-                else if (s_collecting)
+                else if (recorded && s_collecting)
                 {
+                    // A breadcrumb only with both consents: an ops event's content
+                    // is business data (analytics), and breadcrumbs reach the
+                    // server inside technical events.
                     s_timeline?.RecordEvent(name, props, now);
                 }
                 return recorded;
@@ -1079,6 +1089,19 @@ namespace OzxApm.Core
                 return;
             if (_fgSession != _sessionManager.SessionId)
             {
+                if (_fgRunning)
+                {
+                    // A new session while in the foreground (focus lost longer than
+                    // the session timeout, without a pause): the old one ends here,
+                    // with its own id, and the new one's clock starts now.
+                    if (_fgSession != null && _opsSessionStarted == _fgSession && _config.OpsSessionEvents && OpsAllowed)
+                    {
+                        long ms = ForegroundTicks() * 1000 / System.Diagnostics.Stopwatch.Frequency;
+                        var props = new[] { "foreground_ms", ms.ToString(System.Globalization.CultureInfo.InvariantCulture), "reason", "timeout" };
+                        EnqueueOps(OpsSessionEndEvent, props, new[] { PropKinds.Number, PropKinds.String }, Timeline.NowMs(), _fgSession);
+                    }
+                    _fgStartTicks = System.Diagnostics.Stopwatch.GetTimestamp();
+                }
                 _fgSession = _sessionManager.SessionId;
                 _fgAccumTicks = 0;
             }

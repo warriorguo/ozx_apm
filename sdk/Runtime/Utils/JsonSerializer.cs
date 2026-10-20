@@ -343,7 +343,8 @@ namespace OzxApm.Utils
         /// custom event format with "ops":true. No device id, device details
         /// (model, OS, GPU, RAM, network), scene or game clock: an ops event
         /// may be sent while technical consent is denied. The game context is
-        /// sent whole; the server keeps its whitelisted keys.
+        /// the one ApmClient reduced to ApmConfig.OpsContextKeys; the server
+        /// keeps its own whitelist of keys.
         /// </summary>
         private static void WriteOpsEvent(JsonLine w, OpsEvent e)
         {

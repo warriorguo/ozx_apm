@@ -484,7 +484,7 @@ namespace OzxApm.Tests
         public void Defaults_AnalyticsUndecided_NoOpsEventNoPlayerIdStored()
         {
             var client = Start(NewConfig(ConsentState.Undecided));
-            Assert.IsFalse(ApmClient.OpsEvent(RunStart).Send(), "only a breadcrumb: not recorded as an ops event");
+            Assert.IsFalse(ApmClient.OpsEvent(RunStart).Send(), "not recorded (not even as a breadcrumb)");
             Assert.IsFalse(ApmAds.Show("revive", "admob", 0.01, "USD"));
             Pump(client);
             Assert.IsFalse(Directory.Exists(OpsDir), "nothing of the ops queue without analytics consent");
@@ -567,8 +567,13 @@ namespace OzxApm.Tests
             client.EnqueueEvent(new ExceptionEvent { fingerprint = "f", message = "m", stack = "s", count = 1 });
             Pump(client);
             Assert.IsTrue(Directory.Exists(OpsDir) && Directory.Exists(_dir));
+            string player = ApmClient.GetPlayerId();
 
             ApmClient.SetConsent(ConsentCategory.Analytics, ConsentState.Denied);
+            Assert.AreNotEqual(player, ApmClient.GetPlayerId(), "granting again later must not bring back a possibly deleted id");
+            ApmClient.OpsEvent("ops_only_denied").Send();
+            Assert.IsFalse(client.Timeline.Snapshot(10, 10, 200, 300).Any(c => c.Contains("ops_only_denied")),
+                "no breadcrumb of an ops event without analytics consent");
             Pump(client);
             Assert.IsFalse(Directory.Exists(OpsDir), "ops directory deleted");
             Assert.IsFalse(PlayerPrefs.HasKey(PlayerIdentity.Key), "stored player id removed");
@@ -627,6 +632,25 @@ namespace OzxApm.Tests
             Assert.AreEqual(2, starts.Length);
             Assert.AreEqual(1, starts.Count(s => s.Contains("\"session_id\":\"" + client.Session.SessionId + "\"")));
             Assert.AreEqual(1, starts.Count(s => s.Contains("\"session_id\":\"" + first + "\"")));
+        }
+
+        // A new session started on focus (focus lost longer than the timeout,
+        // no pause): the old one ends with its own id, the new one starts.
+        [Test]
+        public void FocusTimeout_EndsTheOldSession_StartsTheNew()
+        {
+            var client = Start();
+            client.Session.BackgroundTimeoutSeconds = 0f;
+            string first = client.Session.SessionId;
+            client.FocusForTests(false);
+            System.Threading.Thread.Sleep(20);
+            client.FocusForTests(true);
+            Pump(client);
+            Assert.AreNotEqual(first, client.Session.SessionId);
+            var end = Lines(OpsDir, ApmClient.OpsSessionEndEvent).Single();
+            StringAssert.Contains("\"session_id\":\"" + first + "\"", end);
+            StringAssert.Contains("\"reason\":\"timeout\"", end);
+            Assert.AreEqual(1, Lines(OpsDir, ApmClient.OpsSessionStartEvent).Count(s => s.Contains(client.Session.SessionId)));
         }
 
         [Test]

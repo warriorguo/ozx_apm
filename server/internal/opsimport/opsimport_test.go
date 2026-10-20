@@ -97,6 +97,26 @@ func TestParseAdReport_Mapping(t *testing.T) {
 	}
 }
 
+// An export broken down further than the table's key (device type, an
+// unknown country) is summed per key, not reduced to one arbitrary row.
+func TestParseAdReport_SumsRowsOfOneKey(t *testing.T) {
+	in := "date,network,country,device,impressions,revenue\n" +
+		"2026-10-19,admob,US,phone,10,0.10\n" +
+		"2026-10-19,admob,US,tablet,5,0.05\n" +
+		"2026-10-19,admob,XX,phone,1,0.01\n" +
+		"2026-10-19,admob,ZZ,phone,2,0.02\n"
+	rows, err := ParseAdReport(strings.NewReader(in), AdReportOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 || rows[0].Impressions != 15 || rows[1].Country != "" || rows[1].Impressions != 3 {
+		t.Fatalf("%+v", rows)
+	}
+	if _, err := ParseAdReport(strings.NewReader("date,network,country,impressions,revenue,currency\n2026-10-19,admob,US,1,1,USD\n2026-10-19,admob,US,1,1,EUR\n"), AdReportOptions{}); err == nil || !strings.Contains(err.Error(), "line 3") {
+		t.Errorf("mixed currencies: %v", err)
+	}
+}
+
 func TestParseAdReport_Errors(t *testing.T) {
 	header := "date,country,impressions,revenue\n"
 	cases := []struct {
