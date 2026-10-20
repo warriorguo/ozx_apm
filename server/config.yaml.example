@@ -21,6 +21,19 @@ admin_server:
   # APM-14 privacy deletion API: disabled unless a token is set. Set it through
   # the environment (OZX_ADMIN_PRIVACY_TOKEN, a secret), not in this file.
   # privacy_token: ""
+  # APM-12 imports of exchange rates and ad network reports: disabled unless a
+  # token is set (OZX_ADMIN_OPS_TOKEN, a secret).
+  # ops_token: ""
+
+# Operations data (APM-12, RELEASE.md). Every key can also be set as
+# OZX_OPS_<KEY> (OZX_OPS_CONTEXT_KEYS is comma separated).
+ops:
+  # Game context keys kept with an ops event (all others are dropped at ingest).
+  context_keys: [runId, chapter, levelId, room, roomId, revivesUsed]
+  # A header a trusted CDN/proxy in front of the ingest server sets to the
+  # client's ISO country (Cloudflare: CF-IPCountry). Empty: not used; the
+  # SDK's country (the device's region setting) is kept instead.
+  country_header: ""
 
 # ClickHouse database configuration
 # Can also be configured via DATABASE_URL environment variable:

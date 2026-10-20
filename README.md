@@ -10,6 +10,7 @@ Application Performance Monitoring system for Unity games. Track performance, cr
 - **Scene Load Tracking**: Load and activation timing per scene
 - **Memory Monitoring**: GC tracking, allocation monitoring
 - **Offline Support**: Queue events when offline, retry on reconnect
+- **Operations data**: player-level events (DAU, retention, funnels, rewarded-ad revenue) counted exactly once, kept a year apart from the diagnostics, analysed in Metabase (APM-12)
 
 ## Architecture
 
@@ -270,9 +271,10 @@ ApmClient.Event("loot.drop").Str("item", item).Str("src", "enemy").Bool("pin", f
 ### Privacy consent
 
 Two categories, each `Undecided`, `Granted` or `Denied`: `Technical`
-(everything the SDK collects: exceptions, crashes, performance) and
-`Analytics` (operations events, APM-12; none collected yet). Only `Granted`
-collects; nothing is enqueued, written to disk or uploaded otherwise.
+(exceptions, crashes, performance, custom events and metrics) and `Analytics`
+(the operations events of APM-12, below: their own queue, directory and
+uploader). Only `Granted` collects; nothing is enqueued, written to disk or
+uploaded otherwise. Each category's data is kept and deleted by its own consent.
 
 ```csharp
 config.DefaultTechnicalConsent = ConsentState.Granted;    // built-in default
@@ -292,6 +294,65 @@ ApmClient.ResetDeviceId();                   // new id + new session, local even
   under way is aborted. `Undecided` stops collecting but keeps what is stored.
 - Main thread. Details, server-side deletion and the admin grant:
   `server/RELEASE.md` (APM-14).
+- Analytics `Denied` deletes only the ops queue and the stored player id;
+  technical `Denied` leaves them.
+
+### Operations events and ads (APM-12)
+
+Business events for designers and operations (DAU, retention, funnels, ad
+revenue), shown in Metabase (`docs/ops-schema.md`). One call per event; the
+SDK never samples, budgets or aggregates them, gives each a unique id (the
+server stores it once whatever is re-sent) and keeps it on disk until the
+server confirms it. **Only with analytics consent.**
+
+```csharp
+var config = new ApmConfig { /* ... */ };
+config.DefaultAnalyticsConsent = ConsentState.Granted;  // where no opt-in is needed; built-in default: Undecided
+config.Channel = "googleplay";                          // install channel, per build flavor
+// config.Country = "DE";   // default: the device's region setting (Android); never a location
+ApmClient.Initialize(config);
+
+ApmClient.OpsEvent("run_start").Str("runId", runId).Int("chapter", 3).Send();
+ApmClient.OpsEvent("run_end").Str("result", "win").Num("duration_s", 312.5, 1).AlsoTechnical().Send();
+
+// Rewarded ads (OZX-1280): fixed names and keys, so the Ads dashboard works as is.
+ApmClient.SetContext("chapter", "3"); ApmClient.SetContext("room", roomId); ApmClient.SetContext("revivesUsed", "1");
+ApmAds.EntryShown("revive");                      // the offer became visible
+ApmAds.Click("revive");                           // the player chose to watch
+ApmAds.Request("revive", "admob");                // optional
+ApmAds.Show("revive", "admob", revenue, "USD");   // impression + the ad SDK's estimated revenue (currency units, not micros)
+ApmAds.Complete("revive", "admob");
+ApmAds.Reward("revive", "admob");
+ApmAds.Fail("shop", "unity", "no_fill");          // any failure, a short reason code
+
+string playerId = ApmClient.GetPlayerId();   // what support needs to delete a player's ops data
+ApmClient.ResetPlayerId();                   // a new player: local ops events deleted, new session
+```
+
+- Names and property keys: `[A-Za-z0-9_.-]{1,64}`; properties typed like
+  `ApmClient.Event` (`Str`, `Int`, `Num`, `Bool`, `Vec`); never personal data.
+  Any thread; `Send()` returns false when nothing was recorded.
+- Sent with each event: name, properties, the anonymous **player id** (random,
+  stable across launches, stored with analytics consent; not the device id; a
+  reinstall is a new player), session, version, platform, build type, install
+  channel, a coarse country and the game context (the server keeps the keys of
+  its whitelist: `runId`, `chapter`, `levelId`, `room`, `roomId`,
+  `revivesUsed` by default). Never the device id, device details or scene.
+- Automatic: `apm_session_start` at every session start and
+  `apm_session_end` (`foreground_ms`) when the game goes to the background or
+  quits (`ApmConfig.OpsSessionEvents`): DAU, new players, retention and session
+  length need no game code.
+- With technical consent an ops event is also a breadcrumb on the time line;
+  `AlsoTechnical()` also records it as a technical custom event (session time
+  line, export). Each copy follows its own consent.
+- Ad events: `placement` is the game's slot name, `network` the ad network in
+  lower case (the same names as in the imported network reports), `revenue` the
+  ad SDK's per-impression estimate in `currency` (default USD). The run's
+  context keys above come with every ad event.
+- Storage: `<persistentDataPath>/ozx_apm_ops`, at most
+  `ApmConfig.MaxOpsStorageBytes` (4 MB; the oldest are dropped beyond it,
+  `ApmStats.OpsDroppedEvents`). `ApmConfig.EnableOpsEvents = false` turns it all off.
+- Details (server, BI, time rules, privacy): `server/RELEASE.md` (APM-12).
 
 ### Crashes, ANRs and kills (Android)
 
@@ -423,6 +484,20 @@ curl -X POST http://localhost:8081/api/privacy/verify -H "Authorization: Bearer 
   -H "Content-Type: application/json" -d "{\"id_type\":\"device_id\",\"id\":\"$DEVICE_ID\"}"
 ```
 
+`"id_type":"player_id"` (APM-12, `ApmClient.GetPlayerId`) deletes a player's
+operations data (`ops_events`, `ops_player_days`, `ops_players`); a player's
+technical data is under the device id: delete both.
+
+### Operations data (admin server, APM-12)
+
+**POST /api/ops/import/fx-rates**, **POST /api/ops/import/ad-report** - daily
+exchange rates and the ad networks' daily reports (CSV), for the BI's revenue in
+USD and its reconciliation. Bearer token `OZX_ADMIN_OPS_TOKEN`; disabled (403)
+without one. `go run ./cmd/opsimport` sends a file. BI (Metabase, preset
+dashboards: `go run ./cmd/metabase-provision`), the read-only ClickHouse account
+and the time rules: `server/RELEASE.md` (APM-12); tables for query writers:
+`docs/ops-schema.md`.
+
 ### Alerting and issue state (admin server)
 
 Alerts (new exception/crash fingerprint, regression of a resolved issue,
@@ -492,7 +567,7 @@ unzip session.zip -d /tmp/s && python3 scripts/ai_trace.py /tmp/s/*/
 | `scene_load` | Scene load and activation time |
 | `exception` | Non-fatal exceptions |
 | `crash` | Native crashes, ANRs, kills of the previous process, with its context and breadcrumbs (APM-7) |
-| `custom_event` | `ApmClient.TrackEvent` (APM-6) |
+| `custom_event` | `ApmClient.TrackEvent` (APM-6); with `"ops":true` an operations event (APM-12), stored in `ops_events` only |
 | `custom_metric` | `RecordMetric` / timers, aggregated per name, context and minute (APM-6) |
 | `run` | A game run that ended (`BeginRun` / `EndRun`), with its peak memory (APM-9) |
 
@@ -535,14 +610,19 @@ ozx_apm/
 │
 ├── server/                 # Go backend
 │   ├── cmd/server/        # Entry point
+│   ├── cmd/opsimport/     # Imports rates and ad network reports (APM-12)
+│   ├── cmd/metabase-provision/  # Creates the BI dashboards in Metabase (APM-12)
 │   ├── internal/
 │   │   ├── api/           # HTTP handlers, middleware
 │   │   ├── models/        # Event structs
 │   │   ├── storage/       # ClickHouse repository
 │   │   ├── processor/     # Validation, enrichment
+│   │   ├── opsbi/         # The BI questions' SQL and dashboards (APM-12)
 │   │   └── alert/         # Alert evaluation
+│   ├── deployments/clickhouse/users.d/  # The read-only BI account (APM-12)
 │   └── tests/
 │
+├── docs/ops-schema.md     # The operations tables, for query writers
 └── CLAUDE.md              # Project documentation
 ```
 

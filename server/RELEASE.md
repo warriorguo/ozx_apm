@@ -4648,3 +4648,372 @@ older SDK. To turn checkpoints off without a rollback:
   (Undecided) stay in the checkpoint file and are uploaded once consent is
   granted again in a later process (as stored segments are); if consent is
   granted again in the same process, the next checkpoint replaces them.
+
+## APM-12: operations data (ops events, players, ads; Metabase on ClickHouse; additive schema change)
+
+Deploy order: **server (apps 36 and 38), then the read-only BI account and
+Metabase, then SDK builds.** Each works without the next: the server creates
+the ops tables and accepts ops events whatever sends them; Metabase can be set
+up on empty tables; SDK builds with ops events need this server (an older one
+rejects them: `missing device_id`, counted in `rejected`, and the SDK deletes
+the batch: they would be lost).
+
+Business data for designers and operations: DAU, new players, retention,
+sessions, funnels, rewarded-ad revenue. Not a second SDK: the same storage,
+upload and context machinery as the technical events (APM-2/5/6/10), with a
+separate queue and separate tables, so each consent category, retention and
+deletion applies to its own data.
+
+### Design
+
+- **One call per event, a queue of its own.** `ApmClient.OpsEvent(name)...Send()`
+  (typed properties as `ApmClient.Event`, APM-10) and `ApmAds` put an ops event
+  into a second `OfflineStorage` (`<persistentDataPath>/ozx_apm_ops`, its own
+  worker thread `OzxApm.OpsStorage`, `seq` file, cap
+  `ApmConfig.MaxOpsStorageBytes` 4 MB) uploaded by a second `EventReporter`.
+  Both are gated by **analytics** consent for everything (enqueue, write,
+  upload), the technical queue by technical consent as before (APM-14 asked for
+  "their own segments" and a per-category upload gate: here, their own
+  directory). Ops events are **never** sampled, budgeted (APM-6's per-minute and
+  per-name limits), aggregated or checkpointed (APM-24): each is one line on
+  disk within `PersistIntervalMs` and stays there until the server confirms it
+  (APM-2). They go out with the low-value hold of perf data (up to
+  `LowValueUploadIntervalSeconds`, flushed on pause/background/quit).
+- **Exactly once.** Every event gets a 128-bit id from the ops worker (APM-3's
+  SplitMix ids) and its queue's sequence number. The server drops an id it has
+  stored already (and repeats within a request) before insert, like APM-19, and
+  `ops_events` is a ReplacingMergeTree with the id in its sort key for what
+  slips through (two uploads of one id at the same moment, a failed lookup):
+  queries use `FINAL` (or count distinct ids). Offline retries, aborted
+  requests and lost answers therefore count once.
+- **Used by both sides, sent per consent.** With technical consent an ops event
+  is a breadcrumb on the time line (APM-6: exceptions and janks carry it).
+  `.AlsoTechnical()` also records it as a technical custom event (session time
+  line, export), sent through the technical queue on its own, not held back by
+  the custom event budget. So an event used by both is sent once per category
+  and the server stores each copy in its table (`ops_events`, `apm_custom_events`);
+  the alternative, one payload split by the server, would put technical data
+  (device id, device details) into the ops queue, which analytics consent alone
+  may upload and technical Denied could not delete without deleting ops data.
+- **What an ops event carries** (on the wire: `custom_event` with `"ops":true`):
+  `event_id, seq, timestamp, app_version, platform, session_id, build_type, name,
+  count:1, ops, player_id, channel, country, props, ctx`. No device id, device
+  model, OS, GPU, RAM, network type, scene or game clock (`JsonSerializer`
+  writes them only for technical events); the context reduced on the device to
+  `ApmConfig.OpsContextKeys` (default `runId, chapter, levelId, room, roomId,
+  revivesUsed`: a line is ~420 bytes with OZX's ~30-key context, ~970 with all
+  of it). The server keeps only its own whitelist `ops.context_keys` (the same
+  list by default; to add a key, add it on both sides).
+- **Player id.** 32 random hex digits (`PlayerIdentity`, PlayerPrefs
+  `ozx_apm_player_id`), generated on the first launch, stored only with
+  analytics consent, stable across launches; a reinstall or
+  `PlayerPrefs.DeleteAll` is a new player (acceptable for now: an account id can
+  replace it later). Separate from the device id: neither is derived from the
+  other; the ops tables never hold the device id, the technical tables never
+  the player id. `ResetDeviceId` does not change it; `ResetPlayerId()` makes a
+  new player (deletes the queued ops events, which carry the old id, and starts
+  a new session so no session id pairs the two). Analytics Denied removes it
+  from PlayerPrefs (kept in memory for the process; a launch that stays denied
+  gets a new one), as APM-14 does with the device id. Note: the session id is
+  shared by both sides, so the server can pair a player id with a device id
+  through a session; a deletion request should delete both ids.
+- **Install channel.** `ApmConfig.Channel` (OZX sets it per build flavor:
+  `googleplay`, ...), sent with every ops event and kept per player
+  (`ops_players.install_channel`). The Android install referrer / installer
+  package was not used: a config value is enough for a store build and needs no
+  JNI or Play library.
+- **Country** (coarse; CLAUDE.md "IP only for coarse geo"). The server has no
+  GeoIP database, and the IP is never stored. The server keeps an ISO 3166-1
+  alpha-2 code only: from a trusted CDN/proxy header when one is configured
+  (`ops.country_header`, e.g. Cloudflare's `CF-IPCountry`: derived from the
+  connection, wins), else the SDK's: `ApmConfig.Country`, else on Android the
+  device's region setting (`java.util.Locale.getDefault().getCountry()`, one
+  JNI call at `Initialize`; a setting, not a location: travellers and unusual
+  settings are counted wrong), else none (iOS has no automatic value yet).
+  `XX`/`ZZ`, region codes and anything not two letters are stored as `''`.
+- **Sessions.** The SDK sends `apm_session_start` at every session start (the
+  launch, a return after `SessionManager.BackgroundTimeoutSeconds`, a reset id,
+  or when analytics consent is granted during a session) and `apm_session_end`
+  with `foreground_ms` (the session's foreground time so far) and `reason`
+  (`pause`, `quit`, `reset`) at every pause and at quit
+  (`ApmConfig.OpsSessionEvents`). DAU, new players and retention therefore need
+  no game code; session length is the largest `foreground_ms` of a session, or
+  its first-to-last event span when it was killed.
+- **Ads** (OZX-1280): `ApmAds.EntryShown / Click / Request / Show / Complete /
+  Reward / Fail` send `ad_entry_show, ad_click, ad_request, ad_show,
+  ad_complete, ad_reward, ad_fail` with `placement`, `network` (lower case),
+  and on `ad_show` the ad SDK's estimated `revenue` per impression (a number, 6
+  decimals, in currency units), `currency` (default USD), `precision`,
+  `ad_type`. The run's context (chapter, room, revives used) comes from the game
+  context (the whitelisted keys above). IAP is out of scope.
+
+### SDK API (OZX-1277 / OZX-1280)
+
+README "Operations events and ads" has the calls. Configuration:
+`EnableOpsEvents` (true), `OpsSessionEvents` (true), `Channel`, `Country`
+(null: automatic), `OpsContextKeys`, `MaxOpsStorageBytes` (4 MB),
+`DefaultAnalyticsConsent` (still `Undecided` by default; for Google Play OZX
+decides: set `Granted` where no opt-in is needed). `ApmStats` adds
+`OpsEnabled, OpsEvents, OpsPendingEvents, OpsStoredBytes, OpsDroppedEvents,
+OpsLastSeq, OpsUploadFailures`. `GetPlayerId()`, `ResetPlayerId()`.
+
+### Server: ingest
+
+- `custom_event` with `"ops": true` -> `processor.OpsNormalizer`: rejected
+  (with a reason) without a valid `event_id` (1-64 of `[A-Za-z0-9_.-]`),
+  `player_id` (the same), `name`, `app_version` or `platform`; properties and
+  context bounded like APM-5/6 (entries dropped or cut and counted, never the
+  event); context reduced to `ops.context_keys`; numbers also into `num_props`;
+  build type, channel and country normalized. Stored in `ops_events` only.
+- Duplicate drop by `event_id` before insert (`TableOpsEvents`: `app_version`,
+  `name` and the **client** time, which every copy shares), then the insert, then
+  the derived rows of **every valid ops event of the request** (duplicates
+  included: idempotent): `ops_player_days` (one row per player and UTC day) and
+  `ops_players` (first/last seen, install channel, platform, build type). An
+  in-process cache skips rows this process has written (re-written when an
+  earlier event arrives late or an hour has passed for `last_seen`; bounded to
+  200k keys). If the derived rows fail, the request's ops events count as
+  failed (503 + `retry`): the SDK resends, the events are then duplicates and
+  the rows are written.
+- Response and logs as before (`accepted`, `duplicates`, `rejected`); the
+  `ingested events` line has `ops_events`.
+- Config: `ops.context_keys` (`OZX_OPS_CONTEXT_KEYS`, comma separated),
+  `ops.country_header` (`OZX_OPS_COUNTRY_HEADER`), `admin_server.ops_token`
+  (`OZX_ADMIN_OPS_TOKEN`, a secret).
+
+### Time: which day an event counts on
+
+Every ops event has `client_time` (the phone's clock when it happened, as
+sent), `server_time` (received) and `seq`. **Daily figures group by `day` =
+the UTC date of `event_time`, and `event_time` is the client time**, unless the
+phone's clock is evidently wrong, then the receive time:
+
+- later than `server_time + 5 min`: a clock in the future (an event is never
+  received before it happened);
+- older than `server_time - 365 days`: a clock far in the past (or past the
+  retention anyway); a zero/absent time likewise.
+
+Reasoning: an event uploaded a day late after offline play counts on **the day
+it was played** (the player was active that day; retention would otherwise be
+wrong for exactly the offline players APM-2 keeps), which only the client time
+knows. A clock that is merely hours or days behind cannot be told from offline
+play and counts on the earlier day (accepted; a future refinement would be the
+SDK sending its clock offset learned from the server's `Date` header). UTC,
+not the player's local day: one calendar for all countries (as Firebase's
+default); a local-day view would need the time zone, which is not collected.
+
+Duplicates and these rules: the sort key `(name, day, event_id)` and the
+partition (`toYYYYMM(day)`) use `day`, which for a clamped event depends on
+when it was received. Two copies of a clamped event that both pass the
+ingest-time lookup (a rare race) and are received on different days are then
+not merged by the ReplacingMergeTree (both count). The lookup itself uses the
+client time, the same for every copy.
+
+### Schema
+
+Created by `Migrate` (`CREATE TABLE IF NOT EXISTS`, within the `apm`
+account's `CREATE TABLE` grant; a failure is a warning `could not create an ops
+table` and the server starts: ops events then answer 503 and stay on the
+devices), also in `scripts/migrate.sql`. **No existing table changes.**
+
+| table | engine, key | TTL | holds |
+|---|---|---|---|
+| `ops_events` | ReplacingMergeTree, `PARTITION BY toYYYYMM(day) ORDER BY (name, day, event_id)`, indexes on `event_id` (bloom 0.001), `player_id` (bloom 0.01), `client_time` (minmax) | `day + 365 DAY` | one row per event: `event_id, name, day, event_time, client_time, server_time, seq, player_id, session_id, app_version, platform, build_type, channel, country, props, prop_types, num_props, ctx` |
+| `ops_player_days` | ReplacingMergeTree, `ORDER BY (day, player_id)` | `day + 365 DAY` | the player was active that day (+ version, platform, build type, channel, country of one event) |
+| `ops_players` | AggregatingMergeTree of simple aggregates, `ORDER BY player_id` | `toDateTime(last_seen) + 365 DAY` | `first_seen` (min), `last_seen` (max), `install_channel`, `platform`, `build_type` (max) |
+| `ops_fx_rates` | ReplacingMergeTree(imported_at), `ORDER BY (currency, day)` | none | imported daily rates: USD per unit |
+| `ops_ad_reports` | ReplacingMergeTree(imported_at), `ORDER BY (day, network, country, placement, ad_unit)` | `day + 365 DAY` | imported network reports |
+
+The derived player tables are written at ingest rather than by materialized
+views: an MV would need `CREATE VIEW` where `CREATE TABLE` is not enough
+(APM-17: refused on some versions), would see duplicates the ingest drops, and
+its inner table would be an extra deletion target. Props and context are Map
+columns (`props['placement']`, `num_props['revenue']`, `ctx['chapter']`).
+The column reference for query writers: `docs/ops-schema.md`.
+
+`ops_players`' TTL runs on each row's `last_seen`: a player's rows merge into
+one (min/max) long before a year passes, so the merged row (latest
+`last_seen`) is what expires, a year after the player was last seen.
+
+### Privacy
+
+- Only analytics consent collects, stores or uploads ops events; technical
+  Denied leaves them (and analytics Denied leaves the technical data). Denied
+  deletes the ops directory and the stored player id; Undecided keeps what is
+  stored (uploaded once granted).
+- Stored per event: name, properties, player id, session, version, platform,
+  build type, channel, country (ISO code), whitelisted context keys, the three
+  times and `seq`. No device id, device details, IP, location, stack, log or
+  breadcrumb. **Names and properties are stored as sent: the game must never put
+  personal data in them** (APM-6 rule).
+- Retention: one year (TTL) on every per-player table; the imported rates and
+  reports are not player data.
+- Deletion: `POST /api/privacy/delete` with `"id_type":"player_id"` (the SDK's
+  `GetPlayerId()`) deletes from `ops_events`, `ops_player_days`, `ops_players`
+  (found by their `player_id` column; same mechanism, audit and grant as APM-14).
+  A player's technical data is under the device id: delete both.
+- The BI account reads only the five ops tables.
+
+### BI: Metabase on ClickHouse (for the lead and the ClickHouse admin)
+
+Preset questions (`internal/opsbi/cards.go`; the SQL is tested on 23.8, 24.1
+and 26.1 by `tests/integration/apm12_test.go`), in the collection "OZX Ops":
+
+- **Players**: new players per day; daily active players; retention D1 / D7 / D30
+  by first day; sessions per player and session length; ops events per day.
+- **Funnels**: a funnel of up to five event names (filters `step1..step5`,
+  window in seconds; ClickHouse `windowFunnel`, players in order).
+- **Ads**: ad impressions per DAU (and the share of players who saw one); ad
+  revenue per day and network (USD, estimated); ARPDAU by country; ARPDAU by
+  placement; ad events by placement; the per-placement funnel entry shown ->
+  click -> show -> complete -> reward; D1/D7 retention by ad views on the first
+  day (0, 1-2, 3-5, 6+); tracked vs reported revenue per day, network and country
+  (`over_threshold` = 1 above `threshold_pct`, default 10 %, or when only one
+  side has revenue).
+
+Every question has the filters `days` (30) and `build` (`release`; `dev`,
+`editor`, `all`); dashboards map them for all their questions. Revenue in USD:
+`num_props['revenue']` times the latest imported rate on or before the
+impression's day (`ASOF JOIN` on `ops_fx_rates`); USD or no currency needs none;
+an impression in a currency without any rate counts 0 and is shown as
+`impressions_without_rate`.
+
+Setup:
+
+1. **Read-only account** (ClickHouse admin, on n192): install
+   `server/deployments/clickhouse/users.d/ozx_ops_readonly.xml` into
+   `/etc/clickhouse-server/users.d/` after setting the password's SHA-256 and the
+   address Metabase connects from (comments in the file). It grants `SELECT` on
+   the five ops tables only, `readonly = 1`, and bounds every query
+   (`max_execution_time` 60 s, `max_memory_usage` 2 GB, `max_rows_to_read` 2e9,
+   `max_bytes_to_read` 200 GB, `max_result_rows` 1e6, 8 concurrent queries),
+   with constraints so the limits cannot be raised. Check:
+   `clickhouse-client -q "SHOW GRANTS FOR ozx_ops_ro"`, and as that user
+   `SELECT count() FROM ozx_apm.ops_events` works, `SELECT count() FROM
+   ozx_apm.apm_exceptions` is refused. If Metabase's ClickHouse driver fails with
+   "Cannot modify ... setting in readonly mode", use `readonly = 2` (still no
+   writes or DDL; the constraints keep the limits).
+2. **Metabase** (lead): 0.47 or later with the ClickHouse driver
+   (`clickhouse.metabase-driver.jar` in `plugins/`), reaching ClickHouse's HTTP
+   port (8123).
+3. **Provisioning** (from `server/`, idempotent; run again after every upgrade of
+   this server to update the questions; secrets from the environment only, never
+   printed):
+   ```sh
+   export MB_URL=https://metabase.example.com MB_USER=admin@example.com MB_PASSWORD=...   # or MB_API_KEY=... (0.49+)
+   export CH_HOST=<clickhouse host as Metabase reaches it> CH_PORT=8123 CH_DATABASE=ozx_apm CH_USER=ozx_ops_ro CH_PASSWORD=...
+   go run ./cmd/metabase-provision
+   # MB_UPDATE_CONNECTION=1 also pushes CH_* to an existing connection (password rotation)
+   ```
+   It creates (or finds by name) the connection "OZX Ops (ClickHouse)", the
+   collection "OZX Ops", 14 questions "OZX Ops: ..." and the dashboards "OZX Ops:
+   Players / Funnels / Ads"; it updates a question or dashboard only when it
+   differs (edits made in the UI to these presets are replaced; other questions
+   are never touched). Designers save their own questions elsewhere or under new
+   names.
+4. **Imports** (operations, with `OZX_ADMIN_OPS_TOKEN` set on the admin
+   deployment as a secret, e.g. `openssl rand -hex 32`):
+   ```sh
+   export OZX_ADMIN_OPS_TOKEN=...
+   go run ./cmd/opsimport fx-rates  -url https://<admin> rates.csv          # date,currency,usd_per_unit
+   go run ./cmd/opsimport ad-report -url https://<admin> -network admob \
+     -map 'date=Date,country=Country,ad_unit=Ad unit,impressions=Impressions,revenue=Estimated earnings (USD)' admob.csv
+   ```
+   (`-dry-run` validates; the endpoints `POST /api/ops/import/fx-rates` and
+   `/api/ops/import/ad-report` take the CSV as body.) A file is validated as a
+   whole (one bad line: 400 with its line number, nothing stored); re-importing
+   a day replaces it. Rates: USD per unit, e.g. from the ECB's daily reference
+   rates (EUR-based: convert); no external API is called at query time.
+   Without the token the endpoints answer 403 and the log has
+   `ops import API disabled: no token configured`.
+
+### Cost
+
+SDK, Unity's Mono outside Unity (M-series Mac; `/tmp/claude-501/apm12/bench`,
+best of 5):
+
+| Path | Time | Allocated |
+|---|---|---|
+| Per frame, ops queue empty (its uploader does not run): `HasData` + consent read | 0.002 us | 0 |
+| An ops event with 3 properties: builder arrays, validation, event, `Enqueue` (lock + list add) | 0.29 us | 372 B (+ one string per number property) |
+| Context change: reduce a 31-key context to the ops keys (once per change, shared) | 1.2 us | 416 B |
+| Ops worker: serialize one event (ops context) | 0.74 us | 0; ~420 B on disk and on the wire before gzip |
+
+- Main thread per frame: `UpdateOps` (a few field reads); while ops events wait
+  for upload, the ops uploader runs per frame like the technical one (a clock
+  read; reachability once a second); no allocation outside the frames that
+  create or complete a request. One more worker thread, asleep when idle.
+  `Initialize`: one JNI call on Android for the region (unless
+  `ApmConfig.Country` is set). Session events: two small events per session
+  and pause, on the main thread at the lifecycle callbacks.
+- Server: per request with ops events one lookup query on `ops_events`
+  (`name`, `app_version`, client time range, the `event_id` bloom filter), one
+  insert, and for keys new to the process one insert each into the two player
+  tables (one row per player and day). BI queries read `ops_events` with
+  `FINAL` per month partition; DAU and retention read the small player tables.
+
+### Rolling deploy and rollback
+
+Old and new binaries serve side by side: the old one does not know the ops
+tables (it rejects ops events: `missing device_id`; SDK builds with ops events
+must ship only after this server runs everywhere), the new one stores them.
+**Rollback:** redeploy the previous binary; no schema action; the ops tables
+stay (unused; rows expire by TTL). Ops events sent while the old binary serves
+are rejected and lost: roll back SDK builds first if that matters, or set
+`ApmConfig.EnableOpsEvents = false` / leave analytics consent `Undecided`
+(events then stay on the devices). To remove the tables after a permanent
+rollback (admin): `DROP TABLE ozx_apm.ops_events, ozx_apm.ops_player_days,
+ozx_apm.ops_players, ozx_apm.ops_fx_rates, ozx_apm.ops_ad_reports` and the
+`users.d` file. SDK rollback: an older SDK ignores `ozx_apm_ops/` (a later SDK
+uploads it); its consent semantics are APM-14's.
+
+### Verified
+
+- Server: `go vet`, `go test -race -short ./...` (all packages): ops
+  normalization (whitelist, country, ids, time rules incl. clocks ahead/behind,
+  storage bounds), the handler (ops only in `ops_events`; a re-sent batch stored
+  once over three resends; derived rows once per process; failures of the
+  insert and of the player rows answered 503 and recovered by the resend; the
+  country header; the whitelist; late uploads on their day), the SDK-written
+  fixture `processor/testdata/sdk_events_apm12.jsonl` (written by the SDK's ops
+  queue on Unity's Mono) stored as sent, the schema (no device or technical
+  column in an ops table, TTLs, keys, migrate.sql regenerated), privacy
+  (`player_id` accepted, ops tables found), the imports (CSV formats, mapping,
+  whole-file refusal, dry run, token 403/401, the CLI against the handler), the
+  BI cards (declared variables = used variables, defaults render, `FINAL` on
+  every `ops_events` read, UTC days, only ops tables read), the read-only XML
+  (grants exactly the ops tables), the Metabase provisioning against a fake
+  Metabase (everything created, a second run writes nothing, a question edited
+  in the UI and a rearranged dashboard restored, other questions untouched,
+  connection rules, no secret in the log).
+- SDK: C# 8 compile (Android; iOS; with `UNITY_2021_2_OR_NEWER`); on Unity's
+  Mono outside Unity all runtime tests pass except the 2 known environment
+  failures (326 pass); new: the ops queue needs analytics, not technical
+  consent; clearing one queue leaves the other; separate sequences; unique ids;
+  the cap; `HasData`; the exact wire format (no device field even if set); the
+  context whitelist; the technical copy bypassing the budget.
+- Driver for the device: `/tmp/claude-501/apm12/ApmTestDriver.cs`
+  (compile-checked), plan `/tmp/claude-501/apm12/DEVICE_PLAN.md`.
+
+### Not verified (for the lead)
+
+- The integration tests (`tests/integration/apm12_test.go`: exactly-once on
+  both insert paths, the day rules, acceptance 2 (three devices on two
+  consecutive days: DAU 3 / 3, new players 3 / 0, D1 100 %, with the first day
+  re-sent), every preset question's numbers on a dataset of four players with
+  sessions, a run, three currencies, rates and network reports (also as the
+  read-only account), deletion by player id, the ops tables created by a copy
+  of the service account) and the schema/migration tests with the new tables:
+  not run (no ClickHouse reachable from the sandbox). The SQL was written for
+  the old analyzer of 23.8 (distinct aliases, `FULL JOIN ... USING`, `ASOF LEFT
+  JOIN`, `windowFunnel` on `toDateTime(event_time)`) but has not met a server.
+- Unity EditMode (`ApmClientOpsTests`: consent per category through ApmClient,
+  the player id across launches, session start/end, ResetPlayerId, AlsoTechnical,
+  ApmAds, the two allocation tests; `OpsQueueTests.UploadGate_*`): need the
+  Unity runtime.
+- The device: acceptance 1 (offline run, kill, flaky reconnects, every event
+  once) and the cost A/B (`DEVICE_PLAN.md`), the JNI region call on the A33.
+- Metabase itself (provisioning was tested against a fake of its API, 0.47+
+  shapes), the read-only account as an XML user (tested as an equivalent SQL
+  user), a real CDN country header, real network report exports (the column
+  mapping), iOS.

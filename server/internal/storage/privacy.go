@@ -14,8 +14,8 @@ import (
 
 // Privacy deletion (APM-14).
 //
-// Rows of one data subject (a device_id today, a player_id once APM-12
-// stores one) are removed with a mutation, ALTER TABLE <t> DELETE WHERE
+// Rows of one data subject (a device_id in the technical tables, a
+// player_id in the ops tables of APM-12) are removed with a mutation, ALTER TABLE <t> DELETE WHERE
 // <column> = ?, waited for with mutations_sync = 2. It needs the ALTER DELETE
 // privilege, which the production `apm` account does not have; RELEASE.md
 // (APM-14) has the GRANT. Without it ClickHouse answers 497 and the request
