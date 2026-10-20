@@ -65,7 +65,24 @@ type PrivacyHandler struct {
 	DeleteTimeout time.Duration
 
 	mu sync.Mutex // one deletion at a time
+
+	// sessionFiles deletes the subject's recordings (APM-13) before the
+	// tables; nil when this server has no object store configured.
+	sessionFiles SessionFilePurger
 }
+
+// SessionFilePurger deletes a subject's session file recordings: objects
+// first, then their index rows (*sessionfiles.Service).
+type SessionFilePurger interface {
+	Purge(ctx context.Context, idType, id string) models.PrivacySessionFiles
+	Count(ctx context.Context, idType, id string) (int, error)
+}
+
+// SetSessionFiles makes deletions remove the subject's recordings too.
+func (h *PrivacyHandler) SetSessionFiles(p SessionFilePurger) { h.sessionFiles = p }
+
+const sessionFilesNotConfigured = "this server has no object store configured (OZX_S3_*): the subject's session file recordings, if any, " +
+	"are not deleted here; run the deletion on a deployment with the object store (RELEASE.md APM-13)"
 
 // NewPrivacyHandler: token is the bearer token both endpoints require
 // (config admin_server.privacy_token, OZX_ADMIN_PRIVACY_TOKEN). With an empty
@@ -258,6 +275,17 @@ func (h *PrivacyHandler) runDeletion(ctx context.Context, job *models.PrivacyDel
 		return fail(fmt.Errorf("audit record could not be written, nothing was deleted: %w", err))
 	}
 
+	// Session file recordings (APM-13) first: their index rows say where
+	// the objects are, so the rows go only after the objects.
+	keepSessionFileRows := true
+	if h.sessionFiles != nil {
+		sf := h.sessionFiles.Purge(ctx, result.IDType, id)
+		result.SessionFiles = &sf
+		keepSessionFileRows = sf.Error != ""
+	} else {
+		result.Note += "; " + sessionFilesNotConfigured
+	}
+
 	tables, err := h.store.PrivacyTables(ctx, column)
 	if err == nil && len(tables) == 0 {
 		err = fmt.Errorf("no table has a %s column", column)
@@ -266,6 +294,23 @@ func (h *PrivacyHandler) runDeletion(ctx context.Context, job *models.PrivacyDel
 	var denied error
 	if err == nil {
 		for _, table := range tables {
+			if table == storage.SessionFilesTable && keepSessionFileRows {
+				// The objects were not deleted: keep the rows that point to them.
+				tr := models.PrivacyTableResult{Table: table}
+				n, cerr := h.store.CountPrivacyRows(ctx, table, column, id)
+				tr.RowsBefore, tr.RowsAfter = n, n
+				if cerr != nil {
+					tr.Error = cerr.Error()
+				} else if n > 0 {
+					tr.Error = "kept: the recordings' objects could not be deleted"
+					if h.sessionFiles == nil {
+						tr.Error = "kept: " + sessionFilesNotConfigured
+					}
+				}
+				result.Tables = append(result.Tables, tr)
+				result.RowsRemaining += tr.RowsAfter
+				continue
+			}
 			tr, terr := h.deleteFromTable(ctx, table, column, id)
 			result.Tables = append(result.Tables, tr)
 			result.RowsRemaining += tr.RowsAfter
@@ -285,6 +330,14 @@ func (h *PrivacyHandler) runDeletion(ctx context.Context, job *models.PrivacyDel
 	for _, tr := range result.Tables {
 		if tr.Error != "" {
 			tableErrors = append(tableErrors, tr.Table+": "+tr.Error)
+		}
+	}
+	if sf := result.SessionFiles; sf != nil {
+		if sf.Error != "" {
+			tableErrors = append(tableErrors, "session files: "+sf.Error)
+		} else if sf.UploadsAfter > 0 && result.IDType != "device_id" {
+			// (by device id the rows are counted in apm_session_files)
+			result.RowsRemaining += uint64(sf.UploadsAfter)
 		}
 	}
 	switch {
@@ -400,6 +453,20 @@ func (h *PrivacyHandler) Verify(w http.ResponseWriter, r *http.Request) {
 		}
 		out.Tables = append(out.Tables, models.PrivacyTableResult{Table: table, RowsAfter: n})
 		out.RowsRemaining += n
+	}
+	if h.sessionFiles != nil {
+		n, err := h.sessionFiles.Count(ctx, req.IDType, req.ID)
+		sf := &models.PrivacySessionFiles{UploadsBefore: n, UploadsAfter: n}
+		if err != nil {
+			h.logger.Error("privacy verify: session files", zap.Error(err))
+			sf.Error = "could not count the session file recordings"
+		}
+		out.SessionFiles = sf
+		if req.IDType != "device_id" {
+			out.RowsRemaining += uint64(n) // by device id they are counted in apm_session_files already
+		}
+	} else {
+		out.Note += "; " + sessionFilesNotConfigured
 	}
 	out.Deletions, err = h.store.PrivacyAuditHistory(ctx, req.IDType, out.IDHash, 50)
 	if err != nil {

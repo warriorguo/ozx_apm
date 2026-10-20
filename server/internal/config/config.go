@@ -18,6 +18,76 @@ type Config struct {
 	RateLimit   RateLimitConfig   `mapstructure:"ratelimit"`
 	Alert       AlertConfig       `mapstructure:"alert"`
 	Ops         OpsConfig         `mapstructure:"ops"`
+	S3          S3Config          `mapstructure:"s3"`
+	// SessionFiles: uploaded AiTelemetry session directories of dev builds (APM-13).
+	SessionFiles SessionFilesConfig `mapstructure:"session_files"`
+}
+
+// S3Config locates the object store of the session files (APM-13): an
+// S3-compatible bucket (SeaweedFS on n192), path-style, SigV4. Session files
+// are disabled while Endpoint, Bucket or a key is empty. The keys are
+// secrets: never logged. Environment: OZX_S3_ENDPOINT, OZX_S3_BUCKET,
+// OZX_S3_REGION, OZX_S3_ACCESS_KEY, OZX_S3_SECRET_KEY, OZX_S3_PREFIX.
+type S3Config struct {
+	Endpoint  string `mapstructure:"endpoint"`
+	Bucket    string `mapstructure:"bucket"`
+	Region    string `mapstructure:"region"`
+	AccessKey string `mapstructure:"access_key"`
+	SecretKey string `mapstructure:"secret_key"`
+	// Prefix of every key the server writes (default "session-files/"), so
+	// the bucket can be shared and the cleaner never touches other keys.
+	Prefix string `mapstructure:"prefix"`
+}
+
+// Configured reports whether the bucket and credentials are set.
+func (c S3Config) Configured() bool {
+	return c.Endpoint != "" && c.Bucket != "" && c.AccessKey != "" && c.SecretKey != ""
+}
+
+// SessionFilesConfig configures the session file upload and retrieval
+// (APM-13). Environment: OZX_SESSION_FILES_<KEY> (e.g.
+// OZX_SESSION_FILES_RETENTION_DAYS) except the admin token.
+type SessionFilesConfig struct {
+	// UploadKey: the SDK must send it (X-Apm-Upload-Key;
+	// ApmConfig.SessionFilesUploadKey, set only in development builds).
+	// Uploads are refused while it is empty. Environment:
+	// OZX_SESSION_FILES_UPLOAD_KEY. A secret: never logged.
+	UploadKey string `mapstructure:"upload_key"`
+	// AdminToken protects the list, link and download endpoints of the
+	// admin API (Authorization: Bearer); they answer 403 while it is empty.
+	// Environment: OZX_ADMIN_SESSIONFILES_TOKEN. A secret: never logged.
+	AdminToken string `mapstructure:"admin_token"`
+	// RetentionDays: a recording is deleted (object and index row) this many
+	// days after its upload started. Default 30.
+	RetentionDays int `mapstructure:"retention_days"`
+	// IncompleteDays: the parts of an upload never committed are deleted
+	// after this many days (the device then starts it again). Default 7.
+	IncompleteDays int `mapstructure:"incomplete_days"`
+	// MaxArchiveBytes bounds one recording's archive. Default 512 MiB.
+	MaxArchiveBytes int64 `mapstructure:"max_archive_bytes"`
+	// MaxUploadsPerDevicePerDay / MaxBytesPerDevicePerDay: uploads one
+	// device starts in 24 hours (429 beyond). Defaults 100 and 4 GiB.
+	MaxUploadsPerDevicePerDay int   `mapstructure:"max_uploads_per_device_per_day"`
+	MaxBytesPerDevicePerDay   int64 `mapstructure:"max_bytes_per_device_per_day"`
+	// MaxOpenUploadsPerDevice: uploads of one device started but not
+	// committed (within IncompleteDays). Default 4.
+	MaxOpenUploadsPerDevice int `mapstructure:"max_open_uploads_per_device"`
+	// CleanerInterval between two runs of the expiry cleaner. Default 1h; 0
+	// or negative disables it in this process.
+	CleanerInterval time.Duration `mapstructure:"cleaner_interval"`
+}
+
+// sessionFilesDefaults are the session_files.* defaults; each key is also
+// bound to OZX_SESSION_FILES_<KEY>.
+var sessionFilesDefaults = map[string]interface{}{
+	"retention_days":                 30,
+	"incomplete_days":                7,
+	"max_archive_bytes":              int64(512 << 20),
+	"max_uploads_per_device_per_day": 100,
+	"max_bytes_per_device_per_day":   int64(4 << 30),
+	"max_open_uploads_per_device":    4,
+	"cleaner_interval":               "1h",
+	"upload_key":                     "",
 }
 
 // OpsConfig configures the operations data channel (APM-12): what ingest
@@ -228,6 +298,24 @@ func Load() (*Config, error) {
 	_ = viper.BindEnv("ops.context_keys", "OZX_OPS_CONTEXT_KEYS")
 	viper.SetDefault("ops.country_header", "")
 	_ = viper.BindEnv("ops.country_header", "OZX_OPS_COUNTRY_HEADER")
+
+	for key, value := range sessionFilesDefaults {
+		viper.SetDefault("session_files."+key, value)
+		_ = viper.BindEnv("session_files."+key, "OZX_SESSION_FILES_"+strings.ToUpper(key))
+	}
+	viper.SetDefault("session_files.admin_token", "")
+	_ = viper.BindEnv("session_files.admin_token", "OZX_ADMIN_SESSIONFILES_TOKEN")
+	for _, key := range []string{"endpoint", "bucket", "region", "access_key", "secret_key", "prefix"} {
+		def := ""
+		switch key {
+		case "region":
+			def = "us-east-1"
+		case "prefix":
+			def = "session-files/"
+		}
+		viper.SetDefault("s3."+key, def)
+		_ = viper.BindEnv("s3."+key, "OZX_S3_"+strings.ToUpper(key))
+	}
 
 	viper.SetDefault("clickhouse.host", "localhost")
 	viper.SetDefault("clickhouse.port", 9000)

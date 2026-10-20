@@ -688,7 +688,80 @@ func (c *ClickHouseClient) Migrate(ctx context.Context) error {
 	c.migrateAlertTables(ctx)
 	c.migrateSymbolTables(ctx)
 	c.migrateOpsTables(ctx)
+	c.migrateSessionFilesTable(ctx)
 	return nil
+}
+
+// ------------------------------------------------------------------
+// Session files (APM-13)
+//
+// The index of the AiTelemetry session directories development builds
+// upload (internal/sessionfiles). The files themselves are in object
+// storage, never in ClickHouse; a row says where (object_key), what
+// (session.json's summary, sizes, SHA-256) and in which state. One row per
+// upload and state: ReplacingMergeTree(version) keeps the latest, and the
+// version's high part is the state's rank (complete > failed > uploading),
+// so a late "uploading" row of a slower replica never hides a completed
+// upload. Read with FINAL (a small table: dev builds only). The expiry
+// cleaner deletes a row (ALTER DELETE, granted for APM-14) after deleting
+// its objects; the TTL, a month later, only catches rows a cleaner never
+// reached (their objects are then removed by the cleaner's sweep of the
+// bucket). device_id makes privacy deletion (APM-14) find the rows; the
+// objects are deleted first by the privacy handler.
+// ------------------------------------------------------------------
+
+// SessionFilesTable is the index table of uploaded session files.
+const SessionFilesTable = "apm_session_files"
+
+const sessionFilesTableDDL = `CREATE TABLE IF NOT EXISTS ` + SessionFilesTable + ` (
+    upload_id String,
+    version UInt64,
+    status LowCardinality(String),
+    created_at DateTime64(3),
+    updated_at DateTime64(3),
+    expires_at DateTime,
+    device_id String,
+    session_id String,
+    recording_name String,
+    app_version LowCardinality(String),
+    app_build String,
+    build_type LowCardinality(String),
+    platform LowCardinality(String),
+    device_model String,
+    os_version String,
+    unity_version String,
+    sdk_version String,
+    git_commit String,
+    started_at String,
+    scene String,
+    data_source String,
+    data_pack_version String,
+    data_pack_sha256 String,
+    size_bytes UInt64,
+    part_bytes UInt32,
+    part_count UInt32,
+    sha256 String,
+    file_count UInt32,
+    raw_bytes UInt64,
+    object_key String,
+    session_json String,
+    error String,
+    INDEX idx_git_commit git_commit TYPE bloom_filter(0.01) GRANULARITY 1,
+    INDEX idx_device_id device_id TYPE bloom_filter(0.01) GRANULARITY 1,
+    INDEX idx_session_id session_id TYPE bloom_filter(0.01) GRANULARITY 1
+) ENGINE = ReplacingMergeTree(version)
+PARTITION BY toYYYYMM(created_at)
+ORDER BY upload_id
+TTL expires_at + INTERVAL 30 DAY`
+
+// migrateSessionFilesTable creates the index (CREATE TABLE, within the
+// service account's grant). A failure is logged and startup continues: only
+// session file uploads (503, kept on the devices) and their listing depend on it.
+func (c *ClickHouseClient) migrateSessionFilesTable(ctx context.Context) {
+	if err := c.conn.Exec(ctx, sessionFilesTableDDL); err != nil {
+		c.logger.Warn("could not create the session files table; session file uploads are refused with 503 (and kept by the devices) until it exists (RELEASE.md, APM-13)",
+			zap.String("table", SessionFilesTable), zap.Error(err))
+	}
 }
 
 // ------------------------------------------------------------------
@@ -1019,5 +1092,11 @@ func SchemaSQL() string {
 	for _, t := range opsTables {
 		sb.WriteString("\n" + t.DDL + ";\n")
 	}
+	sb.WriteString(`
+-- APM-13: index of the session files (AiTelemetry session directories of
+-- development builds) kept in object storage. See internal/storage/schema.go
+-- (sessionFilesTableDDL) and internal/sessionfiles.
+`)
+	sb.WriteString("\n" + sessionFilesTableDDL + ";\n")
 	return sb.String()
 }

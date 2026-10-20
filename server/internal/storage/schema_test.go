@@ -187,6 +187,35 @@ func TestSchema_SymbolTables(t *testing.T) {
 	}
 }
 
+// APM-13: the session files index is created by Migrate (warning on
+// failure, never a statement that must succeed), is in migrate.sql, keeps
+// the latest state per upload (version), has device_id (privacy deletion
+// finds it) and a TTL behind the cleaner's expiry.
+func TestSchema_SessionFilesTable(t *testing.T) {
+	ddl := sessionFilesTableDDL
+	for _, want := range []string{
+		"CREATE TABLE IF NOT EXISTS apm_session_files (",
+		"device_id String,", "session_id String,", "git_commit String,", "object_key String,", "version UInt64,",
+		"ENGINE = ReplacingMergeTree(version)", "PARTITION BY toYYYYMM(created_at)", "ORDER BY upload_id",
+		"TTL expires_at + INTERVAL 30 DAY", "INDEX idx_git_commit git_commit TYPE bloom_filter",
+	} {
+		if !strings.Contains(ddl, want) {
+			t.Errorf("DDL lacks %q", want)
+		}
+	}
+	if strings.Contains(ddl, "player_id") {
+		t.Error("technical data: no player id")
+	}
+	if !strings.Contains(SchemaSQL(), ddl+";\n") {
+		t.Error("migrate.sql lacks the table")
+	}
+	for _, stmt := range schemaStatements {
+		if strings.Contains(stmt, SessionFilesTable) {
+			t.Error("the table must not be a statement that has to succeed")
+		}
+	}
+}
+
 // APM-10: every event table gets the game clock columns, last in CREATE
 // TABLE and last among its ALTERs (so fresh and migrated tables have the same
 // column order); apm_custom_events gets prop_types just before them.

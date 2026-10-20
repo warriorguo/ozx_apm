@@ -161,9 +161,11 @@ func runDeletionScenario(t *testing.T, owner *storage.ClickHouseClient, router h
 	}
 	var d models.PrivacyDeletion
 	decodeInto(t, body, &d)
-	// 3 per event table and the backup, plus the duplicate unless a merge removed it.
+	// 3 per event table and the backup, plus the duplicate unless a merge
+	// removed it. The tables: the event tables, the backup and APM-13's
+	// apm_session_files (no rows of the device: nothing deleted there).
 	nt := len(storage.EventTables) + 1
-	if d.Status != models.PrivacyStatusDone || d.RowsRemaining != 0 || d.RowsDeleted < uint64(3*nt) || d.RowsDeleted > uint64(3*nt+2) || len(d.Tables) != nt {
+	if d.Status != models.PrivacyStatusDone || d.RowsRemaining != 0 || d.RowsDeleted < uint64(3*nt) || d.RowsDeleted > uint64(3*nt+2) || len(d.Tables) != nt+1 {
 		t.Errorf("deletion %+v", d)
 	}
 	t.Logf("deleted %d rows from %d tables", d.RowsDeleted, len(d.Tables))
@@ -205,7 +207,7 @@ func runDeletionScenario(t *testing.T, owner *storage.ClickHouseClient, router h
 	code, body = privacyPost(t, router, "/api/privacy/verify", target, "")
 	var v models.PrivacyVerification
 	decodeInto(t, body, &v)
-	if code != http.StatusOK || v.RowsRemaining != 0 || len(v.Tables) != nt || len(v.Deletions) != 2 ||
+	if code != http.StatusOK || v.RowsRemaining != 0 || len(v.Tables) != nt+1 || len(v.Deletions) != 2 ||
 		v.Deletions[0].Status != "done" || v.Deletions[0].RowsBefore != d.RowsDeleted {
 		t.Errorf("verify %d %+v", code, v)
 	}

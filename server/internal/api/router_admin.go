@@ -15,7 +15,8 @@ import (
 )
 
 // NewAdminRouter creates the admin API router (separate from SDK ingestion API)
-func NewAdminRouter(cfg *config.Config, repo *storage.Repository, logger *zap.Logger) *chi.Mux {
+func NewAdminRouter(cfg *config.Config, repo *storage.Repository, logger *zap.Logger, opts ...RouterOption) *chi.Mux {
+	o := applyOptions(cfg, repo, logger, opts)
 	r := chi.NewRouter()
 
 	// Global middleware
@@ -91,6 +92,10 @@ func NewAdminRouter(cfg *config.Config, repo *storage.Repository, logger *zap.Lo
 			privacyStore = repo
 		}
 		privacyHandler := admin.NewPrivacyHandler(privacyStore, logger, cfg.AdminServer.PrivacyToken)
+		if o.sessionFiles != nil {
+			// Deleting a subject deletes its session file recordings too (APM-13).
+			privacyHandler.SetSessionFiles(o.sessionFiles)
+		}
 		if !privacyHandler.Enabled() {
 			logger.Info("privacy API disabled: no token configured")
 		}
@@ -137,6 +142,23 @@ func NewAdminRouter(cfg *config.Config, repo *storage.Repository, logger *zap.Lo
 		}
 		r.Post("/ops/import/fx-rates", opsImportHandler.FXRates)
 		r.Post("/ops/import/ad-report", opsImportHandler.AdReport)
+
+		// Session files of development builds (APM-13): bearer token
+		// OZX_ADMIN_SESSIONFILES_TOKEN (or a signed link for a download);
+		// "available" tells the time line which sessions have a recording.
+		var sessionFileSvc admin.SessionFileService
+		if o.sessionFiles != nil {
+			sessionFileSvc = o.sessionFiles
+		}
+		sessionFilesHandler := admin.NewSessionFilesHandler(sessionFileSvc, logger, cfg.SessionFiles.AdminToken)
+		if !sessionFilesHandler.Enabled() {
+			logger.Info("session files API disabled: no token configured")
+		}
+		r.Get("/session-files", sessionFilesHandler.List)
+		r.Get("/session-files/detail", sessionFilesHandler.Detail)
+		r.Get("/session-files/available", sessionFilesHandler.Available)
+		r.Post("/session-files/link", sessionFilesHandler.Link)
+		r.Get("/session-files/download", sessionFilesHandler.Download)
 	})
 
 	// Serve static files for admin UI (if exists)

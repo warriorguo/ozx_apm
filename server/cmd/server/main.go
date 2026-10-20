@@ -65,10 +65,26 @@ func main() {
 	defer stopAlerts()
 	startAlerting(alertCtx, cfg.Alert, repo, logger)
 
+	// Session files of development builds (APM-13): one service for both
+	// routers and the expiry cleaner; off without the object store.
+	sessionFiles := api.NewSessionFileService(cfg, repo, logger)
+	if sessionFiles != nil {
+		logger.Info("session files enabled",
+			zap.String("s3_endpoint", cfg.S3.Endpoint), zap.String("s3_bucket", cfg.S3.Bucket),
+			zap.String("s3_prefix", cfg.S3.Prefix), zap.Int("retention_days", cfg.SessionFiles.RetentionDays),
+			zap.Bool("upload_key_set", cfg.SessionFiles.UploadKey != ""),
+			zap.Bool("admin_token_set", cfg.SessionFiles.AdminToken != ""),
+			zap.Duration("cleaner_interval", cfg.SessionFiles.CleanerInterval))
+		go sessionFiles.RunCleaner(alertCtx, cfg.SessionFiles.CleanerInterval)
+	} else {
+		logger.Info("session files disabled (OZX_S3_ENDPOINT, OZX_S3_BUCKET, OZX_S3_ACCESS_KEY, OZX_S3_SECRET_KEY not all set; RELEASE.md APM-13)")
+	}
+	routerOpts := []api.RouterOption{api.WithSessionFiles(sessionFiles)}
+
 	// Start SDK ingestion server if enabled
 	var sdkServer *http.Server
 	if cfg.Server.Enabled {
-		sdkRouter := api.NewRouter(cfg, repo, logger)
+		sdkRouter := api.NewRouter(cfg, repo, logger, routerOpts...)
 		sdkAddr := fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port)
 		sdkServer = &http.Server{
 			Addr:         sdkAddr,
@@ -88,7 +104,7 @@ func main() {
 	// Start Admin server if enabled
 	var adminServer *http.Server
 	if cfg.AdminServer.Enabled {
-		adminRouter := api.NewAdminRouter(cfg, repo, logger)
+		adminRouter := api.NewAdminRouter(cfg, repo, logger, routerOpts...)
 		adminAddr := fmt.Sprintf("%s:%d", cfg.AdminServer.Host, cfg.AdminServer.Port)
 		adminServer = &http.Server{
 			Addr:         adminAddr,

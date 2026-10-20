@@ -770,3 +770,48 @@ CREATE TABLE IF NOT EXISTS ops_ad_reports (
 PARTITION BY toYYYYMM(day)
 ORDER BY (day, network, country, placement, ad_unit)
 TTL day + INTERVAL 365 DAY;
+
+-- APM-13: index of the session files (AiTelemetry session directories of
+-- development builds) kept in object storage. See internal/storage/schema.go
+-- (sessionFilesTableDDL) and internal/sessionfiles.
+
+CREATE TABLE IF NOT EXISTS apm_session_files (
+    upload_id String,
+    version UInt64,
+    status LowCardinality(String),
+    created_at DateTime64(3),
+    updated_at DateTime64(3),
+    expires_at DateTime,
+    device_id String,
+    session_id String,
+    recording_name String,
+    app_version LowCardinality(String),
+    app_build String,
+    build_type LowCardinality(String),
+    platform LowCardinality(String),
+    device_model String,
+    os_version String,
+    unity_version String,
+    sdk_version String,
+    git_commit String,
+    started_at String,
+    scene String,
+    data_source String,
+    data_pack_version String,
+    data_pack_sha256 String,
+    size_bytes UInt64,
+    part_bytes UInt32,
+    part_count UInt32,
+    sha256 String,
+    file_count UInt32,
+    raw_bytes UInt64,
+    object_key String,
+    session_json String,
+    error String,
+    INDEX idx_git_commit git_commit TYPE bloom_filter(0.01) GRANULARITY 1,
+    INDEX idx_device_id device_id TYPE bloom_filter(0.01) GRANULARITY 1,
+    INDEX idx_session_id session_id TYPE bloom_filter(0.01) GRANULARITY 1
+) ENGINE = ReplacingMergeTree(version)
+PARTITION BY toYYYYMM(created_at)
+ORDER BY upload_id
+TTL expires_at + INTERVAL 30 DAY;

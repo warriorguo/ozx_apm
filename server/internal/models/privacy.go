@@ -45,6 +45,16 @@ type PrivacyTableResult struct {
 	Error      string `json:"error,omitempty"`
 }
 
+// PrivacySessionFiles is what a deletion did to the subject's session file
+// recordings (APM-13): their objects in the object store and index rows.
+// Found by device id, or for a player id through the sessions of the
+// player's ops events.
+type PrivacySessionFiles struct {
+	UploadsBefore int    `json:"uploads_before"`
+	UploadsAfter  int    `json:"uploads_after"`
+	Error         string `json:"error,omitempty"`
+}
+
 // PrivacyDeletion is the response of POST /api/privacy/delete.
 type PrivacyDeletion struct {
 	RequestID     string               `json:"request_id"`
@@ -58,6 +68,9 @@ type PrivacyDeletion struct {
 	RowsRemaining uint64               `json:"rows_remaining"`
 	Error         string               `json:"error,omitempty"`
 	Note          string               `json:"note,omitempty"`
+	// SessionFiles: the recordings (APM-13); nil when this server has no
+	// object store configured.
+	SessionFiles *PrivacySessionFiles `json:"session_files,omitempty"`
 }
 
 // PrivacyAuditRecord is one row of apm_privacy_deletions. A request writes
@@ -84,6 +97,8 @@ type PrivacyVerification struct {
 	RowsRemaining uint64               `json:"rows_remaining"`
 	Deletions     []PrivacyAuditRecord `json:"deletions"`
 	Note          string               `json:"note,omitempty"`
+	// SessionFiles: recordings stored now (UploadsAfter); nil without an object store.
+	SessionFiles *PrivacySessionFiles `json:"session_files,omitempty"`
 }
 
 // PrivacyIDHash is how a subject id is recorded in the audit table and in

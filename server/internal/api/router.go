@@ -15,7 +15,8 @@ import (
 )
 
 // NewRouter creates the SDK ingestion API router (separate from admin API)
-func NewRouter(cfg *config.Config, repo *storage.Repository, logger *zap.Logger) *chi.Mux {
+func NewRouter(cfg *config.Config, repo *storage.Repository, logger *zap.Logger, opts ...RouterOption) *chi.Mux {
+	o := applyOptions(cfg, repo, logger, opts)
 	r := chi.NewRouter()
 
 	// Global middleware
@@ -44,6 +45,16 @@ func NewRouter(cfg *config.Config, repo *storage.Repository, logger *zap.Logger)
 		// Ingest handler
 		ingestHandler := handlers.NewIngestHandlerWithOps(repo, logger, cfg.Ops)
 		r.Post("/events", ingestHandler.IngestEvents)
+
+		// Session files of development builds (APM-13): the upload key
+		// (and the app key above) authenticate; 503 while not configured.
+		sessionFileHandler := handlers.NewSessionFileHandler(o.sessionFiles, cfg.SessionFiles.UploadKey, logger)
+		if !sessionFileHandler.Enabled() {
+			logger.Info("session file upload disabled: OZX_S3_* or OZX_SESSION_FILES_UPLOAD_KEY not configured")
+		}
+		r.Post("/session-files", sessionFileHandler.Create)
+		r.Put("/session-files/{id}/parts/{n}", sessionFileHandler.Part)
+		r.Post("/session-files/{id}/commit", sessionFileHandler.Commit)
 
 		// Query handlers
 		queryHandler := handlers.NewQueryHandler(repo, logger)

@@ -421,3 +421,45 @@ func TestOpsContextKeys_NilAndEmpty(t *testing.T) {
 		t.Errorf("empty: %v", got)
 	}
 }
+
+// APM-13: the object store and session file settings come from OZX_S3_* and
+// OZX_SESSION_FILES_*, the admin token from OZX_ADMIN_SESSIONFILES_TOKEN.
+// Without them the feature is off.
+func TestLoad_SessionFiles(t *testing.T) {
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sf := cfg.SessionFiles
+	if cfg.S3.Configured() || cfg.S3.Region != "us-east-1" || cfg.S3.Prefix != "session-files/" ||
+		sf.RetentionDays != 30 || sf.IncompleteDays != 7 || sf.MaxArchiveBytes != 512<<20 ||
+		sf.MaxUploadsPerDevicePerDay != 100 || sf.MaxBytesPerDevicePerDay != 4<<30 || sf.MaxOpenUploadsPerDevice != 4 ||
+		sf.CleanerInterval != time.Hour || sf.UploadKey != "" || sf.AdminToken != "" {
+		t.Fatalf("defaults: s3 %v region %q prefix %q retention %d incomplete %d max %d interval %v",
+			cfg.S3.Configured(), cfg.S3.Region, cfg.S3.Prefix, sf.RetentionDays, sf.IncompleteDays, sf.MaxArchiveBytes, sf.CleanerInterval)
+	}
+	t.Setenv("OZX_S3_ENDPOINT", "http://192.168.0.192:18333")
+	t.Setenv("OZX_S3_BUCKET", "ozx-apm-sessions")
+	t.Setenv("OZX_S3_ACCESS_KEY", "ak")
+	t.Setenv("OZX_S3_SECRET_KEY", "sk")
+	t.Setenv("OZX_S3_REGION", "eu-west-1")
+	t.Setenv("OZX_S3_PREFIX", "x/")
+	t.Setenv("OZX_SESSION_FILES_RETENTION_DAYS", "14")
+	t.Setenv("OZX_SESSION_FILES_MAX_ARCHIVE_BYTES", "1048576")
+	t.Setenv("OZX_SESSION_FILES_CLEANER_INTERVAL", "10m")
+	t.Setenv("OZX_SESSION_FILES_UPLOAD_KEY", "up")
+	t.Setenv("OZX_ADMIN_SESSIONFILES_TOKEN", "adm")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sf = cfg.SessionFiles
+	if !cfg.S3.Configured() || cfg.S3.Endpoint != "http://192.168.0.192:18333" || cfg.S3.Bucket != "ozx-apm-sessions" ||
+		cfg.S3.AccessKey != "ak" || cfg.S3.SecretKey != "sk" || cfg.S3.Region != "eu-west-1" || cfg.S3.Prefix != "x/" ||
+		sf.RetentionDays != 14 || sf.MaxArchiveBytes != 1<<20 || sf.CleanerInterval != 10*time.Minute ||
+		sf.UploadKey != "up" || sf.AdminToken != "adm" {
+		t.Fatalf("from the environment: bucket %q region %q prefix %q retention %d max %d interval %v keys set %v %v",
+			cfg.S3.Bucket, cfg.S3.Region, cfg.S3.Prefix, sf.RetentionDays, sf.MaxArchiveBytes, sf.CleanerInterval,
+			sf.UploadKey == "up", sf.AdminToken == "adm")
+	}
+}
