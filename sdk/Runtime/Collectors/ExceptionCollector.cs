@@ -6,6 +6,7 @@ using System.Threading.Tasks;
 using UnityEngine;
 using OzxApm.Core;
 using OzxApm.Models;
+using OzxApm.Network;
 
 namespace OzxApm.Collectors
 {
@@ -55,6 +56,14 @@ namespace OzxApm.Collectors
     /// MaxImmediatePerWindow + MaxBucketsPerWindow + MaxFingerprintsPerWindow + 1
     /// events.
     ///
+    /// Counts of the window are checkpointed (APM-24, ICountCheckpointSource):
+    /// every count has an event id from the moment it starts, which its
+    /// checkpoint copies and its final event share. After something was
+    /// counted the collector asks the storage worker for a checkpoint (once,
+    /// then a dirty flag); the worker collects the counts at most every
+    /// ApmConfig.CountCheckpointIntervalSeconds and writes them to a file that
+    /// the next launch uploads if this process dies before the window closes.
+    ///
     /// Cost: a repeat (the same text, up to the numbers in its first line,
     /// within the window) is two hashes, one lookup and a counter under a
     /// lock: no parsing, no allocation. A new text is parsed once (outside the
@@ -62,7 +71,7 @@ namespace OzxApm.Collectors
     /// the main thread's Update. Nothing is ever logged or enqueued while the
     /// lock is held (Unity may hold its own log lock while calling us).
     /// </summary>
-    public class ExceptionCollector : ICollector
+    public class ExceptionCollector : ICollector, ICountCheckpointSource
     {
         private readonly ApmConfig _config;
         private readonly ApmClient _client;
@@ -149,6 +158,16 @@ namespace OzxApm.Collectors
         [ThreadStatic] private static int t_echoTick;
         private int _windowId;
 
+        // ---- Count checkpoints (APM-24), guarded by _sync ----
+        // Something was counted (or a window closed) since the storage worker
+        // last collected the counts.
+        private bool _cpDirty;
+        // Windows closed whose events are not handed to the queue yet: a
+        // checkpoint now would hold them in neither place (Busy).
+        private int _closing;
+        private readonly EventIdSource _ids = new EventIdSource();
+        private ulong _untrackedIdHi, _untrackedIdLo; // the window's summary event
+
         // Breadcrumbs and recent warning/error lines (APM-6): the Timeline,
         // shared with the other collectors. Sent with the first occurrence of
         // an exception: the most recent breadcrumbs and log lines merged by
@@ -192,6 +211,9 @@ namespace OzxApm.Collectors
             public double FirstGameT;  // APM-10: the game clock of the first occurrence
             public int FirstFrame1;    // its frame + 1; 0: none
             public bool Merged;
+            // APM-24: the event id of this count, from its first occurrence
+            // (shared by its checkpoint copies and its final event).
+            public ulong IdHi, IdLo;
         }
 
         private struct Occurrence
@@ -309,12 +331,16 @@ namespace OzxApm.Collectors
         // Test seams: receive the events instead of ApmClient.EnqueueEvent, and
         // activate without subscribing to Unity's log callback.
         internal Action<ExceptionEvent> EnqueueForTests;
+        /// <summary>Test seam: receives the checkpoint requests (urgent) instead of ApmClient.</summary>
+        internal Action<bool> CheckpointRequestedForTests;
         internal void ActivateForTests()
         {
             _mainThreadId = Environment.CurrentManagedThreadId;
             Volatile.Write(ref _windowStartTick, Environment.TickCount);
+            List<ExceptionEvent> closed;
             lock (_sync)
-                SyncSessionLocked();
+                closed = SyncSessionLocked();
+            EnqueueAll(closed);
             _isActive = true;
         }
         internal SessionClock ClockForTests { set => _clock = value; }
@@ -346,8 +372,10 @@ namespace OzxApm.Collectors
             // Main thread (ApmClient).
             _mainThreadId = Environment.CurrentManagedThreadId;
             Volatile.Write(ref _windowStartTick, Environment.TickCount);
+            List<ExceptionEvent> closed;
             lock (_sync)
-                SyncSessionLocked();
+                closed = SyncSessionLocked();
+            EnqueueAll(closed); // a window of an earlier start (normally none: Stop flushed it)
             _isActive = true;
 
             // One callback for every thread: logMessageReceivedThreaded is called
@@ -520,12 +548,14 @@ namespace OzxApm.Collectors
             var ctx = GameContext.Current;
             List<ExceptionEvent> closed = null;
             bool counted = false;
+            bool checkpoint = false;
             lock (_sync)
             {
                 // Checked under the lock: after Stop's final flush nothing is counted.
                 if (!_isActive)
                     return;
                 closed = SyncSessionLocked();
+                bool wasDirty = _cpDirty;
                 if (_byRawKey.TryGetValue(key, out var known))
                 {
                     counted = true;
@@ -541,8 +571,11 @@ namespace OzxApm.Collectors
                             RememberLog(known.Fingerprint, target, ref occ);
                     }
                 }
+                checkpoint = !wasDirty && _cpDirty;
             }
             EnqueueAll(closed);
+            if (checkpoint)
+                RequestCheckpoint(false);
             if (counted)
                 return;
 
@@ -561,11 +594,13 @@ namespace OzxApm.Collectors
         {
             ExceptionEvent first = null;
             List<ExceptionEvent> closed = null;
+            bool checkpoint = false;
             lock (_sync)
             {
                 if (!_isActive)
                     return;
                 closed = SyncSessionLocked();
+                bool wasDirty = _cpDirty;
                 if (track && unhandled == null && IsEchoOfUnhandled(info))
                     goto Done;
 
@@ -627,11 +662,14 @@ namespace OzxApm.Collectors
                     // (errors and asserts are; exceptions are not).
                     _timeline.RecordText("Exception: " + Truncate(FirstLine(info.Message), 100), nowMs);
                 }
-            Done:;
+            Done:
+                checkpoint = !wasDirty && _cpDirty;
             }
             EnqueueAll(closed);
             if (first != null)
                 Enqueue(first);
+            if (checkpoint)
+                RequestCheckpoint(false);
         }
 
         // ---- Unhandled exceptions ----
@@ -692,9 +730,11 @@ namespace OzxApm.Collectors
             ExceptionEvent release = null;
             List<ExceptionEvent> closed = null;
             bool done = false;
+            bool checkpoint = false;
             lock (_sync)
             {
                 closed = SyncSessionLocked();
+                bool wasDirty = _cpDirty;
                 if (!mainThread && ReferenceEquals(t_logOwner, this) && t_logFingerprint == info.Fingerprint &&
                     unchecked(Environment.TickCount - t_logTick) < EchoWindowMs)
                 {
@@ -716,6 +756,7 @@ namespace OzxApm.Collectors
                         {
                             // Only this occurrence: the count itself becomes unhandled.
                             bucket.Unhandled = kind;
+                            _cpDirty = true;
                         }
                         else if (bucket.FirstSeq != occ.Seq)
                         {
@@ -728,11 +769,14 @@ namespace OzxApm.Collectors
                     }
                     // An untracked one (in the window's summary): counted once already.
                 }
+                checkpoint = !wasDirty && _cpDirty;
             }
 
             EnqueueAll(closed);
             if (release != null)
                 Enqueue(release);
+            if (checkpoint)
+                RequestCheckpoint(false);
             if (!done)
             {
                 if (!mainThread)
@@ -886,9 +930,11 @@ namespace OzxApm.Collectors
                 b.FirstSessionMs = occ.SessionMs;
                 b.FirstGameT = occ.GameT;
                 b.FirstFrame1 = occ.Frame1;
+                _ids.Next(out b.IdHi, out b.IdLo);
             }
             b.Count++;
             e.Last = b;
+            _cpDirty = true;
             return b;
         }
 
@@ -913,6 +959,7 @@ namespace OzxApm.Collectors
             {
                 _untrackedFirst = occ;
                 _untrackedMerged = false;
+                _ids.Next(out _untrackedIdHi, out _untrackedIdLo);
             }
             else
             {
@@ -929,6 +976,7 @@ namespace OzxApm.Collectors
             _untrackedTotal++;
             if (fingerprint != null && _untrackedFingerprints.Count < MaxUntrackedFingerprints)
                 _untrackedFingerprints.Add(fingerprint);
+            _cpDirty = true;
         }
 
         /// <summary>
@@ -957,23 +1005,7 @@ namespace OzxApm.Collectors
             }
 
             if (_untrackedCount > 0)
-            {
-                int kinds = Math.Max(1, _untrackedFingerprints.Count);
-                string message = "[OzxApm] " + _untrackedCount.ToString(CultureInfo.InvariantCulture) + " errors of " +
-                                 kinds.ToString(CultureInfo.InvariantCulture) + " kinds not reported one by one: more than " +
-                                 MaxFingerprintsPerWindow.ToString(CultureInfo.InvariantCulture) + " different errors within " +
-                                 (WindowMs / 1000).ToString(CultureInfo.InvariantCulture) + " seconds";
-                var summary = new Entry
-                {
-                    LogType = ExceptionParser.LogTypeError,
-                    Message = message,
-                    Stack = "",
-                    Embedded = ""
-                };
-                summary.Fingerprint = ExceptionParser.Analyze(summary.LogType, summary.Message, "", "").Fingerprint;
-                var occ = _untrackedFirst;
-                (events ?? (events = new List<ExceptionEvent>())).Add(BuildEvent(summary, _untrackedCount, ref occ, _untrackedMerged, _windowSessionId, null));
-            }
+                (events ?? (events = new List<ExceptionEvent>())).Add(BuildSummaryLocked());
 
             _entries.Clear();
             _byRawKey.Clear();
@@ -986,8 +1018,39 @@ namespace OzxApm.Collectors
             _windowId++;
             Volatile.Write(ref _windowStartTick, Environment.TickCount);
             if (events != null)
+            {
                 _eventsEnqueued += events.Count - held; // held ones were counted when built
+                // Until EnqueueAll has handed them to the queue (APM-24).
+                _closing++;
+            }
             return events;
+        }
+
+        /// <summary>
+        /// The window's summary of the occurrences beyond MaxFingerprintsPerWindow
+        /// (its own group: "[OzxApm] N errors of M kinds not reported one by
+        /// one"). Caller holds _sync; _untrackedCount > 0.
+        /// </summary>
+        private ExceptionEvent BuildSummaryLocked()
+        {
+            int kinds = Math.Max(1, _untrackedFingerprints.Count);
+            string message = "[OzxApm] " + _untrackedCount.ToString(CultureInfo.InvariantCulture) + " errors of " +
+                             kinds.ToString(CultureInfo.InvariantCulture) + " kinds not reported one by one: more than " +
+                             MaxFingerprintsPerWindow.ToString(CultureInfo.InvariantCulture) + " different errors within " +
+                             (WindowMs / 1000).ToString(CultureInfo.InvariantCulture) + " seconds";
+            var summary = new Entry
+            {
+                LogType = ExceptionParser.LogTypeError,
+                Message = message,
+                Stack = "",
+                Embedded = ""
+            };
+            summary.Fingerprint = ExceptionParser.Analyze(summary.LogType, summary.Message, "", "").Fingerprint;
+            var occ = _untrackedFirst;
+            var evt = BuildEvent(summary, _untrackedCount, ref occ, _untrackedMerged, _windowSessionId, null);
+            evt.id_hi = _untrackedIdHi;
+            evt.id_lo = _untrackedIdLo;
+            return evt;
         }
 
         private static void AddBucketEvent(ref List<ExceptionEvent> events, Entry e, Bucket b, string sessionId)
@@ -1004,7 +1067,10 @@ namespace OzxApm.Collectors
                 Ctx = b.Ctx,
                 Unhandled = b.Unhandled
             };
-            (events ?? (events = new List<ExceptionEvent>())).Add(BuildEvent(e, b.Count, ref occ, b.Merged, sessionId, null));
+            var evt = BuildEvent(e, b.Count, ref occ, b.Merged, sessionId, null);
+            evt.id_hi = b.IdHi;
+            evt.id_lo = b.IdLo;
+            (events ?? (events = new List<ExceptionEvent>())).Add(evt);
         }
 
         /// <summary>
@@ -1097,12 +1163,82 @@ namespace OzxApm.Collectors
             };
         }
 
+        /// <summary>
+        /// Hands a closed window's events (CloseWindowLocked) to the queue, then
+        /// lets the storage worker rewrite the checkpoint without them (APM-24).
+        /// Every non-null result of CloseWindowLocked must come here. Never
+        /// called with _sync held.
+        /// </summary>
         private void EnqueueAll(List<ExceptionEvent> events)
         {
             if (events == null)
                 return;
-            for (int i = 0; i < events.Count; i++)
-                Enqueue(events[i]);
+            try
+            {
+                for (int i = 0; i < events.Count; i++)
+                    Enqueue(events[i]);
+            }
+            finally
+            {
+                lock (_sync)
+                {
+                    _closing--;
+                    _cpDirty = true;
+                }
+                RequestCheckpoint(true);
+            }
+        }
+
+        private void RequestCheckpoint(bool urgent)
+        {
+            var test = CheckpointRequestedForTests;
+            if (test != null)
+            {
+                test(urgent);
+                return;
+            }
+            _client?.RequestCountCheckpoint(urgent);
+        }
+
+        // ---- ICountCheckpointSource (APM-24) ----
+
+        string ICountCheckpointSource.CheckpointName => "exceptions";
+
+        CheckpointCollect ICountCheckpointSource.CollectCheckpoint(List<BaseEvent> into, bool force) =>
+            CollectCheckpoint(into, force);
+
+        /// <summary>
+        /// The window's pending counts as its close would send them now (with
+        /// their ids): every bucket with a count and the summary. Held first
+        /// occurrences are not counts (they are queued within HoldMs). Called on
+        /// the storage worker; allocates the events there.
+        /// </summary>
+        internal CheckpointCollect CollectCheckpoint(List<BaseEvent> into, bool force)
+        {
+            lock (_sync)
+            {
+                if (_closing > 0)
+                    return CheckpointCollect.Busy;
+                if (!_cpDirty && !force)
+                    return CheckpointCollect.Unchanged;
+                _cpDirty = false;
+                List<ExceptionEvent> events = null;
+                foreach (var kvp in _entries)
+                {
+                    var e = kvp.Value;
+                    for (int i = 0; i < e.BucketCount; i++)
+                        AddBucketEvent(ref events, e, e.Buckets[i], _windowSessionId);
+                    if (e.Overflow != null)
+                        AddBucketEvent(ref events, e, e.Overflow, _windowSessionId);
+                    if (e.UnhandledOverflow != null)
+                        AddBucketEvent(ref events, e, e.UnhandledOverflow, _windowSessionId);
+                }
+                if (events != null)
+                    into.AddRange(events);
+                if (_untrackedCount > 0)
+                    into.Add(BuildSummaryLocked());
+            }
+            return CheckpointCollect.Collected;
         }
 
         // Never called with _sync held.

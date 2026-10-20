@@ -2,6 +2,10 @@ package handlers
 
 import (
 	"net/http"
+	"os"
+	"regexp"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -88,5 +92,37 @@ func TestIngest_CheckpointCopyAndFinalCount_OnlyOneIsStored(t *testing.T) {
 	}
 	if len(store.exceptions) != 1 || store.exceptions[0].Count != 100 {
 		t.Errorf("stored: %+v", store.exceptions)
+	}
+}
+
+// The checkpoint lines as the APM-24 SDK writes them (serialized on Unity's
+// Mono by the SDK's storage worker: testdata/sdk_events_apm24.jsonl) are
+// stored with the flag and their counts.
+func TestIngest_RecoveredCountsFromTheSDK(t *testing.T) {
+	b, err := os.ReadFile("../../processor/testdata/sdk_events_apm24.jsonl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := regexp.MustCompile(`"timestamp":\d+`)
+	now := `"timestamp":` + strconv.FormatInt(time.Now().UnixMilli(), 10)
+	var lines []string
+	for _, l := range strings.Split(strings.TrimSpace(string(b)), "\n") {
+		lines = append(lines, ts.ReplaceAllString(l, now))
+	}
+	store := &fakeEventStore{}
+	h := newIngestHandler(store, zap.NewNop())
+	w, resp := postBatch(t, h, batchOf(lines...), map[string]string{SDKVersionHeader: "2.0.0"})
+	if w.Code != http.StatusOK || resp.Accepted != 3 || resp.Rejected != 0 {
+		t.Fatalf("code %d resp %+v", w.Code, resp)
+	}
+	if len(store.exceptions) != 1 || store.exceptions[0].Count != 57 || !bool(store.exceptions[0].Recovered) ||
+		store.exceptions[0].Seq != 0 || store.exceptions[0].ErrorSeq != 2 || store.exceptions[0].Context["roomId"] != "r-12" {
+		t.Errorf("exception: %+v", store.exceptions)
+	}
+	if len(store.customs) != 1 || store.customs[0].Count != 120 || !bool(store.customs[0].Aggregated) || !bool(store.customs[0].Recovered) {
+		t.Errorf("custom event: %+v", store.customs)
+	}
+	if len(store.metricRows) != 1 || store.metricRows[0].Count != 4 || !bool(store.metricRows[0].Recovered) {
+		t.Errorf("metric: %+v", store.metricRows)
 	}
 }

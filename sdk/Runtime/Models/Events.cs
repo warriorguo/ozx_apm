@@ -52,6 +52,13 @@ namespace OzxApm.Models
         /// </summary>
         [NonSerialized] internal double game_t;
         [NonSerialized] internal int frame = -1;
+
+        /// <summary>
+        /// APM-24: a pending count as written to the storage's checkpoint file
+        /// (sent as "recovered":true, only if the process died before the
+        /// count's window closed). Never set on the events the window sends.
+        /// </summary>
+        [NonSerialized] internal bool recovered;
     }
 
     [Serializable]

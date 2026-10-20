@@ -112,5 +112,13 @@ namespace OzxApm.Core
         public string BuildType;
         /// <summary>False in the Unity Editor unless ApmConfig.UploadInEditor.</summary>
         public bool UploadsEnabled;
+        /// <summary>APM-24: count checkpoint files written in this process (storage worker).</summary>
+        public long CountCheckpoints;
+        /// <summary>Size of the last count checkpoint written (bytes; 0 once deleted at a window close).</summary>
+        public long CountCheckpointBytes;
+        /// <summary>Count checkpoints of an earlier process found at this launch and queued for upload.</summary>
+        public long CountCheckpointsRecovered;
+        /// <summary>Pending counts left out of a checkpoint because it was full (they still go out with their window).</summary>
+        public long CountCheckpointOmitted;
     }
 }

@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Threading;
 using OzxApm.Core;
 using OzxApm.Models;
+using OzxApm.Network;
 using OzxApm.Utils;
 
 namespace OzxApm.Collectors
@@ -31,6 +32,13 @@ namespace OzxApm.Collectors
     /// MaxNamesPerWindow names per kind (further names are dropped and
     /// counted in ApmStats).
     ///
+    /// Checkpoints (APM-24, ICountCheckpointSource): the aggregated event counts
+    /// and metric series of the window are written by the storage worker at
+    /// most every ApmConfig.CountCheckpointIntervalSeconds after something was
+    /// counted; each series has an event id from its start, shared by its
+    /// checkpoint copies and its final event. If the process dies, the next
+    /// launch uploads the last checkpoint.
+    ///
     /// Cost: recording a sample is a lock, a dictionary lookup by name and a
     /// binary search in the series' histogram; it allocates nothing once the
     /// name has been seen (series and histograms are reused across windows).
@@ -38,7 +46,7 @@ namespace OzxApm.Collectors
     /// Thread-safe: any thread may record; the window is closed by the main
     /// thread's Update. Nothing is logged or enqueued while the lock is held.
     /// </summary>
-    public class CustomCollector : ICollector
+    public class CustomCollector : ICollector, ICountCheckpointSource
     {
         internal const int WindowMs = 60000;
         internal const int MaxSeriesPerWindow = 128;
@@ -92,6 +100,11 @@ namespace OzxApm.Collectors
         private readonly List<NameEntry> _used = new List<NameEntry>(2 * MaxNamesPerWindow);
         private readonly Stack<Series> _free = new Stack<Series>();
 
+        // ---- Count checkpoints (APM-24), guarded by _sync ----
+        private bool _cpDirty;   // counted (or a window closed) since the last collection
+        private int _closing;    // windows closed whose events are not queued yet
+        private readonly EventIdSource _ids = new EventIdSource();
+
         // ---- Totals since start (ApmStats), guarded by _sync ----
         private long _eventsTracked;
         private long _eventsAggregated;
@@ -114,6 +127,9 @@ namespace OzxApm.Collectors
             public double Max;
             public long FirstMs;
             public MetricHistogram Hist; // metrics; kept when the series is reused
+            // APM-24: the event id of this window's count/series, shared by its
+            // checkpoint copies and its final event.
+            public ulong IdHi, IdLo;
         }
 
         private sealed class NameEntry
@@ -137,6 +153,8 @@ namespace OzxApm.Collectors
 
         // Test seams.
         internal Action<BaseEvent> EnqueueForTests;
+        /// <summary>Test seam: receives the checkpoint requests (urgent) instead of ApmClient.</summary>
+        internal Action<bool> CheckpointRequestedForTests;
         internal SessionClock ClockForTests { set => _clock = value; }
         internal void ActivateForTests()
         {
@@ -164,13 +182,15 @@ namespace OzxApm.Collectors
 
         private void StartWindow()
         {
+            List<BaseEvent> closed;
             lock (_sync)
             {
                 _windowStartMs = Timeline.NowMs();
                 Volatile.Write(ref _windowStartTick, Environment.TickCount);
                 _budgetStartTick = Environment.TickCount;
-                SyncSessionLocked();
+                closed = SyncSessionLocked();
             }
+            EnqueueAll(closed); // a window of an earlier start (normally none: Stop flushed it)
         }
 
         // Caller holds _sync. True if this call of name may be sent on its own.
@@ -276,6 +296,7 @@ namespace OzxApm.Collectors
 
             CustomEvent evt = null;
             List<BaseEvent> closed;
+            bool checkpoint = false;
             lock (_sync)
             {
                 if (!_isActive)
@@ -307,12 +328,16 @@ namespace OzxApm.Collectors
                             s.FirstMs = now;
                         s.Count++;
                         _eventsAggregated++;
+                        checkpoint = !_cpDirty;
+                        _cpDirty = true;
                     }
                 }
             }
             EnqueueAll(closed);
             if (evt != null)
                 Enqueue(evt);
+            if (checkpoint)
+                RequestCheckpoint(false);
             return true;
         }
 
@@ -430,6 +455,7 @@ namespace OzxApm.Collectors
             var ctx = GameContext.Current;
             int key = MetricBuckets.Key(value);
             List<BaseEvent> closed;
+            bool checkpoint = false;
             lock (_sync)
             {
                 if (!_isActive)
@@ -461,9 +487,13 @@ namespace OzxApm.Collectors
                     s.Sum += value;
                     s.Hist.Add(key);
                     _samples++;
+                    checkpoint = !_cpDirty;
+                    _cpDirty = true;
                 }
             }
             EnqueueAll(closed);
+            if (checkpoint)
+                RequestCheckpoint(false);
             return true;
         }
 
@@ -562,6 +592,7 @@ namespace OzxApm.Collectors
             s.Min = 0;
             s.Max = 0;
             s.FirstMs = 0;
+            _ids.Next(out s.IdHi, out s.IdLo); // APM-24
             if (metric)
             {
                 if (s.Hist == null)
@@ -642,6 +673,8 @@ namespace OzxApm.Collectors
             _windowId++;
             _windowStartMs = now;
             Volatile.Write(ref _windowStartTick, Environment.TickCount);
+            if (events != null)
+                _closing++; // until EnqueueAll has queued them (APM-24)
             return events;
         }
 
@@ -659,7 +692,9 @@ namespace OzxApm.Collectors
                     aggregated = true,
                     ctx_merged = s.Merged,
                     ctx = s.Ctx,
-                    session_id = _windowSessionId
+                    session_id = _windowSessionId,
+                    id_hi = s.IdHi,
+                    id_lo = s.IdLo
                 });
                 return;
             }
@@ -679,16 +714,81 @@ namespace OzxApm.Collectors
                 hist_counts = counts,
                 ctx_merged = s.Merged,
                 ctx = s.Ctx,
-                session_id = _windowSessionId
+                session_id = _windowSessionId,
+                id_hi = s.IdHi,
+                id_lo = s.IdLo
             });
         }
 
+        /// <summary>
+        /// Hands a closed window's events (CloseWindowLocked) to the queue, then
+        /// lets the storage worker rewrite the checkpoint without them (APM-24).
+        /// Every non-null result of CloseWindowLocked must come here. Never
+        /// called with _sync held.
+        /// </summary>
         private void EnqueueAll(List<BaseEvent> events)
         {
             if (events == null)
                 return;
-            for (int i = 0; i < events.Count; i++)
-                Enqueue(events[i]);
+            try
+            {
+                for (int i = 0; i < events.Count; i++)
+                    Enqueue(events[i]);
+            }
+            finally
+            {
+                lock (_sync)
+                {
+                    _closing--;
+                    _cpDirty = true;
+                }
+                RequestCheckpoint(true);
+            }
+        }
+
+        private void RequestCheckpoint(bool urgent)
+        {
+            var test = CheckpointRequestedForTests;
+            if (test != null)
+            {
+                test(urgent);
+                return;
+            }
+            _client?.RequestCountCheckpoint(urgent);
+        }
+
+        // ---- ICountCheckpointSource (APM-24) ----
+
+        string ICountCheckpointSource.CheckpointName => "custom";
+
+        CheckpointCollect ICountCheckpointSource.CollectCheckpoint(List<BaseEvent> into, bool force) =>
+            CollectCheckpoint(into, force);
+
+        /// <summary>
+        /// The window's aggregated event counts and metric series as its close
+        /// would send them now (window_ms up to now, with their ids). Called on
+        /// the storage worker; allocates the events (and histogram arrays) there.
+        /// </summary>
+        internal CheckpointCollect CollectCheckpoint(List<BaseEvent> into, bool force)
+        {
+            lock (_sync)
+            {
+                if (_closing > 0)
+                    return CheckpointCollect.Busy;
+                if (!_cpDirty && !force)
+                    return CheckpointCollect.Unchanged;
+                _cpDirty = false;
+                long windowMs = Math.Max(0, Timeline.NowMs() - _windowStartMs);
+                for (int n = 0; n < _used.Count; n++)
+                {
+                    var ne = _used[n];
+                    for (int i = 0; i < ne.Count; i++)
+                        AddEvent(into, ne.Series[i], windowMs);
+                    if (ne.Overflow != null)
+                        AddEvent(into, ne.Overflow, windowMs);
+                }
+            }
+            return CheckpointCollect.Collected;
         }
 
         // Never called with _sync held.

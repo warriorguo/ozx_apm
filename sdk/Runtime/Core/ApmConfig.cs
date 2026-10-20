@@ -200,6 +200,19 @@ namespace OzxApm.Core
         public int PersistIntervalMs { get; set; } = 200;
 
         /// <summary>
+        /// APM-24: how often (at most) the counts that wait in memory until
+        /// their one-minute window closes (repeats of an exception, custom events
+        /// beyond the per-minute budget, custom metric samples) are written to a
+        /// checkpoint file by the storage worker, and only after something was
+        /// counted. If the process dies in the foreground (crash, kill, OOM) the
+        /// next launch uploads them, so at most this many seconds of counts are
+        /// lost instead of the whole minute. Clamped to 1..60 s; 0 (or less)
+        /// turns checkpoints off. Off the main thread; one small file rewritten
+        /// in place of the previous one. Default 5 s.
+        /// </summary>
+        public float CountCheckpointIntervalSeconds { get; set; } = 5.0f;
+
+        /// <summary>
         /// First retry delay after a failed upload (seconds). Doubles per consecutive failure.
         /// </summary>
         public float RetryBaseDelaySeconds { get; set; } = 5.0f;

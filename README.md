@@ -135,7 +135,13 @@ var config = new ApmConfig
 
     // Offline support
     EnableOfflineStorage = true,
-    MaxOfflineStorageBytes = 5 * 1024 * 1024
+    MaxOfflineStorageBytes = 5 * 1024 * 1024,
+    // Repeat counts of errors, custom events beyond the budget and metric
+    // samples wait in memory for their one-minute window; they are written to a
+    // checkpoint file at most this often (off the main thread, only after
+    // something was counted), so a kill or crash loses at most this much of
+    // them (APM-24). 0 turns it off.
+    CountCheckpointIntervalSeconds = 5f
 };
 
 ApmClient.Initialize(config);
@@ -190,6 +196,11 @@ ApmClient.StopTimer(t);                                   // or StopTimer("room_
   characters, at most 64 properties (the context's limits). **Never put personal
   data in names, properties or units.** Technical data: collected only with
   technical consent; business events (purchases, funnels) are not for this API.
+- Counts and metric windows survive a kill or crash up to the last checkpoint
+  (`CountCheckpointIntervalSeconds`, 5 s): the next launch uploads them with
+  `recovered = 1`; a window that closes normally replaces its checkpoint (same
+  event id: the server never counts both). The same holds for repeat counts of
+  errors.
 
 ### Memory, game runs and count ranges
 

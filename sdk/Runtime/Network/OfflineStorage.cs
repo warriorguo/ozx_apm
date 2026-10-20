@@ -224,6 +224,42 @@ namespace OzxApm.Network
         private readonly MemoryStream _bodyBuffer = new MemoryStream(16 * 1024);
         private readonly MemoryStream _gzipBuffer = new MemoryStream(8 * 1024);
 
+        // ---- Count checkpoints (APM-24) ----
+        // "<name>.ckpt": the pending counts of one ICountCheckpointSource, one
+        // event per line exactly as uploaded ("recovered":true, seq 0). Written
+        // as "<name>.ckpt.tmp" and renamed. At the next launch LoadExisting
+        // turns a file left behind into a sealed segment.
+        private const string CheckpointExtension = ".ckpt";
+        private const string CheckpointTmpExtension = ".ckpt.tmp";
+        private const string CheckpointPrefix = "counts-";
+
+        private sealed class CheckpointSlot
+        {
+            public ICountCheckpointSource Source;
+            public string Path;
+            public string TmpPath;
+            public readonly List<BaseEvent> Events = new List<BaseEvent>();
+            public bool Collected;
+            public bool HasFile; // worker's view: a .ckpt or .ckpt.tmp of this slot may exist
+        }
+
+        private CheckpointSlot[] _cpSlots = new CheckpointSlot[0]; // replaced under _lock; read by the worker
+        private bool _cpRequested;   // under _lock: a source changed (or a window closed) since the last collection
+        private bool _cpUrgent;      // under _lock: collect at the next iteration, whatever the interval
+        private int _cpLastTick;     // worker: Environment.TickCount of the last collection
+        private bool _cpCollectedOnce; // worker
+        private bool _cpForce;       // worker: collect even unchanged sources (a collection was discarded)
+        private bool _writeFailedInPump; // worker: events of this iteration did not reach the disk
+        private readonly MemoryStream _cpBuffer = new MemoryStream(4 * 1024);
+        private long _cpWrites, _cpLastBytes, _cpRecoveredFiles, _cpOmitted;
+
+        /// <summary>
+        /// APM-24: fills the common fields (version, device, session, scene,
+        /// build type...) of a checkpoint event, as ApmClient.EnqueueEvent does
+        /// for queued events. Called on the worker thread.
+        /// </summary>
+        internal Action<BaseEvent> CheckpointStamp;
+
         /// <summary>
         /// Test seam: called with the segment stream before every append; may
         /// write partial data and throw to simulate a failing disk.
@@ -400,6 +436,362 @@ namespace OzxApm.Network
                 MarkBusy();
             }
             _wake.Set();
+        }
+
+        // ------------------------------------------------------------------
+        // Count checkpoints (APM-24)
+        //
+        // Collectors keep repeat counts, over-budget custom events and metric
+        // series in memory until their one-minute window closes; a process
+        // killed in the foreground lost all of them. The worker now writes
+        // what such a source would send, at most every
+        // CountCheckpointIntervalSeconds and only after it changed, to
+        // "counts-<name>.ckpt". The window's final events carry the same event
+        // ids as these copies, and the file is rewritten (deleted when empty)
+        // in the worker iteration that writes them. At the next launch a file
+        // left behind becomes a segment: what was counted up to the last
+        // checkpoint reaches the server once (an id stored already is dropped
+        // there as a duplicate).
+        // ------------------------------------------------------------------
+
+        /// <summary>The checkpoint interval in ms; 0: off.</summary>
+        internal int CheckpointIntervalMs
+        {
+            get
+            {
+                float s = _config.CountCheckpointIntervalSeconds;
+                if (!(s > 0f))
+                    return 0;
+                return (int)(Math.Min(60f, Math.Max(1f, s)) * 1000f);
+            }
+        }
+
+        /// <summary>
+        /// Registers a source of pending counts (ApmClient, once per collector).
+        /// Any thread; before or after Start.
+        /// </summary>
+        internal void AddCheckpointSource(ICountCheckpointSource source)
+        {
+            if (source == null)
+                return;
+            var slot = new CheckpointSlot
+            {
+                Source = source,
+                Path = Path.Combine(_storagePath, CheckpointPrefix + source.CheckpointName + CheckpointExtension),
+                TmpPath = Path.Combine(_storagePath, CheckpointPrefix + source.CheckpointName + CheckpointTmpExtension)
+            };
+            lock (_lock)
+            {
+                var slots = new CheckpointSlot[_cpSlots.Length + 1];
+                Array.Copy(_cpSlots, slots, _cpSlots.Length);
+                slots[_cpSlots.Length] = slot;
+                _cpSlots = slots;
+            }
+        }
+
+        /// <summary>
+        /// A source changed (something was counted: at most once per
+        /// checkpoint, the source keeps a dirty flag) or closed a window
+        /// (urgent: its file must stop holding counts the queue now has). Any
+        /// thread, never with the source's lock held: a lock and, if the worker
+        /// is in its long sleep, one signal.
+        /// </summary>
+        internal void RequestCheckpoint(bool urgent)
+        {
+            if (!_persistToDisk || CheckpointIntervalMs <= 0)
+                return;
+            bool wake;
+            lock (_lock)
+            {
+                if (_stopRequested)
+                    return;
+                _cpRequested = true;
+                _cpUrgent |= urgent;
+                wake = _workerLongWait;
+                _workerLongWait = false;
+            }
+            if (wake)
+                _wake.Set();
+        }
+
+        /// <summary>Test seam: the checkpoint interval has passed since the last collection.</summary>
+        internal void ExpireCheckpointIntervalForTests() => _cpLastTick = unchecked(Environment.TickCount - CheckpointIntervalMs - 1);
+
+        /// <summary>Checkpoint files written in this process.</summary>
+        internal long CheckpointWrites => Interlocked.Read(ref _cpWrites);
+
+        /// <summary>Size of the last checkpoint file written (bytes; 0 after it was deleted).</summary>
+        internal long CheckpointLastBytes => Interlocked.Read(ref _cpLastBytes);
+
+        /// <summary>Checkpoint files of an earlier process found at start and queued for upload.</summary>
+        internal long CheckpointsRecovered => Interlocked.Read(ref _cpRecoveredFiles);
+
+        /// <summary>Pending counts left out of a checkpoint because it was full (MaxCheckpointBytes).</summary>
+        internal long CheckpointEventsOmitted => Interlocked.Read(ref _cpOmitted);
+
+        /// <summary>A checkpoint file holds at most this much (bytes); further counts wait for their window.</summary>
+        internal int MaxCheckpointBytes => 4 * Math.Max(16 * 1024, _config.MaxBatchBytes);
+
+        /// <summary>Milliseconds until a requested checkpoint is due; int.MaxValue: none requested. Worker; caller holds _lock.</summary>
+        private int CheckpointDueInMsLocked()
+        {
+            if (!_cpRequested || !_persistToDisk)
+                return int.MaxValue;
+            int interval = CheckpointIntervalMs;
+            if (interval <= 0 || _cpUrgent || _cpForce || !_cpCollectedOnce)
+                return 0;
+            int elapsed = unchecked(Environment.TickCount - _cpLastTick);
+            return elapsed >= interval || elapsed < 0 ? 0 : interval - elapsed;
+        }
+
+        /// <summary>
+        /// Before the queue is drained: asks the sources whose counts changed
+        /// for their pending events, if a checkpoint is due. Taken before the
+        /// drain so that a closed window's events, which a source hands to the
+        /// queue before it reports the close, are written in this iteration
+        /// before the file that no longer holds them. Worker thread; never
+        /// holds _lock while calling a source.
+        /// </summary>
+        private bool CollectCheckpoints()
+        {
+            CheckpointSlot[] slots;
+            lock (_lock)
+            {
+                if (!_persistToDisk || !_ownsDirectory)
+                {
+                    // Memory-only (or another instance owns the directory): never.
+                    _cpRequested = false;
+                    _cpUrgent = false;
+                    return false;
+                }
+                if (CheckpointDueInMsLocked() > 0)
+                    return false;
+                _cpRequested = false;
+                _cpUrgent = false;
+                slots = _cpSlots;
+            }
+            bool force = _cpForce;
+            _cpForce = false;
+            _cpLastTick = Environment.TickCount;
+            _cpCollectedOnce = true;
+            // Without consent nothing is written, and nothing is deleted
+            // (withdrawn consent keeps what is stored; Denied clears it all).
+            if (!_config.TechnicalAllowed || CheckpointIntervalMs <= 0)
+                return false;
+
+            bool any = false, busy = false;
+            for (int i = 0; i < slots.Length; i++)
+            {
+                var slot = slots[i];
+                slot.Events.Clear();
+                slot.Collected = false;
+                CheckpointCollect result;
+                try
+                {
+                    result = slot.Source.CollectCheckpoint(slot.Events, force);
+                }
+                catch (Exception ex)
+                {
+                    Warn($"Count checkpoint failed: {ex.GetType().Name}: {ex.Message}");
+                    slot.Events.Clear();
+                    continue;
+                }
+                if (result == CheckpointCollect.Busy)
+                    busy = true;
+                else if (result == CheckpointCollect.Collected)
+                {
+                    slot.Collected = true;
+                    any = true;
+                }
+            }
+            if (busy)
+            {
+                // A window is being closed right now: try again in the next
+                // iteration (its close requests an urgent checkpoint anyway).
+                lock (_lock)
+                {
+                    _cpRequested = true;
+                    _cpUrgent = true;
+                }
+            }
+            return any;
+        }
+
+        /// <summary>
+        /// After the queue was written: writes (or deletes) the checkpoint file
+        /// of every source collected in this iteration. Not when the events of
+        /// this iteration failed to reach the disk (a closed window's final
+        /// counts would be in neither place), nor across a Clear (the
+        /// collection was stamped before it, e.g. with a reset device id): then
+        /// everything is collected again at the next iteration. Worker thread.
+        /// </summary>
+        private void WriteCheckpoints(bool discard)
+        {
+            var slots = _cpSlots;
+            bool again = false;
+            for (int i = 0; i < slots.Length; i++)
+            {
+                var slot = slots[i];
+                if (!slot.Collected)
+                    continue;
+                slot.Collected = false;
+                try
+                {
+                    if (discard || _writeFailedInPump || !_config.TechnicalAllowed)
+                    {
+                        again = _config.TechnicalAllowed;
+                        continue;
+                    }
+                    if (slot.Events.Count == 0)
+                        DeleteCheckpointFiles(slot);
+                    else
+                        WriteCheckpointFile(slot);
+                }
+                catch (Exception ex)
+                {
+                    slot.HasFile = true; // unknown: deleted at the next close
+                    Warn($"Failed to write the count checkpoint: {ex.GetType().Name}: {ex.Message}");
+                }
+                finally
+                {
+                    slot.Events.Clear();
+                }
+            }
+            if (again)
+            {
+                _cpForce = true;
+                lock (_lock)
+                {
+                    _cpRequested = true;
+                    _cpUrgent = true;
+                }
+            }
+        }
+
+        private void WriteCheckpointFile(CheckpointSlot slot)
+        {
+            _cpBuffer.SetLength(0);
+            int cap = MaxCheckpointBytes;
+            var stamp = CheckpointStamp;
+            for (int i = 0; i < slot.Events.Count; i++)
+            {
+                var evt = slot.Events[i];
+                if (evt == null || (string.IsNullOrEmpty(evt.event_id) && (evt.id_hi | evt.id_lo) == 0))
+                    continue; // never without the id its final event will have
+                stamp?.Invoke(evt);
+                evt.seq = 0;          // a copy: no number of the per-install sequence
+                evt.recovered = true;
+                _line.Clear();
+                JsonSerializer.WriteEvent(_line, evt);
+                _line.Byte((byte)'\n');
+                if (_cpBuffer.Length + _line.Length > cap)
+                {
+                    Interlocked.Increment(ref _cpOmitted);
+                    continue;
+                }
+                _cpBuffer.Write(_line.Buffer, 0, _line.Length);
+            }
+            if (_cpBuffer.Length == 0)
+            {
+                DeleteCheckpointFiles(slot);
+                return;
+            }
+
+            EnsureDirectory();
+            slot.HasFile = true;
+            // Unbuffered; no fsync: the page cache survives the process (a
+            // crash, a kill), like the segments. Then replace the previous
+            // file: a kill between the delete and the move leaves the
+            // complete .tmp, which LoadExisting takes.
+            using (var fs = new FileStream(slot.TmpPath, FileMode.Create, FileAccess.Write, FileShare.None, 1))
+            {
+                fs.Write(_cpBuffer.GetBuffer(), 0, (int)_cpBuffer.Length);
+                fs.Flush();
+            }
+            if (File.Exists(slot.Path))
+                File.Delete(slot.Path);
+            File.Move(slot.TmpPath, slot.Path);
+            Interlocked.Increment(ref _cpWrites);
+            Interlocked.Exchange(ref _cpLastBytes, _cpBuffer.Length);
+            if (_cpBuffer.Capacity > MaxPooledBufferBytes)
+            {
+                _cpBuffer.SetLength(0);
+                _cpBuffer.Capacity = 4 * 1024;
+            }
+        }
+
+        private void DeleteCheckpointFiles(CheckpointSlot slot)
+        {
+            if (!slot.HasFile)
+                return;
+            if (File.Exists(slot.Path))
+                File.Delete(slot.Path);
+            if (File.Exists(slot.TmpPath))
+                File.Delete(slot.TmpPath);
+            slot.HasFile = false;
+            Interlocked.Exchange(ref _cpLastBytes, 0);
+        }
+
+        /// <summary>
+        /// LoadExisting: the checkpoint files of an earlier process become sealed
+        /// segments, named after the time they are found (so they are uploaded
+        /// after that process's own segments, which may hold the final counts).
+        /// A ".ckpt" wins over a ".ckpt.tmp" of the same source (the .tmp may be
+        /// cut); a .tmp alone was complete (killed between delete and move).
+        /// </summary>
+        private void RecoverCheckpoints()
+        {
+            var files = Directory.GetFiles(_storagePath);
+            Array.Sort(files, StringComparer.Ordinal);
+            var finals = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var file in files)
+            {
+                if (file.EndsWith(CheckpointExtension, StringComparison.Ordinal))
+                    finals.Add(file);
+            }
+            foreach (var file in files)
+            {
+                string name = Path.GetFileName(file);
+                try
+                {
+                    string source;
+                    if (file.EndsWith(CheckpointTmpExtension, StringComparison.Ordinal))
+                    {
+                        if (finals.Contains(file.Substring(0, file.Length - 4)))
+                        {
+                            File.Delete(file);
+                            continue;
+                        }
+                        source = file;
+                    }
+                    else if (file.EndsWith(CheckpointExtension, StringComparison.Ordinal))
+                    {
+                        source = file;
+                    }
+                    else
+                    {
+                        continue;
+                    }
+                    if (new FileInfo(source).Length == 0)
+                    {
+                        File.Delete(source);
+                        continue;
+                    }
+                    long ms = new DateTimeOffset(UtcNow).ToUnixTimeMilliseconds();
+                    string baseName = SegmentBaseName(ms);
+                    while (File.Exists(Path.Combine(_storagePath, baseName + SegmentExtension)) ||
+                           File.Exists(Path.Combine(_storagePath, baseName + OpenExtension)))
+                    {
+                        baseName = SegmentBaseName(ms);
+                    }
+                    File.Move(source, Path.Combine(_storagePath, baseName + SegmentExtension));
+                    Interlocked.Increment(ref _cpRecoveredFiles);
+                }
+                catch (Exception ex)
+                {
+                    Warn($"Skipping count checkpoint {name}: {ex.Message}");
+                }
+            }
         }
 
         /// <summary>
@@ -722,6 +1114,14 @@ namespace OzxApm.Network
                     if (w.Open != null && w.Open.EventCount > 0)
                         wait = Math.Min(wait, (w.Open.CreatedUtc.AddSeconds(_config.FlushIntervalSeconds) - now).TotalMilliseconds);
                 }
+                // APM-24: a requested count checkpoint wakes the worker when due.
+                int checkpointDue = CheckpointDueInMsLocked();
+                if (checkpointDue < int.MaxValue)
+                {
+                    if (_writeRetryAtUtc > now) // not while writes back off
+                        checkpointDue = (int)Math.Max(checkpointDue, Math.Min(IdleWaitMs, (_writeRetryAtUtc - now).TotalMilliseconds));
+                    wait = Math.Min(wait, checkpointDue);
+                }
                 _workerLongWait = true;
                 return (int)Math.Max(10, wait);
             }
@@ -738,6 +1138,10 @@ namespace OzxApm.Network
             bool flush, clear, resetSeq, upload, releaseFirst;
             long clearGen;
             bool writeAllowed = DateTime.UtcNow >= _writeRetryAtUtc;
+            // APM-24: before the drain (see CollectCheckpoints); not while
+            // writes are backing off (the file is kept as it is meanwhile).
+            bool checkpoints = writeAllowed && CollectCheckpoints();
+            _writeFailedInPump = false;
             lock (_lock)
             {
                 if (writeAllowed)
@@ -778,6 +1182,18 @@ namespace OzxApm.Network
                     WriteEvents(_drain);
                 }
 
+                // APM-24: after the closed windows' final counts are on disk.
+                if (checkpoints)
+                {
+                    checkpoints = false;
+                    bool cleared;
+                    lock (_lock)
+                    {
+                        cleared = clear || _clearGen != clearGen;
+                    }
+                    WriteCheckpoints(cleared);
+                }
+
                 foreach (var w in Writers)
                 {
                     if (w.Open != null && w.Open.EventCount > 0 &&
@@ -815,6 +1231,17 @@ namespace OzxApm.Network
             }
             finally
             {
+                if (checkpoints)
+                {
+                    // Collected but not written (something above threw): collect
+                    // everything again next time.
+                    _cpForce = true;
+                    lock (_lock)
+                    {
+                        _cpRequested = true;
+                        _cpUrgent = true;
+                    }
+                }
                 UpdateHighValueWaiting();
                 _drain.Clear();
                 _completionDrain.Clear();
@@ -873,6 +1300,15 @@ namespace OzxApm.Network
                 return;
 
             _directoryReady = true;
+            try
+            {
+                // APM-24: counts an earlier process had only checkpointed.
+                RecoverCheckpoints();
+            }
+            catch (Exception ex)
+            {
+                Warn($"Could not recover count checkpoints: {ex.Message}");
+            }
             var files = Directory.GetFiles(_storagePath);
             Array.Sort(files, StringComparer.Ordinal);
 
@@ -1188,7 +1624,8 @@ namespace OzxApm.Network
                 retry.AddRange(events.GetRange(notBuffered, events.Count - notBuffered));
 
             _writeFailures++;
-            double delay = Math.Min(30.0, 0.5 * Math.Pow(2, Math.Min(_writeFailures - 1, 6)));
+            _writeFailedInPump = true;
+            double delay =Math.Min(30.0, 0.5 * Math.Pow(2, Math.Min(_writeFailures - 1, 6)));
             _writeRetryAtUtc = DateTime.UtcNow.AddSeconds(delay);
             Warn($"Failed to write events ({ex.GetType().Name}: {ex.Message}); retrying in {delay:F1}s");
 
@@ -1686,6 +2123,19 @@ namespace OzxApm.Network
             {
                 try
                 {
+                    // APM-24: the count checkpoints (any source, also a .tmp).
+                    if (Directory.Exists(_storagePath))
+                    {
+                        foreach (var file in Directory.GetFiles(_storagePath))
+                        {
+                            if (file.EndsWith(CheckpointExtension, StringComparison.Ordinal) ||
+                                file.EndsWith(CheckpointTmpExtension, StringComparison.Ordinal))
+                                File.Delete(file);
+                        }
+                    }
+                    foreach (var slot in _cpSlots)
+                        slot.HasFile = false;
+                    Interlocked.Exchange(ref _cpLastBytes, 0);
                     foreach (var name in new[] { SeqFileName, SeqFileName + ".tmp" })
                     {
                         string path = Path.Combine(_storagePath, name);

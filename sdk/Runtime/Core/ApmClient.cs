@@ -1032,6 +1032,7 @@ namespace OzxApm.Core
             CreateCrashMonitor();
             CreateMemorySampler();
             InitializeCollectors();
+            RegisterCountCheckpoints();
 
             // Subscribe to scene changes
             SceneManager.sceneLoaded += OnSceneLoaded;
@@ -1307,6 +1308,11 @@ namespace OzxApm.Core
                 stats.LastSeq = client._offlineStorage.LastSeq;
                 stats.PersistsToDisk = client._offlineStorage.PersistsToDisk;
                 stats.HasWorkerThread = client._offlineStorage.HasWorkerThread;
+                // APM-24
+                stats.CountCheckpoints = client._offlineStorage.CheckpointWrites;
+                stats.CountCheckpointBytes = client._offlineStorage.CheckpointLastBytes;
+                stats.CountCheckpointsRecovered = client._offlineStorage.CheckpointsRecovered;
+                stats.CountCheckpointOmitted = client._offlineStorage.CheckpointEventsOmitted;
             }
             if (client._reporter != null)
             {
@@ -1727,17 +1733,7 @@ namespace OzxApm.Core
                 // is persisted (Guid generation reads the OS random source: keep it
                 // off the main thread).
 
-                evt.app_version = _config.AppVersion;
-                evt.platform = _platform;
-                evt.device_model = _deviceModel;
-                evt.os_version = _osVersion;
-                // A collector may have set the session the event happened in
-                // (exception counts closed after a new session started).
-                if (string.IsNullOrEmpty(evt.session_id))
-                    evt.session_id = _sessionManager.SessionId;
-                evt.device_id = _sessionManager.DeviceId;
-                evt.scene = _currentScene;
-                StampContext(evt, _buildType, _gpu, _ramClass, _netType);
+                StampCommonFields(evt);
                 // The game clock (APM-10) of events enqueued when they happen
                 // (perf samples, janks, scene loads, startup, runs). Custom
                 // events and exceptions carry the one of their call or first
@@ -1751,6 +1747,42 @@ namespace OzxApm.Core
             catch (Exception ex)
             {
                 ReportInternalError("EnqueueEvent", ex);
+            }
+        }
+
+        /// <summary>
+        /// APM-24: the collectors whose counts wait for their window to close
+        /// are checkpointed by the storage worker (OfflineStorage,
+        /// ICountCheckpointSource); their copies get the common fields here,
+        /// on the worker thread, like a queued event.
+        /// </summary>
+        private void RegisterCountCheckpoints()
+        {
+            var storage = _offlineStorage;
+            if (storage == null)
+                return;
+            storage.CheckpointStamp = StampCommonFields;
+            if (_exceptionCollector != null)
+                storage.AddCheckpointSource(_exceptionCollector);
+            if (_customCollector != null)
+                storage.AddCheckpointSource(_customCollector);
+        }
+
+        /// <summary>
+        /// APM-24: a collector counted something new since its last checkpoint
+        /// (urgent: it closed a window). Any thread, never under a collector's
+        /// lock; at most once per checkpoint interval per collector, plus once
+        /// per window close.
+        /// </summary>
+        internal void RequestCountCheckpoint(bool urgent)
+        {
+            try
+            {
+                _offlineStorage?.RequestCheckpoint(urgent);
+            }
+            catch (Exception ex)
+            {
+                ReportInternalError("RequestCountCheckpoint", ex);
             }
         }
 
@@ -1815,6 +1847,28 @@ namespace OzxApm.Core
         /// context as it is now (unless the collector captured an earlier one).
         /// Allocation-free while the context is unchanged; any thread.
         /// </summary>
+        /// <summary>
+        /// The fields every event of this process carries: version, device,
+        /// session (unless the collector set the one it happened in), device id,
+        /// scene, build type and device details, the game context (unless
+        /// captured earlier). Any thread (EnqueueEvent; the storage worker for
+        /// count checkpoints, APM-24).
+        /// </summary>
+        private void StampCommonFields(BaseEvent evt)
+        {
+            evt.app_version = _config.AppVersion;
+            evt.platform = _platform;
+            evt.device_model = _deviceModel;
+            evt.os_version = _osVersion;
+            // A collector may have set the session the event happened in
+            // (exception counts closed after a new session started).
+            if (string.IsNullOrEmpty(evt.session_id))
+                evt.session_id = _sessionManager.SessionId;
+            evt.device_id = _sessionManager.DeviceId;
+            evt.scene = _currentScene;
+            StampContext(evt, _buildType, _gpu, _ramClass, _netType);
+        }
+
         internal static void StampContext(BaseEvent evt, string buildType, string gpu, string ramClass, string netType)
         {
             evt.build_type = buildType;

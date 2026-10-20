@@ -315,6 +315,11 @@ namespace OzxApm.Utils
                     break;
             }
 
+            // APM-24: a count written to the checkpoint file; the line is only
+            // uploaded if the process dies before the count's window closes.
+            if (evt.recovered)
+                w.Ascii(",\"recovered\":true");
+
             // The game context, last: its UTF-8 JSON was built once per context
             // change and is shared by every event until the next one (APM-5).
             var ctx = evt.ctx;
