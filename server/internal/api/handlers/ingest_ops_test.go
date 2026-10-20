@@ -5,6 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"os"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -71,6 +74,53 @@ func opsJSON(id, player, name string, ts time.Time, extra string) string {
 		s = s[:len(s)-1] + "," + extra + "}"
 	}
 	return s
+}
+
+// The SDK's own ops events (testdata/sdk_events_apm12.jsonl, written by the
+// APM-12 SDK's ops queue on Unity's Mono) are stored as sent: typed
+// properties, the whitelisted context, the ops sequence and ids.
+func TestIngestOps_EventsFromTheSDK(t *testing.T) {
+	b, err := os.ReadFile("../../processor/testdata/sdk_events_apm12.jsonl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := regexp.MustCompile(`"timestamp":(\d+)`)
+	base := opsTestNow.Add(-time.Hour).UnixMilli() - 1792244223000
+	var lines []string
+	for _, l := range strings.Split(strings.TrimSpace(string(b)), "\n") {
+		lines = append(lines, ts.ReplaceAllStringFunc(l, func(m string) string {
+			n, _ := strconv.ParseInt(ts.FindStringSubmatch(m)[1], 10, 64)
+			return `"timestamp":` + strconv.FormatInt(n+base, 10)
+		}))
+	}
+	store := &fakeOpsStore{}
+	h := opsHandler(store, config.OpsConfig{})
+	w, resp := postBatch(t, h, batchOf(lines...), map[string]string{SDKVersionHeader: "2.0.0"})
+	if w.Code != http.StatusOK || resp.Accepted != 7 || resp.Rejected != 0 || len(resp.Errors) != 0 {
+		t.Fatalf("%d %+v", w.Code, resp)
+	}
+	if len(store.ops) != 7 || len(store.customs) != 0 {
+		t.Fatalf("ops %d technical %d", len(store.ops), len(store.customs))
+	}
+	for i, e := range store.ops {
+		if e.Seq != uint64(i+1) || len(e.EventID) != 32 || e.PlayerID != "5f0c1a7e9b2d4c3e8a6f1b0d2c4e6a8b" || e.Country != "DE" ||
+			e.Channel != "googleplay" || e.Context["runId"] != "r-7" || e.Context["chapter"] != "3" || e.Context["masterSeed"] != "" {
+			t.Errorf("event %d: %+v", i, e)
+		}
+	}
+	run, show, end := store.ops[1], store.ops[4], store.ops[6]
+	if run.Props["mode"] != `hard "x"` || run.NumProps["chapter"] != 3 || run.PropTypes["mode"] != 0 {
+		t.Errorf("run_start %+v", run)
+	}
+	if show.Name != "ad_show" || show.NumProps["revenue"] != 0.012346 || show.Props["currency"] != "USD" || show.Props["network"] != "admob" {
+		t.Errorf("ad_show %+v", show)
+	}
+	if end.NumProps["foreground_ms"] != 6000 || end.Props["reason"] != "pause" {
+		t.Errorf("session end %+v", end)
+	}
+	if len(store.days) != 1 || len(store.players) != 1 || store.players[0].InstallChannel != "googleplay" {
+		t.Errorf("days %+v players %+v", store.days, store.players)
+	}
 }
 
 func TestIngestOps_StoredInOpsEventsOnly(t *testing.T) {
