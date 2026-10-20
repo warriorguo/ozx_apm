@@ -11,7 +11,7 @@ namespace OzxApm.Core
         public bool Initialized;
         /// <summary>Technical consent (APM-14).</summary>
         public ConsentState Consent;
-        /// <summary>Analytics consent (APM-14; no analytics events are collected yet).</summary>
+        /// <summary>Analytics consent (APM-14): the ops events of APM-12.</summary>
         public ConsentState AnalyticsConsent;
         /// <summary>Collectors are running (technical consent Granted).</summary>
         public bool Collecting;
@@ -120,5 +120,20 @@ namespace OzxApm.Core
         public long CountCheckpointsRecovered;
         /// <summary>Pending counts left out of a checkpoint because it was full (they still go out with their window).</summary>
         public long CountCheckpointOmitted;
+
+        /// <summary>APM-12: the ops queue exists (ApmConfig.EnableOpsEvents).</summary>
+        public bool OpsEnabled;
+        /// <summary>Ops events queued in this process (OpsEvent, ApmAds, session events).</summary>
+        public long OpsEvents;
+        /// <summary>Ops events queued but not yet written by the ops worker.</summary>
+        public int OpsPendingEvents;
+        /// <summary>Bytes of ops events stored locally and not yet confirmed by the server.</summary>
+        public long OpsStoredBytes;
+        /// <summary>Ops events dropped locally (only beyond ApmConfig.MaxOpsStorageBytes or the in-memory hand-off).</summary>
+        public long OpsDroppedEvents;
+        /// <summary>Highest ops sequence number assigned so far (the ops queue's own sequence).</summary>
+        public long OpsLastSeq;
+        /// <summary>Consecutive failed ops uploads (0 after a success).</summary>
+        public int OpsUploadFailures;
     }
 }

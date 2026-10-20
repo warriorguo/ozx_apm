@@ -62,6 +62,12 @@ namespace OzxApm.Utils
         /// </summary>
         internal static void WriteEvent(JsonLine w, BaseEvent evt)
         {
+            if (evt is OpsEvent ops)
+            {
+                WriteOpsEvent(w, ops);
+                return;
+            }
+
             w.Byte((byte)'{');
 
             // Common fields
@@ -329,6 +335,66 @@ namespace OzxApm.Utils
                 w.Bytes(ctx.JsonUtf8);
             }
 
+            w.Byte((byte)'}');
+        }
+
+        /// <summary>
+        /// An ops event (APM-12): only what the server's ops tables keep, in the
+        /// custom event format with "ops":true. No device id, device details
+        /// (model, OS, GPU, RAM, network), scene or game clock: an ops event
+        /// may be sent while technical consent is denied. The game context is
+        /// sent whole; the server keeps its whitelisted keys.
+        /// </summary>
+        private static void WriteOpsEvent(JsonLine w, OpsEvent e)
+        {
+            w.Byte((byte)'{');
+            w.Ascii("\"type\":");
+            w.String(e.type);
+            w.Name("event_id");
+            if (string.IsNullOrEmpty(e.event_id) && (e.id_hi | e.id_lo) != 0)
+                w.Id(e.id_hi, e.id_lo);
+            else
+                w.String(e.event_id);
+            w.Name("seq");
+            w.Long(e.seq);
+            w.Name("timestamp");
+            w.Long(e.timestamp);
+            Field(w, "app_version", e.app_version);
+            Field(w, "platform", e.platform);
+            Field(w, "session_id", e.session_id);
+            OptionalField(w, "build_type", e.build_type);
+            Field(w, "name", e.name);
+            w.Ascii(",\"count\":1,\"ops\":true");
+            Field(w, "player_id", e.player_id);
+            OptionalField(w, "channel", e.channel);
+            OptionalField(w, "country", e.country);
+            WriteProps(w, e.props, e.prop_kinds);
+            var ctx = e.ctx;
+            if (ctx != null && ctx.JsonUtf8 != null)
+            {
+                w.Ascii(",\"ctx\":");
+                w.Bytes(ctx.JsonUtf8);
+            }
+            w.Byte((byte)'}');
+        }
+
+        private static void WriteProps(JsonLine w, string[] props, byte[] kinds)
+        {
+            if (props == null || props.Length < 2)
+                return;
+            w.Name("props");
+            w.Byte((byte)'{');
+            for (int i = 0; i + 1 < props.Length; i += 2)
+            {
+                if (i > 0) w.Byte((byte)',');
+                w.String(props[i]);
+                w.Byte((byte)':');
+                string v = props[i + 1];
+                if (kinds != null && i / 2 < kinds.Length && IsJsonLiteral(kinds[i / 2], v))
+                    w.Ascii(v);
+                else
+                    w.String(v);
+            }
             w.Byte((byte)'}');
         }
 

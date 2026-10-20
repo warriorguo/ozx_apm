@@ -292,6 +292,35 @@ namespace OzxApm.Models
         }
     }
 
+    /// <summary>
+    /// An operations event (APM-12: ApmClient.OpsEvent, ApmAds, the session
+    /// events): business data for designers and operations, sent through the
+    /// ops queue with analytics consent and stored by the server in
+    /// ops_events (one year), never in the technical tables. On the wire a
+    /// custom event with "ops":true that carries only what the ops tables
+    /// keep: no device id, device details or scene (JsonSerializer).
+    /// </summary>
+    [Serializable]
+    public class OpsEvent : BaseEvent
+    {
+        public string name;
+        /// <summary>The anonymous player id (PlayerIdentity), not the device id.</summary>
+        public string player_id;
+        /// <summary>The install channel (ApmConfig.Channel), or null.</summary>
+        public string channel;
+        /// <summary>ISO 3166-1 alpha-2 country, or null.</summary>
+        public string country;
+        /// <summary>Properties as key, value pairs (validated, immutable); null for none.</summary>
+        [NonSerialized] internal string[] props;
+        /// <summary>The JSON type of each property (PropKinds); null: all strings.</summary>
+        [NonSerialized] internal byte[] prop_kinds;
+
+        public OpsEvent()
+        {
+            type = "custom_event";
+        }
+    }
+
     /// <summary>The JSON type of a custom event property (CustomEvent.prop_kinds, APM-10).</summary>
     internal static class PropKinds
     {

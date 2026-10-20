@@ -51,6 +51,23 @@ namespace OzxApm.Core
         private OfflineStorage _offlineStorage;
         private NetworkLogger _networkLogger;
 
+        // Operations events (APM-12): their own queue and uploader, gated by
+        // analytics consent; null when ApmConfig.EnableOpsEvents is off.
+        private OfflineStorage _opsStorage;
+        private EventReporter _opsReporter;
+        private volatile string _playerId;
+        private string _channel;
+        private string _country;
+        private long _opsEventsQueued;
+        private static bool _resetPlayerIdBeforeInit;
+        // The session apm_session_start was sent for, and its foreground time
+        // (main thread).
+        private string _opsSessionStarted;
+        private string _fgSession;
+        private long _fgAccumTicks;
+        private long _fgStartTicks;
+        private bool _fgRunning;
+
         // Collectors
         private PerformanceCollector _performanceCollector;
         private JankDetector _jankDetector;
@@ -177,8 +194,11 @@ namespace OzxApm.Core
         // Privacy consent (APM-14)
         //
         // Two categories, each Undecided / Granted / Denied (ConsentCategory,
-        // ConsentState). Technical covers everything the SDK collects today;
-        // Analytics is for APM-12 operations events (none collected yet).
+        // ConsentState). Technical covers the diagnostics (exceptions, crashes,
+        // performance, custom events and metrics); Analytics the APM-12
+        // operations events, which have their own queue (directory, sequence,
+        // uploader): each category's data is collected, kept, uploaded and
+        // deleted by its own consent.
         //
         // The state of a category is, in this order: the game's SetConsent call,
         // the choice stored in PlayerPrefs by an earlier SetConsent
@@ -244,8 +264,11 @@ namespace OzxApm.Core
         /// (delete it with the admin API, RELEASE.md APM-14). Calling it with
         /// Denied again deletes again.
         ///
-        /// Analytics: only stored and reported today (GetConsent, GetStats); the
-        /// SDK collects no analytics events yet (APM-12 will, and only when Granted).
+        /// Analytics (APM-12): the ops events (OpsEvent, ApmAds, the session
+        /// events) and nothing else. Granted collects them in their own queue;
+        /// Undecided stops collecting and uploading them and keeps what is
+        /// stored; Denied also deletes the ops queue and the stored player id.
+        /// Either category's change never touches the other's data.
         /// </summary>
         public static void SetConsent(ConsentCategory category, ConsentState state)
         {
@@ -292,7 +315,10 @@ namespace OzxApm.Core
         {
             // State first: from here on no thread enqueues, writes or uploads.
             if (analytics)
+            {
                 _config.SetConsentState(ConsentCategory.Analytics, state);
+                OnAnalyticsConsent(state);
+            }
             if (technical)
             {
                 _config.SetConsentState(ConsentCategory.Technical, state);
@@ -316,6 +342,37 @@ namespace OzxApm.Core
             _reporter.CancelInFlight();
             if (state == ConsentState.Denied)
                 DeleteLocalTechnicalData();
+        }
+
+        /// <summary>
+        /// Analytics consent (APM-12): the ops queue's own gate. Granted stores
+        /// the player id and starts the session's ops (apm_session_start if it
+        /// was not sent); otherwise the ops upload under way is cancelled, and
+        /// Denied deletes the ops queue (its directory) and the stored player
+        /// id. Technical data is not touched either way.
+        /// </summary>
+        private void OnAnalyticsConsent(ConsentState state)
+        {
+            if (_opsStorage == null)
+                return;
+            if (state == ConsentState.Granted)
+            {
+                PlayerIdentity.Persist();
+                _opsReporter.RetryNow();
+                OpsSessionStart();
+                return;
+            }
+            _opsReporter.CancelInFlight();
+            if (state == ConsentState.Denied)
+                DeleteLocalOpsData();
+        }
+
+        /// <summary>Analytics denied: nothing of the ops data stays on the device.</summary>
+        private void DeleteLocalOpsData()
+        {
+            _opsStorage?.Clear(true);
+            PlayerIdentity.Forget();
+            _opsSessionStarted = null;
         }
 
         /// <summary>Denied: nothing of the technical data stays on the device.</summary>
@@ -411,8 +468,71 @@ namespace OzxApm.Core
             _sessionManager.StartNewSession();
             // Journals of earlier processes carry the old id (APM-7).
             _crash?.OnDeviceIdReset();
+            // A new session: its ops session events (APM-12).
+            OpsSessionChanged(true);
             Log(LogLevel.Info, "Device id reset; local events deleted");
             return _sessionManager.DeviceId;
+        }
+
+        /// <summary>
+        /// The anonymous player id of the ops events (APM-12): what support
+        /// needs to delete a player's operations data (id_type player_id,
+        /// RELEASE.md). Random, stable across launches (stored with analytics
+        /// consent), separate from GetDeviceId. Main thread.
+        /// </summary>
+        public static string GetPlayerId()
+        {
+            try
+            {
+                var client = _instance;
+                if (_isInitialized && !ReferenceEquals(client, null) && client._playerId != null)
+                    return client._playerId;
+                return PlayerIdentity.Get(false);
+            }
+            catch (Exception ex)
+            {
+                ReportInternalError("GetPlayerId", ex);
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// Replaces the player id with a new random one (APM-12) and returns it:
+        /// for the server, a new player. Deletes the queued and stored ops events
+        /// (they carry the old id), cancels the ops upload under way and starts a
+        /// new session (session ids would link the two ids). The device id is not
+        /// changed. Stored only with analytics consent. Server data keeps the old
+        /// id: read GetPlayerId first and delete it with the admin API. Works
+        /// before Initialize. Main thread.
+        /// </summary>
+        public static string ResetPlayerId()
+        {
+            try
+            {
+                var client = _instance;
+                if (_isInitialized && !ReferenceEquals(client, null))
+                    return client.ResetPlayerIdInternal();
+                _resetPlayerIdBeforeInit = true;
+                return PlayerIdentity.Reset(false);
+            }
+            catch (Exception ex)
+            {
+                ReportInternalError("ResetPlayerId", ex);
+                return null;
+            }
+        }
+
+        private string ResetPlayerIdInternal()
+        {
+            _opsReporter?.CancelInFlight();
+            _opsStorage?.Clear(true);
+            _playerId = PlayerIdentity.Reset(_config.AnalyticsAllowed);
+            _sessionManager.StartNewSession();
+            // No apm_session_end for the old session: it would pair the old
+            // session with the new id.
+            OpsSessionChanged(false);
+            Log(LogLevel.Info, "Player id reset; local ops events deleted");
+            return _playerId;
         }
 
         /// <summary>
@@ -626,6 +746,7 @@ namespace OzxApm.Core
                 var client = Instance;
                 client._startupTracker?.MarkTTI();
                 client._reporter?.NotifyGameReady();
+                client._opsReporter?.NotifyGameReady();
             }
             catch (Exception ex)
             {
@@ -757,6 +878,214 @@ namespace OzxApm.Core
             if (custom == null || !custom.IsActive)
                 return default;
             return EventBuilder.Begin(custom, name);
+        }
+
+        // ------------------------------------------------------------------
+        // Operations events (APM-12)
+        //
+        // Business events for designers and operations: retention, funnels,
+        // ads (ApmAds). Sent through their own queue (directory, sequence,
+        // uploader) with analytics consent only; never sampled, rate limited,
+        // aggregated or held back by a budget; each event gets a unique id
+        // (the server stores it once whatever is re-sent) and stays on disk
+        // until the server confirms it. The server keeps them a year in
+        // ops_events under the player id (GetPlayerId), with only the event
+        // name, properties, version, platform, build type, channel, a coarse
+        // country and the whitelisted game context keys: no device id or
+        // device details. With technical consent the event is also a
+        // breadcrumb on the time line (exceptions and janks carry it);
+        // AlsoTechnical() also sends it as a technical custom event (session
+        // time line, export).
+        //
+        // Names and property keys: [A-Za-z0-9_.-]{1,64}; never personal data.
+        // ------------------------------------------------------------------
+
+        /// <summary>The automatic ops event of a session start (ApmConfig.OpsSessionEvents).</summary>
+        public const string OpsSessionStartEvent = "apm_session_start";
+        /// <summary>The automatic ops event when the app goes to the background or quits: foreground_ms, reason.</summary>
+        public const string OpsSessionEndEvent = "apm_session_end";
+
+        /// <summary>
+        /// Starts an operations event (APM-12) with typed properties (Str, Int,
+        /// Num, Bool, Vec as for <see cref="Event"/>), sent with Send():
+        /// <code>
+        /// ApmClient.OpsEvent("run_end").Str("result", "win").Int("chapter", 3).Num("duration_s", 312.5, 1).Send();
+        /// </code>
+        /// Send returns false when nothing was recorded (no analytics consent and
+        /// no technical consent, an invalid name). Any thread; build and send on
+        /// one thread. Nothing is allocated when nothing would be recorded.
+        /// </summary>
+        public static ApmEvent OpsEvent(string name)
+        {
+            var client = _instance;
+            if (!_isInitialized || ReferenceEquals(client, null))
+                return default;
+            if (!client.OpsAllowed && !s_collecting)
+                return default;
+            return EventBuilder.BeginOps(name);
+        }
+
+        /// <summary>The ops queue takes events now (enabled, analytics consent).</summary>
+        private bool OpsAllowed => _opsStorage != null && _config.AnalyticsAllowed;
+
+        /// <summary>
+        /// Records an ops event (EventBuilder.Send): onto the ops queue with
+        /// analytics consent; with technical consent onto the time line, or as
+        /// a technical custom event too (alsoTechnical, not held back by the
+        /// custom event budget). props/kinds are validated. Any thread.
+        /// </summary>
+        internal static bool SendOpsEvent(string name, string[] props, byte[] kinds, bool alsoTechnical)
+        {
+            try
+            {
+                var client = _instance;
+                if (!_isInitialized || ReferenceEquals(client, null))
+                    return false;
+                if (!GameContext.IsValidKey(name))
+                {
+                    CustomCollector.ReportViolation("OpsEvent", name, "invalid name (1-64 characters from [A-Za-z0-9_.-])");
+                    return false;
+                }
+                long now = Timeline.NowMs();
+                bool recorded = client.EnqueueOps(name, props, kinds, now);
+                if (alsoTechnical)
+                {
+                    var custom = s_custom;
+                    if (custom != null && custom.IsActive && custom.TrackEvent(name, props, kinds, true))
+                        recorded = true;
+                }
+                else if (s_collecting)
+                {
+                    s_timeline?.RecordEvent(name, props, now);
+                }
+                return recorded;
+            }
+            catch (Exception ex)
+            {
+                ReportInternalError("OpsEvent", ex);
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Queues an ops event if the ops queue takes it: the call's time, the
+        /// game context now, the session (the current one unless given) and
+        /// the ops identity. Any thread.
+        /// </summary>
+        private bool EnqueueOps(string name, string[] props, byte[] kinds, long timeMs, string session = null)
+        {
+            var storage = _opsStorage;
+            var sessions = _sessionManager;
+            if (storage == null || !_config.AnalyticsAllowed || sessions == null)
+                return false;
+            var evt = new Models.OpsEvent
+            {
+                timestamp = timeMs,
+                name = name,
+                props = props,
+                prop_kinds = props != null ? kinds : null,
+                ctx = GameContext.Current,
+                app_version = _config.AppVersion,
+                platform = _platform,
+                session_id = session ?? sessions.SessionId,
+                build_type = _buildType,
+                player_id = _playerId,
+                channel = _channel,
+                country = _country
+            };
+            storage.Enqueue(evt);
+            System.Threading.Interlocked.Increment(ref _opsEventsQueued);
+            return true;
+        }
+
+        /// <summary>apm_session_start for the current session, once (main thread).</summary>
+        private void OpsSessionStart()
+        {
+            if (!_config.OpsSessionEvents || !OpsAllowed || _sessionManager == null)
+                return;
+            string session = _sessionManager.SessionId;
+            if (session == _opsSessionStarted)
+                return;
+            if (EnqueueOps(OpsSessionStartEvent, null, null, Timeline.NowMs()))
+                _opsSessionStarted = session;
+        }
+
+        /// <summary>
+        /// apm_session_end of the current session with its foreground time so
+        /// far (sent at every pause: the server takes the largest), if its start
+        /// was sent. Main thread; allocates the event and two short strings.
+        /// </summary>
+        private void OpsSessionEnd(string reason)
+        {
+            if (!_config.OpsSessionEvents || !OpsAllowed || _sessionManager == null)
+                return;
+            if (_opsSessionStarted == null || _opsSessionStarted != _sessionManager.SessionId)
+                return;
+            long ms = ForegroundTicks() * 1000 / System.Diagnostics.Stopwatch.Frequency;
+            var props = new[] { "foreground_ms", ms.ToString(System.Globalization.CultureInfo.InvariantCulture), "reason", reason };
+            var kinds = new[] { PropKinds.Number, PropKinds.String };
+            EnqueueOps(OpsSessionEndEvent, props, kinds, Timeline.NowMs());
+        }
+
+        private long ForegroundTicks()
+        {
+            long t = _fgAccumTicks;
+            if (_fgRunning)
+                t += System.Diagnostics.Stopwatch.GetTimestamp() - _fgStartTicks;
+            return t;
+        }
+
+        /// <summary>
+        /// The app is (again) in the foreground: if the session changed (a new
+        /// session after a long background, a reset id), its foreground time
+        /// starts at 0 and its apm_session_start is sent. Idempotent; main thread.
+        /// </summary>
+        private void OpsForeground()
+        {
+            if (_sessionManager == null)
+                return;
+            if (_fgSession != _sessionManager.SessionId)
+            {
+                _fgSession = _sessionManager.SessionId;
+                _fgAccumTicks = 0;
+            }
+            if (!_fgRunning)
+            {
+                _fgStartTicks = System.Diagnostics.Stopwatch.GetTimestamp();
+                _fgRunning = true;
+            }
+            OpsSessionStart();
+        }
+
+        /// <summary>The app goes to the background (or quits): stops the foreground clock, sends apm_session_end.</summary>
+        private void OpsBackground(string reason)
+        {
+            if (_fgRunning)
+            {
+                _fgAccumTicks += System.Diagnostics.Stopwatch.GetTimestamp() - _fgStartTicks;
+                _fgRunning = false;
+            }
+            OpsSessionEnd(reason);
+        }
+
+        /// <summary>
+        /// The session was replaced by the SDK (ResetDeviceId, ResetPlayerId):
+        /// optionally ends the old one, then starts the new one's ops.
+        /// </summary>
+        private void OpsSessionChanged(bool endOld)
+        {
+            bool running = _fgRunning;
+            if (endOld && _fgSession != null && _opsSessionStarted == _fgSession && _config.OpsSessionEvents && OpsAllowed)
+            {
+                long ms = ForegroundTicks() * 1000 / System.Diagnostics.Stopwatch.Frequency;
+                // With the old session's id: the end belongs to it.
+                var props = new[] { "foreground_ms", ms.ToString(System.Globalization.CultureInfo.InvariantCulture), "reason", "reset" };
+                EnqueueOps(OpsSessionEndEvent, props, new[] { PropKinds.Number, PropKinds.String }, Timeline.NowMs(), _fgSession);
+            }
+            _fgRunning = false;
+            _fgSession = null;
+            if (running)
+                OpsForeground();
         }
 
         private static bool TrackEventInternal(string name, string[] pairs, int length)
@@ -917,6 +1246,9 @@ namespace OzxApm.Core
                 client._offlineStorage?.Flush();
                 client._reporter?.NotifyGameReady();
                 client._reporter?.RetryNow();
+                client._opsStorage?.Flush();
+                client._opsReporter?.NotifyGameReady();
+                client._opsReporter?.RetryNow();
             }
             catch (Exception ex)
             {
@@ -1021,6 +1353,7 @@ namespace OzxApm.Core
                 DeleteLocalTechnicalData();
             }
             _offlineStorage.Start();
+            CreateOpsQueue();
 
             // The game clock events carry (APM-10): this is the main thread.
             GameClock.Init();
@@ -1038,9 +1371,50 @@ namespace OzxApm.Core
             SceneManager.sceneLoaded += OnSceneLoaded;
 
             _isInitialized = true;
+            // The launch's session (APM-12: apm_session_start with analytics consent).
+            OpsForeground();
             Log(LogLevel.Info, $"APM SDK initialized successfully (build type {_buildType}, consent technical {_config.GetConsent(ConsentCategory.Technical)}, analytics {_config.GetConsent(ConsentCategory.Analytics)})");
             if (!_uploadsEnabled)
                 Log(LogLevel.Info, "Running in the Editor: events are stored but not uploaded (ApmConfig.UploadInEditor)");
+        }
+
+        /// <summary>
+        /// The ops queue (APM-12): its own directory (ozx_apm_ops), worker
+        /// thread and uploader, gated by analytics consent. The player id is
+        /// read (or generated: stored only with analytics consent), the
+        /// country resolved once (ApmConfig.Country, else on Android one JNI
+        /// call for the device's region setting). Analytics Denied deletes
+        /// what an earlier process left.
+        /// </summary>
+        private void CreateOpsQueue()
+        {
+            if (!_config.EnableOpsEvents)
+                return;
+            try
+            {
+                _channel = PlayerIdentity.IsValid(_config.Channel) ? _config.Channel : null;
+                _country = PlayerCountry.Resolve(_config.Country);
+                // ResetPlayerId before Initialize made the new id (in memory).
+                _playerId = PlayerIdentity.Get(_config.AnalyticsAllowed);
+                string testPath = OpsStoragePathForTests ?? (StoragePathForTests != null ? StoragePathForTests + "_ops" : null);
+                _opsStorage = testPath != null ? OfflineStorage.ForOps(_config, testPath, false) : OfflineStorage.ForOps(_config);
+                _opsReporter = new EventReporter(_config, _opsStorage, _networkLogger);
+                if (_resetPlayerIdBeforeInit)
+                {
+                    // Stored ops events carry the old id.
+                    _resetPlayerIdBeforeInit = false;
+                    _opsStorage.Clear(true);
+                }
+                if (_config.GetConsent(ConsentCategory.Analytics) == ConsentState.Denied)
+                    DeleteLocalOpsData();
+                _opsStorage.Start();
+            }
+            catch (Exception ex)
+            {
+                ReportInternalError("CreateOpsQueue", ex);
+                _opsStorage = null;
+                _opsReporter = null;
+            }
         }
 
         /// <summary>
@@ -1389,6 +1763,17 @@ namespace OzxApm.Core
                 stats.JankUpdateUs = System.Threading.Interlocked.Read(ref jank.LastSampledTicks) * 1e6 / System.Diagnostics.Stopwatch.Frequency;
                 stats.JankSelfCheckOverheadUs = System.Threading.Interlocked.Read(ref jank.SelfCheckOverheadTicks) * 1e6 / System.Diagnostics.Stopwatch.Frequency;
             }
+            var ops = client._opsStorage;
+            if (ops != null)
+            {
+                stats.OpsEnabled = true;
+                stats.OpsEvents = System.Threading.Interlocked.Read(ref client._opsEventsQueued);
+                stats.OpsPendingEvents = ops.PendingEventCount;
+                stats.OpsStoredBytes = ops.GetStorageSize();
+                stats.OpsDroppedEvents = ops.DroppedEventCount;
+                stats.OpsLastSeq = ops.LastSeq;
+                stats.OpsUploadFailures = client._opsReporter != null ? client._opsReporter.ConsecutiveFailures : 0;
+            }
             stats.TimersSpanningPause = TimerRegistry.SpanningPauseCount;
             stats.TimersUntracked = TimerRegistry.UntrackedCount;
             if (client._timeline != null)
@@ -1418,6 +1803,11 @@ namespace OzxApm.Core
         internal MemorySampler MemorySamplerForTests => _memory;
         internal RunTracker RunsForTests => _runs;
         internal OfflineStorage StorageForTests => _offlineStorage;
+        /// <summary>APM-12: the ops queue's directory for the next Initialize (default: StoragePathForTests + "_ops").</summary>
+        internal static string OpsStoragePathForTests;
+        internal OfflineStorage OpsStorageForTests => _opsStorage;
+        internal EventReporter OpsReporterForTests => _opsReporter;
+        internal void FocusForTests(bool focus) => OnApplicationFocus(focus);
         internal EventReporter ReporterForTests => _reporter;
         internal ExceptionCollector ExceptionCollectorForTests => _exceptionCollector;
         internal CustomCollector CustomCollectorForTests => _customCollector;
@@ -1447,6 +1837,9 @@ namespace OzxApm.Core
             ProcStatmPathForTests = null;
             MemorySourceForTests = null;
             _resetDeviceIdBeforeInit = false;
+            _resetPlayerIdBeforeInit = false;
+            OpsStoragePathForTests = null;
+            PlayerIdentity.ClearCacheForTests();
             for (int i = 0; i < _explicitConsent.Length; i++)
                 _explicitConsent[i] = -1;
             StoragePathForTests = null;
@@ -1490,6 +1883,7 @@ namespace OzxApm.Core
                 {
                     _startupTracker?.Update();
                     _offlineStorage.Tick();
+                    UpdateOps();
                 }
                 catch (Exception ex)
                 {
@@ -1530,12 +1924,28 @@ namespace OzxApm.Core
                     _offlineStorage.Tick();
                     if (_uploadsEnabled)
                         _reporter.Update();
+                    UpdateOps();
                 }
                 catch (Exception ex)
                 {
                     ReportInternalError("Reporter.Update", ex);
                 }
             }
+        }
+
+        /// <summary>
+        /// The ops queue's per-frame step (APM-12): its uploader runs only while
+        /// the queue holds something (or a request is under way), with analytics
+        /// consent; otherwise this is a few field reads. No allocation.
+        /// </summary>
+        private void UpdateOps()
+        {
+            var reporter = _opsReporter;
+            if (reporter == null)
+                return;
+            _opsStorage.Tick();
+            if (_uploadsEnabled && (!reporter.IsIdle || (_opsStorage.HasData && _config.AnalyticsAllowed)))
+                reporter.Update();
         }
 
         private void OnApplicationPause(bool paused)
@@ -1559,18 +1969,31 @@ namespace OzxApm.Core
                 {
                     // Timers running now would include the time in background.
                     TimerRegistry.OnPause();
+                    // APM-12: the session's foreground time so far.
+                    OpsBackground("pause");
                     // The OS may kill us in the background: get everything onto disk
-                    // and sealed for upload. Bounded wait; the worker is normally idle.
+                    // and sealed for upload. Bounded wait; the workers are normally idle.
                     _exceptionCollector?.FlushPending();
                     _customCollector?.FlushPending();
+                    _opsStorage?.Flush();
                     _offlineStorage.Flush();
+                    long start = System.Diagnostics.Stopwatch.GetTimestamp();
                     _offlineStorage.WaitIdle(PauseFlushTimeoutMs);
+                    if (_opsStorage != null)
+                    {
+                        // The two workers wrote at the same time: what is left of the budget.
+                        long spentMs = (System.Diagnostics.Stopwatch.GetTimestamp() - start) * 1000 / System.Diagnostics.Stopwatch.Frequency;
+                        _opsStorage.WaitIdle((int)Math.Max(20, PauseFlushTimeoutMs - spentMs));
+                    }
                 }
                 else
                 {
                     // The network may have changed while we were away.
                     _netType = DeviceInfo.GetNetworkType();
                     _reporter.RetryNow();
+                    _opsReporter?.RetryNow();
+                    // A new session if the background was long (APM-12).
+                    OpsForeground();
                 }
             }
             catch (Exception ex)
@@ -1588,6 +2011,9 @@ namespace OzxApm.Core
             {
                 _sessionManager.OnApplicationFocus(hasFocus);
                 _jankDetector?.OnFocus(hasFocus);
+                // The session manager may start a new session on focus too (APM-12).
+                if (hasFocus && _fgRunning)
+                    OpsForeground();
             }
             catch (Exception ex)
             {
@@ -1650,9 +2076,22 @@ namespace OzxApm.Core
                 // process survived is only in its trace; APM-7).
                 _crash?.OnShutdown();
 
+                // APM-12: the session's end, then both queues write what they
+                // hold at the same time.
+                if (_fgRunning)
+                    OpsBackground("quit");
+                _opsStorage?.Flush();
+
                 // Unsent batches stay on disk and are uploaded on the next launch.
                 _reporter.Shutdown();
+                _opsReporter?.Shutdown();
+                long start = System.Diagnostics.Stopwatch.GetTimestamp();
                 _offlineStorage.Shutdown(ShutdownFlushTimeoutMs);
+                if (_opsStorage != null)
+                {
+                    long spentMs = (System.Diagnostics.Stopwatch.GetTimestamp() - start) * 1000 / System.Diagnostics.Stopwatch.Frequency;
+                    _opsStorage.Shutdown((int)Math.Max(50, ShutdownFlushTimeoutMs - spentMs));
+                }
             }
             catch (Exception ex)
             {
@@ -1697,6 +2136,10 @@ namespace OzxApm.Core
                 // The journal with the exception on its time line (APM-7): the
                 // process ends before the journal's thread would write it.
                 _crash?.Journal?.WriteNow();
+                // APM-12: queued ops events too (their own worker writes them meanwhile).
+                var ops = _opsStorage;
+                if (ops != null && ops.HasWorkerThread)
+                    ops.Flush();
                 var storage = _offlineStorage;
                 if (storage == null)
                     return;

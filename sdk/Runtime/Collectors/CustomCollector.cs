@@ -281,7 +281,14 @@ namespace OzxApm.Collectors
         /// value per pair, validated with ValidateProps; null: all strings).
         /// The event carries the game's clock (APM-10, GameClock) of the call.
         /// </summary>
-        internal bool TrackEvent(string name, string[] props, byte[] kinds)
+        internal bool TrackEvent(string name, string[] props, byte[] kinds) => TrackEvent(name, props, kinds, false);
+
+        /// <summary>
+        /// TrackEvent; bypassBudget (APM-12: the technical copy of an ops event
+        /// marked AlsoTechnical) sends the event on its own with its properties
+        /// whatever the per-minute budget, and does not use the budget up.
+        /// </summary>
+        internal bool TrackEvent(string name, string[] props, byte[] kinds, bool bypassBudget)
         {
             if (!_isActive)
                 return false;
@@ -308,7 +315,7 @@ namespace OzxApm.Collectors
                     _timeline?.RecordEvent(name, props, now);
                     closed = SyncSessionLocked();
                     _eventsTracked++;
-                    if (TakeBudgetLocked(name))
+                    if (bypassBudget || TakeBudgetLocked(name))
                     {
                         evt = new CustomEvent { timestamp = now, name = name, props = props, prop_kinds = props != null ? kinds : null, ctx = ctx };
                         if (clock)

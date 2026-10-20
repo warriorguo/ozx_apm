@@ -114,9 +114,24 @@ namespace OzxApm.Core
         }
 
         /// <summary>
-        /// Records the event (see ApmClient.TrackEvent). False if nothing was
-        /// recorded: not collecting, an invalid name, sent already, or another
-        /// event was started on this thread since.
+        /// APM-12, for an ops event (ApmClient.OpsEvent): also record it as a
+        /// technical custom event (with technical consent; sent on its own, not
+        /// held back by the custom event budget), so it shows on the session
+        /// time line and in the session export. Without it an ops event is only
+        /// a breadcrumb on the technical side. No effect on other events.
+        /// </summary>
+        public ApmEvent AlsoTechnical()
+        {
+            if (IsActive)
+                _builder.AlsoTechnical = true;
+            return this;
+        }
+
+        /// <summary>
+        /// Records the event (see ApmClient.TrackEvent; an ops event: see
+        /// ApmClient.OpsEvent). False if nothing was recorded: not collecting,
+        /// an invalid name, sent already, or another event was started on this
+        /// thread since.
         /// </summary>
         public bool Send()
         {
@@ -150,6 +165,9 @@ namespace OzxApm.Core
         internal int Token;
         private string _name;
         private CustomCollector _collector;
+        // APM-12: an ops event (ApmClient.OpsEvent), and whether it is also technical.
+        private bool _ops;
+        internal bool AlsoTechnical;
         private readonly string[] _pairs = new string[2 * Capacity];
         private readonly byte[] _kinds = new byte[Capacity];
         private int _count; // pairs
@@ -167,12 +185,26 @@ namespace OzxApm.Core
             return new ApmEvent(b, b.Token);
         }
 
+        /// <summary>Starts an ops event on this thread (APM-12; abandons one being built).</summary>
+        internal static ApmEvent BeginOps(string name)
+        {
+            var b = t_builder ?? (t_builder = new EventBuilder());
+            b.Token++;
+            b.Clear();
+            b._name = name;
+            b._collector = null;
+            b._ops = true;
+            return new ApmEvent(b, b.Token);
+        }
+
         private void Clear()
         {
             for (int i = 0; i < 2 * _count; i++)
                 _pairs[i] = null;
             _count = 0;
             _overflowReported = false;
+            _ops = false;
+            AlsoTechnical = false;
         }
 
         internal void Add(string key, string value, byte kind)
@@ -215,6 +247,7 @@ namespace OzxApm.Core
             Token++; // sent: the ApmEvent values of it are inactive from here on
             var collector = _collector;
             string name = _name;
+            bool ops = _ops, alsoTechnical = AlsoTechnical;
             int n = _count;
             string[] pairs = null;
             byte[] kinds = null;
@@ -228,6 +261,12 @@ namespace OzxApm.Core
             Clear();
             _collector = null;
             _name = null;
+            if (ops)
+            {
+                // APM-12: the ops queue (and the technical side, see AlsoTechnical).
+                var opsKept = CustomCollector.ValidateProps(pairs, 2 * n, kinds, out byte[] opsKinds);
+                return ApmClient.SendOpsEvent(name, opsKept, opsKinds, alsoTechnical);
+            }
             if (collector == null || !collector.IsActive)
                 return false;
             var kept = CustomCollector.ValidateProps(pairs, 2 * n, kinds, out byte[] keptKinds);
