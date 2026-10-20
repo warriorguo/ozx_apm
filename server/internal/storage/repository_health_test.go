@@ -135,8 +135,13 @@ func TestDashboardVersionsQuery_IsTheHealthDefinition(t *testing.T) {
 	if fmt.Sprint(set) != "[native java oom killed]" {
 		t.Errorf("crash types %v", set)
 	}
-	if !strings.Contains(q, "uniqExactIf(sid, sc = 1)") || !strings.Contains(q, "max(crashed) AS sc") || !strings.Contains(q, "GROUP BY value\n") {
+	if !strings.Contains(q, "uniqExactIf(sid, sc = 1)") || !strings.Contains(q, "max(crashed) AS sc") || !strings.Contains(q, "GROUP BY value, sid") {
 		t.Errorf("crashed sessions per version: %s", q)
+	}
+	// The totals are distinct sessions over all versions (the NULL group),
+	// not sums of the versions: a session may have rows of two versions.
+	if !strings.Contains(q, "arrayJoin([toNullable(toString(value)), NULL]) AS g") || !strings.Contains(q, "GROUP BY g\n") {
+		t.Errorf("no total row: %s", q)
 	}
 }
 

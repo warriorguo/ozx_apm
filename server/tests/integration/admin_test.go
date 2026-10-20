@@ -139,14 +139,30 @@ func TestAdminSummary_ReturnsRealCounts(t *testing.T) {
 	if !near(s.AvgFPS, 40) || !near(s.AvgStartupMs, 1750) || !near(s.CrashRate, 1000) {
 		t.Errorf("avg_fps %v avg_startup_ms %v crash_rate %v, want 40 1750 1000", s.AvgFPS, s.AvgStartupMs, s.CrashRate)
 	}
-	// APM-22: crashed sessions and their fraction, also per version.
+	// APM-22: sessions and crashed sessions as the session health counts
+	// them (any row; crashes of the default types). In range: s1, s2 (1.0,
+	// Android) and s3 (1.1, iOS); each has a native crash (c-old is outside
+	// the range), so 3 of 3 sessions crashed (rate 1), 3 crash reports
+	// (crash_rate 1000 per 1000 sessions).
 	if s.CrashedSessions != 3 || !near(s.CrashedSessionRate, 1) {
 		t.Errorf("crashed_sessions %d crashed_session_rate %v, want 3 1", s.CrashedSessions, s.CrashedSessionRate)
 	}
-	if len(s.TopVersions) != 2 || s.TopVersions[0].Version != "1.0" || s.TopVersions[0].SessionCount != 2 || s.TopVersions[1].SessionCount != 1 ||
-		s.TopVersions[0].CrashCount != 2 || s.TopVersions[0].CrashedSessions != 2 || !near(s.TopVersions[0].CrashedSessionRate, 1) ||
-		!near(s.TopVersions[0].CrashRate, 1000) || s.TopVersions[1].CrashCount != 1 || s.TopVersions[1].CrashedSessions != 1 {
-		t.Errorf("top_versions %+v", s.TopVersions)
+	// Per version, a session counts under every version it has rows of (as
+	// on the Health page): s3's exception e3 is a 1.0 row (exc() always
+	// writes 1.0), so 1.0 has s1, s2 and s3 = 3 sessions, of which s1 and
+	// s2 crashed in 1.0 (s3's crash is a 1.1 row): 2/3, 2 crash reports,
+	// 666.7 per 1000. 1.1 has s3 alone, crashed: 1/1. The totals above are
+	// distinct sessions (3), not the sum of the versions (4).
+	if len(s.TopVersions) != 2 {
+		t.Fatalf("top_versions %+v", s.TopVersions)
+	}
+	if v := s.TopVersions[0]; v.Version != "1.0" || v.SessionCount != 3 || v.CrashCount != 2 || v.CrashedSessions != 2 ||
+		!near(v.CrashedSessionRate, 2.0/3) || !near(v.CrashRate, 2.0/3*1000) {
+		t.Errorf("1.0: %+v, want 3 sessions, 2 crashes, 2 crashed, 2/3, 666.7", v)
+	}
+	if v := s.TopVersions[1]; v.Version != "1.1" || v.SessionCount != 1 || v.CrashCount != 1 || v.CrashedSessions != 1 ||
+		!near(v.CrashedSessionRate, 1) || !near(v.CrashRate, 1000) {
+		t.Errorf("1.1: %+v, want 1 session, 1 crash, 1 crashed, 1, 1000", v)
 	}
 	if len(s.TopPlatforms) != 2 || s.TopPlatforms[0].Platform != "Android" || s.TopPlatforms[0].SessionCount != 2 ||
 		!near(s.TopPlatforms[0].AvgFPS, (30+60+50)/3.0) || !near(s.TopPlatforms[1].AvgFPS, 20) {
@@ -156,8 +172,17 @@ func TestAdminSummary_ReturnsRealCounts(t *testing.T) {
 	params := lastHour()
 	params.Set("platform", "iOS")
 	getAdmin(t, router, "/api/summary", params, &s)
-	if s.TotalSessions != 1 || s.CrashCount != 1 || s.CrashedSessions != 1 || s.ExceptionCount != 1 || s.JankCount != 1 || !near(s.AvgFPS, 20) {
+	// iOS: s3 alone (its perf sample, crash and jank are 1.1 rows, its
+	// exception a 1.0 row): 1 session, crashed, 1 crash report. Per version
+	// it is under both: 1.0 (exception only, not crashed) and 1.1 (crashed);
+	// tied at 1 session, by version name.
+	if s.TotalSessions != 1 || s.CrashCount != 1 || s.CrashedSessions != 1 || !near(s.CrashedSessionRate, 1) || !near(s.CrashRate, 1000) ||
+		s.ExceptionCount != 1 || s.JankCount != 1 || !near(s.AvgFPS, 20) {
 		t.Errorf("iOS: %+v", s)
+	}
+	if len(s.TopVersions) != 2 || s.TopVersions[0].Version != "1.0" || s.TopVersions[0].SessionCount != 1 || s.TopVersions[0].CrashedSessions != 0 ||
+		s.TopVersions[0].CrashCount != 0 || s.TopVersions[1].Version != "1.1" || s.TopVersions[1].CrashedSessions != 1 || s.TopVersions[1].CrashCount != 1 {
+		t.Errorf("iOS top_versions %+v", s.TopVersions)
 	}
 }
 

@@ -4327,7 +4327,10 @@ sessions were only those with perf samples, and every crash report counted
 - **One unit for every rate the admin shows: a fraction 0..1**, formatted
   as a percentage. The dashboard's figure is now **crashed sessions /
   sessions**, from the same per-session rows as `GET /api/health/sessions`
-  with its defaults (`sessionHealthRows`, shared; one query per version):
+  with its defaults (`sessionHealthRows`, shared; one query, per version
+  plus a total row: a session with rows of two versions counts under each
+  version, as on the Health page, but once in the total, so the total is
+  not the sum of the versions; found by the integration run on bc4421f):
   a session is any session with a row in the range (perf samples,
   startups, janks, custom events and metrics, runs, exceptions, crashes);
   a crashed session has a crash of type `native`, `java`, `oom` or `killed`,

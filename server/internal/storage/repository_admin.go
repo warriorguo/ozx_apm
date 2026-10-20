@@ -90,11 +90,13 @@ func (r *Repository) GetDashboardSummary(ctx context.Context, f models.AdminFilt
 	// Sessions and crashed sessions per version, as the session health
 	// (APM-9) counts them (APM-22: the dashboard counted perf-sample
 	// sessions and every crash report, and called crashes per 1000 sessions
-	// a percentage). A session has one version, so the totals are the sums.
-	versions, err := r.dashboardVersions(ctx, f)
+	// a percentage). The totals are distinct sessions, not the sums over
+	// versions (a session may have rows of two versions).
+	versions, sessions, crashed, err := r.dashboardVersions(ctx, f)
 	if err != nil {
 		return nil, err
 	}
+	summary.TotalSessions, summary.CrashedSessions = sessions, crashed
 	crashesByVersion := map[string]int64{}
 	crashQuery := fmt.Sprintf(`SELECT app_version, toInt64(count()) FROM apm_crashes %s GROUP BY app_version LIMIT 10000`, whereClause)
 	err = r.queryRows(ctx, crashQuery, args, func(rows driver.Rows) error {
@@ -112,8 +114,6 @@ func (r *Repository) GetDashboardSummary(ctx context.Context, f models.AdminFilt
 	}
 	for i := range versions {
 		v := &versions[i]
-		summary.TotalSessions += v.SessionCount
-		summary.CrashedSessions += v.CrashedSessions
 		v.CrashCount = crashesByVersion[v.Version]
 		v.CrashedSessionRate, v.CrashRate = models.CrashRates(v.SessionCount, v.CrashedSessions, v.CrashCount)
 	}
@@ -171,37 +171,50 @@ const dashboardTopVersions = 5
 
 // dashboardVersionsQuery counts per version the sessions and the crashed
 // sessions of the session health's rows (sessionHealthRows with its default
-// crash types, kills by the player left out), most sessions first.
+// crash types, kills by the player left out), most sessions first, and in
+// the row whose version is NULL the distinct sessions and crashed sessions
+// over all versions. A session with rows of two versions counts under each
+// (as on the Health page) but once in the total: the total is not the sum.
 func dashboardVersionsQuery(f models.AdminFilter) (string, []interface{}) {
 	inner, args := sessionHealthRows(f, "app_version", nil, HealthOptions{})
-	return fmt.Sprintf(`SELECT value, toInt64(uniqExact(sid)) AS sessions, toInt64(uniqExactIf(sid, sc = 1))
+	return fmt.Sprintf(`SELECT g, toInt64(uniqExact(sid)) AS sessions, toInt64(uniqExactIf(sid, sc = 1))
 		FROM (
-			SELECT value, sid, max(crashed) AS sc
-			FROM (%s)
-			GROUP BY value, sid
+			SELECT arrayJoin([toNullable(toString(value)), NULL]) AS g, sid, sc
+			FROM (
+				SELECT value, sid, max(crashed) AS sc
+				FROM (%s)
+				GROUP BY value, sid
+			)
 		)
-		GROUP BY value
-		ORDER BY sessions DESC, value
-		LIMIT 10000`, inner), args
+		GROUP BY g
+		ORDER BY sessions DESC, g
+		LIMIT 10001`, inner), args
 }
 
 // dashboardVersions returns every version's sessions and crashed sessions
-// (the crash counts and rates are left to the caller).
-func (r *Repository) dashboardVersions(ctx context.Context, f models.AdminFilter) ([]models.VersionStats, error) {
+// (the crash counts and rates are left to the caller) and the totals over
+// all versions.
+func (r *Repository) dashboardVersions(ctx context.Context, f models.AdminFilter) (versions []models.VersionStats, sessions, crashed int64, err error) {
 	query, args := dashboardVersionsQuery(f)
-	out := []models.VersionStats{}
-	err := r.queryRows(ctx, query, args, func(rows driver.Rows) error {
+	versions = []models.VersionStats{}
+	err = r.queryRows(ctx, query, args, func(rows driver.Rows) error {
+		var v *string
 		var vs models.VersionStats
-		if err := rows.Scan(&vs.Version, &vs.SessionCount, &vs.CrashedSessions); err != nil {
+		if err := rows.Scan(&v, &vs.SessionCount, &vs.CrashedSessions); err != nil {
 			return err
 		}
-		out = append(out, vs)
+		if v == nil {
+			sessions, crashed = vs.SessionCount, vs.CrashedSessions
+			return nil
+		}
+		vs.Version = *v
+		versions = append(versions, vs)
 		return nil
 	})
 	if err != nil {
-		return nil, fmt.Errorf("sessions per version: %w", err)
+		return nil, 0, 0, fmt.Errorf("sessions per version: %w", err)
 	}
-	return out, nil
+	return versions, sessions, crashed, nil
 }
 
 // GetTimeSeries returns time series data for a metric. interval is one of a
