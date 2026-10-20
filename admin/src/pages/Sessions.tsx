@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import type { FormEvent, ReactNode } from 'react'
 import { Link, useSearchParams } from 'react-router-dom'
 import { TimeSeriesChart } from '../components/TimeSeriesChart'
+import { SessionRecordings } from '../components/SessionRecordings'
 import { useDeviceSessions, useSessionTimeline } from '../hooks/useApi'
 import { formatDateTime, formatMs, formatNumber } from '../utils/format'
 import { deviceSessionsLink, exceptionDetailLink, formatSessionMs, kindStyles, sessionExportLink, utcClock } from '../utils/timeline'
@@ -291,7 +292,8 @@ function SessionHeader({ timeline: t }: { timeline: SessionTimeline }) {
     <div className="bg-white rounded-lg shadow p-6">
       <div className="flex flex-wrap items-start justify-between gap-2">
         <h3 className="text-sm font-medium text-gray-700">
-          Session <span className="font-mono break-all">{s.session_id}</span>
+          Session <span className="font-mono break-all">{s.session_id}</span>{' '}
+          <SessionRecordings sessionId={s.session_id} />
         </h3>
         <a
           href={sessionExportLink(s.session_id, t.start_time, t.end_time)}

@@ -11,6 +11,7 @@ const navItems = [
   { path: '/custom', label: 'Custom' },
   { path: '/funnel', label: 'Funnel' },
   { path: '/sessions', label: 'Sessions' },
+  { path: '/session-files', label: 'Session files' },
 ]
 
 export function Layout() {

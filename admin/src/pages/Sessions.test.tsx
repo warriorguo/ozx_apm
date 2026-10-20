@@ -13,6 +13,13 @@ const { api } = vi.hoisted(() => ({
   },
 }))
 
+// APM-13: which sessions have a recording (none here unless a test says so).
+const sessionFilesMock = vi.hoisted(() => ({
+  getSessionFileAvailability: vi.fn().mockResolvedValue([]),
+  sessionFilesLink: (p: Record<string, string>) => '/session-files?' + new URLSearchParams(p).toString(),
+}))
+vi.mock('../services/sessionFiles', () => sessionFilesMock)
+
 vi.mock('../services/api', () => api)
 
 vi.mock('../components/TimeSeriesChart', () => ({
@@ -157,6 +164,19 @@ describe('Sessions page (APM-15)', () => {
     expect(u.searchParams.get('session_id')).toBe('S1 half&x')
     expect(u.searchParams.get('start_time')).toBe(timeline.start_time)
     expect(u.searchParams.get('end_time')).toBe(timeline.end_time)
+  })
+
+  // APM-13: a session a development build recorded links to its recording.
+  it('links the session recording when there is one', async () => {
+    api.getSessionTimeline.mockResolvedValue(timeline)
+    const sessionId = timeline.session.session_id
+    sessionFilesMock.getSessionFileAvailability.mockResolvedValueOnce([
+      { session_id: sessionId, upload_id: 'u1', size_bytes: 5 << 20, created_at: '' },
+    ])
+    renderAt('/sessions?' + new URLSearchParams({ session_id: sessionId }).toString())
+    const link = (await screen.findByText('Recording (5.0 MB)')).closest('a')!
+    expect(link.getAttribute('href')).toBe('/session-files?' + new URLSearchParams({ session_id: sessionId }).toString())
+    expect(sessionFilesMock.getSessionFileAvailability).toHaveBeenCalledWith([sessionId])
   })
 
   it('adds the performance track on request', async () => {

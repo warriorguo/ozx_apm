@@ -6,6 +6,7 @@ import { Pagination } from '../components/Pagination'
 import { TimeSeriesChart } from '../components/TimeSeriesChart'
 import { BreadcrumbList } from '../components/BreadcrumbList'
 import { IssueStatusControl } from '../components/IssueStatus'
+import { SessionRecordings, SessionRecordingsBatch } from '../components/SessionRecordings'
 import { useFilters } from '../hooks/useFilters'
 import {
   useContextKeys,
@@ -394,11 +395,13 @@ function OccurrencesSection({ fingerprint }: { fingerprint: string }) {
       ) : occurrences.length === 0 ? (
         <p className="text-sm text-gray-500">No occurrences.</p>
       ) : (
-        <div className="space-y-4">
-          {occurrences.map((o) => (
-            <OccurrenceCard key={o.event_id || o.timestamp} occurrence={o} />
-          ))}
-        </div>
+        <SessionRecordingsBatch sessionIds={occurrences.map((o) => o.session_id)}>
+          <div className="space-y-4">
+            {occurrences.map((o) => (
+              <OccurrenceCard key={o.event_id || o.timestamp} occurrence={o} />
+            ))}
+          </div>
+        </SessionRecordingsBatch>
       )}
       {data && (
         <Pagination
@@ -459,7 +462,8 @@ export function OccurrenceCard({ occurrence: o }: { occurrence: ExceptionOccurre
               <span className="font-mono">{o.session_id}</span>{' '}
               <Link to={sessionLink(o)} className="text-blue-600 hover:underline">
                 Session time line at this moment
-              </Link>
+              </Link>{' '}
+              <SessionRecordings sessionId={o.session_id} />
             </>
           ) : (
             '-'

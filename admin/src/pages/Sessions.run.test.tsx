@@ -10,6 +10,13 @@ const { api } = vi.hoisted(() => ({
   api: { getSessionTimeline: vi.fn(), getDeviceSessions: vi.fn() },
 }))
 
+// APM-13: which sessions have a recording (none here unless a test says so).
+const sessionFilesMock = vi.hoisted(() => ({
+  getSessionFileAvailability: vi.fn().mockResolvedValue([]),
+  sessionFilesLink: (p: Record<string, string>) => '/session-files?' + new URLSearchParams(p).toString(),
+}))
+vi.mock('../services/sessionFiles', () => sessionFilesMock)
+
 vi.mock('../services/api', () => api)
 
 function renderAt(path: string) {
