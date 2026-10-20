@@ -10,6 +10,7 @@ import (
 	"github.com/warriorguo/ozx_apm/server/internal/api/handlers/admin"
 	"github.com/warriorguo/ozx_apm/server/internal/api/middleware"
 	"github.com/warriorguo/ozx_apm/server/internal/config"
+	"github.com/warriorguo/ozx_apm/server/internal/opsimport"
 	"github.com/warriorguo/ozx_apm/server/internal/storage"
 )
 
@@ -123,6 +124,19 @@ func NewAdminRouter(cfg *config.Config, repo *storage.Repository, logger *zap.Lo
 		r.Post("/symbols/part", symbolHandler.Part)
 		r.Post("/symbols/commit", symbolHandler.Commit)
 		r.Get("/symbols", symbolHandler.List)
+
+		// Operations data imports (APM-12: exchange rates, ad network
+		// reports): bearer token OZX_ADMIN_OPS_TOKEN, disabled (403) without.
+		var opsImportStore opsimport.Store
+		if repo != nil {
+			opsImportStore = repo
+		}
+		opsImportHandler := admin.NewOpsImportHandler(opsImportStore, logger, cfg.AdminServer.OpsToken)
+		if !opsImportHandler.Enabled() {
+			logger.Info("ops import API disabled: no token configured")
+		}
+		r.Post("/ops/import/fx-rates", opsImportHandler.FXRates)
+		r.Post("/ops/import/ad-report", opsImportHandler.AdReport)
 	})
 
 	// Serve static files for admin UI (if exists)
