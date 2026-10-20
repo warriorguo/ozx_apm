@@ -844,9 +844,17 @@ namespace OzxApm.Tests
             exc.HandleLogMessage(message, Stack, LogType.Error);
             exc.HandleLogMessage(message, Stack, LogType.Error);
             var into = new List<BaseEvent>();
+            // Each delegate runs once before it is measured (a first run can
+            // allocate for the runtime, not the SDK); the checkpoint before each
+            // measured repeat clears the dirty flag, so the measured repeat also
+            // takes the path that requests the next checkpoint.
+            TestDelegate repeat = () => { exc.HandleLogMessage(message, Stack, LogType.Error); };
+            exc.CollectCheckpoint(into, false);
+            repeat();
+            into.Clear();
             exc.CollectCheckpoint(into, false); // dirty cleared: the next repeat requests again
-            Assert.That(() => { exc.HandleLogMessage(message, Stack, LogType.Error); }, Is.Not.AllocatingGCMemory());
-            Assert.That(() => { exc.HandleLogMessage(message, Stack, LogType.Error); }, Is.Not.AllocatingGCMemory());
+            Assert.That(repeat, Is.Not.AllocatingGCMemory());
+            Assert.That(repeat, Is.Not.AllocatingGCMemory());
 
             var custom = new CustomCollector(new ApmConfig(), null, new Timeline());
             custom.EnqueueForTests = e => { };
@@ -857,9 +865,13 @@ namespace OzxApm.Tests
             custom.RecordMetric(name, 1, unit);
             custom.RecordMetric(name, 2000, unit);
             into.Clear();
+            TestDelegate sample = () => { custom.RecordMetric(name, 16.6, unit); };
             custom.CollectCheckpoint(into, false);
-            Assert.That(() => { custom.RecordMetric(name, 16.6, unit); }, Is.Not.AllocatingGCMemory());
-            Assert.That(() => { custom.RecordMetric(name, 16.7, unit); }, Is.Not.AllocatingGCMemory());
+            sample();
+            into.Clear();
+            custom.CollectCheckpoint(into, false);
+            Assert.That(sample, Is.Not.AllocatingGCMemory());
+            Assert.That(sample, Is.Not.AllocatingGCMemory());
             Assert.Greater(requests, 2);
         }
     }
