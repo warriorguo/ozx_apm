@@ -5034,6 +5034,43 @@ uploads it); its consent semantics are APM-14's.
 - Driver for the device: `/tmp/claude-501/apm12/ApmTestDriver.cs`
   (compile-checked), plan `/tmp/claude-501/apm12/DEVICE_PLAN.md`.
 
+### Verified before release (lead)
+
+- Integration on real ClickHouse: 26.1 73 passed, 24.1 73 passed, 23.8 68 passed
+  and 5 skipped (accounts 23.8 cannot create), 0 failed: exactly-once on both insert
+  paths, the day rules, acceptance 2 (3 devices x 2 days: DAU and D1), every preset
+  question, deletion by player, the read-only account. Unity EditMode 474/474.
+- Device (A33, Android 16, release, clean build, local server): acceptance 1 (a run
+  offline, a kill, 12 network toggles while uploading, 4 kills right after uploads
+  started): 224 rows, 224 event ids, FINAL 224; per name exactly the driver's events
+  (ops_burst 200, run_start/run_end 1, each ad step 1 per placement); ad_show 0.0123
+  USD admob, chapter 2, room r-12, revivesUsed 0, country GB, channel apmtest; the
+  technical copy of run_end 1 row. (No re-sent batch reached the server in this run:
+  the duplicate drop itself is covered by the integration tests.) Sequence numbers
+  jump by the seq file's reservation block per process (APM-2), so max(seq) is not
+  the row count.
+- Consent per category: technical Denied -> the ops events arrive, no technical
+  copy; analytics Denied -> nothing uploaded, ok=False, a new player id when granted
+  again. Deletion by player_id: ops_events 237, ops_player_days 1, ops_players 1 ->
+  0; other players untouched.
+- Cost (release, measure=60): ops on idle p50 0.037-0.039 / p99 0.13-0.19 ms, opsoff
+  0.036-0.038 / 0.13-0.15, analytics Undecided 0.039 / 0.15; an ops event every frame
+  p50 0.041 ms; no per-frame allocation; ops_dropped 0.
+- Test environment: tables created by the apm account; an ops run from the device
+  arrived in ops_events/ops_player_days.
+- BI on n192: Metabase v0.63.19.1 (its ClickHouse driver is built in since 0.54; no
+  plugin) in Docker on n192, `--network host`, port 3300, data in
+  ~/ozx-metabase (survives restarts). The read-only account `ozx_ops_ro` was created
+  with SQL by the default user (same grants and limits as the XML). **readonly = 1
+  does not work** with Metabase's driver ("Cannot modify 'select_sequential_consistency'
+  setting in readonly mode"): the profile and the XML use readonly = 2 (constraint
+  2..2); checked: writes, DDL, readonly=0, raising max_execution_time and the technical
+  tables are refused. `cmd/metabase-provision` created the connection, the collection,
+  14 questions and 3 dashboards; all 14 questions run on Metabase with n192's data.
+  A second run leaves the connection and the dashboards alone but rewrites every
+  question ("updated"): the change detection does not match how Metabase 0.63 stores
+  a card (harmless, the content is the same; to fix).
+
 ### Not verified (for the lead)
 
 - The integration tests (`tests/integration/apm12_test.go`: exactly-once on

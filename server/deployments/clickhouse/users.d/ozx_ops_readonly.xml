@@ -17,15 +17,16 @@
   here:
     PW=$(openssl rand -hex 24); echo -n "$PW" | sha256sum | cut -d' ' -f1
 
-  readonly = 1: no writes, no DDL, no SET. If Metabase's ClickHouse driver
-  fails with "Cannot modify ... setting in readonly mode" (some driver
-  versions set session settings), use readonly = 2 (still no writes or DDL);
-  the constraints below keep the limits from being raised either way.
+  readonly = 2: no writes, no DDL; session settings allowed, because
+  Metabase's ClickHouse driver sets some per connection (with readonly = 1
+  Metabase 0.63 fails: "Cannot modify 'select_sequential_consistency' setting
+  in readonly mode", seen on n192 2026-10-20). The constraints keep readonly
+  at 2 and the limits from being raised.
 -->
 <clickhouse>
     <profiles>
         <ozx_ops_readonly>
-            <readonly>1</readonly>
+            <readonly>2</readonly>
             <!-- One dashboard query; FINAL over a year of ops_events at
                  today's volume takes well under this. -->
             <max_execution_time>60</max_execution_time>
@@ -35,7 +36,7 @@
             <max_result_rows>1000000</max_result_rows>
             <max_concurrent_queries_for_user>8</max_concurrent_queries_for_user>
             <constraints>
-                <readonly><min>1</min></readonly>
+                <readonly><min>2</min><max>2</max></readonly>
                 <max_execution_time><max>60</max></max_execution_time>
                 <max_memory_usage><max>2000000000</max></max_memory_usage>
                 <max_rows_to_read><max>2000000000</max></max_rows_to_read>
