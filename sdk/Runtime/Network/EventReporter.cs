@@ -129,6 +129,14 @@ namespace OzxApm.Network
         private float _nextReachabilityCheck;
         private NetworkReachability _lastReachability = NetworkReachability.ReachableViaLocalAreaNetwork;
 
+        private readonly ConsentCategory _category;
+
+        /// <summary>True while the queue's consent category is Granted (one volatile read).</summary>
+        private bool Allowed => _config.GetConsent(_category) == ConsentState.Granted;
+
+        /// <summary>No request is being prepared, sent or disposed.</summary>
+        internal bool IsIdle => _state == State.Idle;
+
         public int ConsecutiveFailures => _consecutiveFailures;
         /// <summary>Main-thread cost of the last request start / completion (Stopwatch ticks).</summary>
         public long LastSendTicks { get; private set; }
@@ -150,6 +158,9 @@ namespace OzxApm.Network
         {
             _config = config;
             _storage = storage;
+            // The queue's consent category gates every upload (APM-12: per
+            // category; Technical for the event queue, Analytics for the ops queue).
+            _category = storage != null ? storage.Category : ConsentCategory.Technical;
             _networkLogger = networkLogger;
             _transport = transport;
             _clock = clock;
@@ -174,7 +185,7 @@ namespace OzxApm.Network
             // Consent withdrawn: nothing may leave the device any more, not even
             // a request that was already built or is under way. ApmClient cancels
             // synchronously when consent changes; this covers any other path.
-            if (_state != State.Idle && !_config.TechnicalAllowed)
+            if (_state != State.Idle && !Allowed)
             {
                 CancelInFlight();
                 return;
@@ -197,7 +208,7 @@ namespace OzxApm.Network
             {
                 case State.Idle:
                     if ((now >= _nextAttemptTime || (now >= _highValueAttemptTime && _storage.HighValueWaiting)) &&
-                        now >= _uploadsAllowedAt && _config.TechnicalAllowed)
+                        now >= _uploadsAllowedAt && Allowed)
                     {
                         if (!_firstRequestCreated)
                             _storage.ReleaseForFirstUpload();
@@ -213,7 +224,7 @@ namespace OzxApm.Network
                         poll = _storage.PollUpload(out batch);
                     if (poll == UploadPoll.Ready)
                     {
-                        if (!_config.TechnicalAllowed)
+                        if (!Allowed)
                         {
                             // Consent was withdrawn meanwhile: do not send. (Only
                             // reachable if the check above was skipped this frame.)

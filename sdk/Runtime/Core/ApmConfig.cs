@@ -279,6 +279,50 @@ namespace OzxApm.Core
         /// </summary>
         public ConsentState DefaultAnalyticsConsent { get; set; } = ConsentState.Undecided;
 
+        // ------------------------------------------------------------------
+        // Operations events (APM-12)
+        // ------------------------------------------------------------------
+
+        /// <summary>
+        /// The ops queue (ApmClient.OpsEvent, ApmAds, the automatic session
+        /// events): business events for designers and operations (retention,
+        /// funnels, ads), never sampled, rate limited or aggregated, stored on
+        /// disk until the server confirms them. Collected only with Analytics
+        /// consent. Off: nothing of it runs (no thread, no directory).
+        /// </summary>
+        public bool EnableOpsEvents { get; set; } = true;
+
+        /// <summary>
+        /// Send "apm_session_start" when a session starts (a launch, or a return
+        /// after a long background) and "apm_session_end" with the foreground
+        /// time when the app goes to the background or quits, as ops events:
+        /// what DAU, new players, retention and session length are counted from.
+        /// </summary>
+        public bool OpsSessionEvents { get; set; } = true;
+
+        /// <summary>
+        /// The store or channel the game was installed from (e.g. "googleplay",
+        /// "appstore", "huawei"; 1-64 characters from [A-Za-z0-9_.-], else
+        /// left out): sent with every ops event and kept as the player's install
+        /// channel. Set it per build flavor.
+        /// </summary>
+        public string Channel { get; set; } = "";
+
+        /// <summary>
+        /// The player's country (ISO 3166-1 alpha-2, e.g. "DE") for ops events.
+        /// Null: the device's region setting where the SDK can read it (Android,
+        /// once at Initialize), else none. Coarse by design: never a location.
+        /// The server prefers the country a trusted CDN header reports.
+        /// </summary>
+        public string Country { get; set; } = null;
+
+        /// <summary>
+        /// Disk the ops queue may use (bytes). Ops events are never dropped for
+        /// any other reason; beyond this the oldest stored ones are (counted in
+        /// ApmStats.OpsDroppedEvents). About 300-600 bytes per event.
+        /// </summary>
+        public int MaxOpsStorageBytes { get; set; } = 4 * 1024 * 1024;
+
         /// <summary>
         /// Store the player's choice (SetConsent) in PlayerPrefs and use it on the
         /// next launch instead of the defaults. Turn it off if the game keeps the
@@ -344,6 +388,9 @@ namespace OzxApm.Core
         /// volatile read: checked on every enqueue, write and upload.
         /// </summary>
         internal bool TechnicalAllowed => GetConsent(ConsentCategory.Technical) == ConsentState.Granted;
+
+        /// <summary>True while ops events may be collected, stored and uploaded (APM-12).</summary>
+        internal bool AnalyticsAllowed => GetConsent(ConsentCategory.Analytics) == ConsentState.Granted;
 
         /// <summary>
         /// Request timeout in seconds

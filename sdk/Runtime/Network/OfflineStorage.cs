@@ -302,18 +302,74 @@ namespace OzxApm.Network
                 _persistToDisk = false;
         }
 
+        /// <summary>Directory of the ops queue (APM-12) under Application.persistentDataPath.</summary>
+        internal const string OpsDirectoryName = "ozx_apm_ops";
+
+        /// <summary>
+        /// The queue of operations events (APM-12): its own directory, its own
+        /// sequence and cap (ApmConfig.MaxOpsStorageBytes), and analytics
+        /// consent instead of technical consent for everything (enqueue, write,
+        /// upload; Clear deletes only it).
+        /// </summary>
+        internal static OfflineStorage ForOps(ApmConfig config)
+        {
+            // WebGL has no threads and no reliable file system: memory-only.
+            bool webgl = Application.platform == RuntimePlatform.WebGLPlayer;
+            var store = ForOps(config, Path.Combine(Application.persistentDataPath, OpsDirectoryName), !webgl);
+            if (webgl)
+                store._persistToDisk = false;
+            return store;
+        }
+
+        /// <summary>The ops queue in a given directory (tests: no engine call).</summary>
+        internal static OfflineStorage ForOps(ApmConfig config, string storagePath, bool useWorkerThread)
+        {
+            return new OfflineStorage(config, storagePath, useWorkerThread, ConsentCategory.Analytics,
+                Math.Max(16 * 1024, config.MaxOpsStorageBytes));
+        }
+
         /// <param name="storagePath">Directory for segment files.</param>
         /// <param name="useWorkerThread">
         /// false: the caller drives the worker with Tick()/Pump() (tests, platforms without threads).
         /// </param>
         public OfflineStorage(ApmConfig config, string storagePath, bool useWorkerThread)
+            : this(config, storagePath, useWorkerThread, ConsentCategory.Technical, 0)
+        {
+        }
+
+        /// <param name="category">The consent category every enqueue, write and upload needs (APM-12: Analytics for the ops queue).</param>
+        /// <param name="capBytes">The storage cap; 0: ApmConfig.MaxOfflineStorageBytes.</param>
+        internal OfflineStorage(ApmConfig config, string storagePath, bool useWorkerThread, ConsentCategory category, long capBytes)
         {
             _config = config;
             _storagePath = Path.GetFullPath(storagePath);
             _quarantinePath = Path.Combine(_storagePath, QuarantineDirName);
             _persistToDisk = config.EnableOfflineStorage;
             _useWorkerThread = useWorkerThread;
+            _category = category;
+            _capBytes = capBytes;
         }
+
+        private readonly ConsentCategory _category;
+        private readonly long _capBytes;
+
+        /// <summary>The consent category of this queue (Technical, or Analytics for the ops queue).</summary>
+        internal ConsentCategory Category => _category;
+
+        /// <summary>
+        /// True while this queue's consent category is Granted: checked on every
+        /// enqueue, write and upload (one volatile read). Technical data for the
+        /// event queue (APM-14), analytics for the ops queue (APM-12).
+        /// </summary>
+        private bool Allowed => _config.GetConsent(_category) == ConsentState.Granted;
+
+        /// <summary>
+        /// True while something is queued or stored (worker's view, refreshed
+        /// after every worker iteration). The ops queue's uploader only runs
+        /// then (APM-12: no per-frame work for an empty queue).
+        /// </summary>
+        internal bool HasData => _hasData;
+        private volatile bool _hasData = true; // until the first scan says otherwise
 
         public string StoragePath => _storagePath;
 
@@ -351,9 +407,11 @@ namespace OzxApm.Network
             }
         }
 
+        private long ConfiguredCapBytes => _capBytes > 0 ? _capBytes : (long)_config.MaxOfflineStorageBytes;
+
         private long CapBytes => _persistToDisk
-            ? Math.Max(4096, (long)_config.MaxOfflineStorageBytes)
-            : Math.Min(MemoryOnlyMaxBytes, Math.Max(4096, (long)_config.MaxOfflineStorageBytes));
+            ? Math.Max(4096, ConfiguredCapBytes)
+            : Math.Min(MemoryOnlyMaxBytes, Math.Max(4096, ConfiguredCapBytes));
 
         /// <summary>
         /// Starts the background worker. Does no I/O on the calling thread. If
@@ -373,7 +431,7 @@ namespace OzxApm.Network
                 var thread = new Thread(WorkerLoop)
                 {
                     IsBackground = true,
-                    Name = "OzxApm.Storage"
+                    Name = _category == ConsentCategory.Analytics ? "OzxApm.OpsStorage" : "OzxApm.Storage"
                 };
                 try
                 {
@@ -399,7 +457,7 @@ namespace OzxApm.Network
         /// </summary>
         public void Enqueue(BaseEvent evt)
         {
-            if (evt == null || !_config.TechnicalAllowed)
+            if (evt == null || !Allowed)
                 return;
 
             bool wake;
@@ -422,6 +480,7 @@ namespace OzxApm.Network
                 if (wake)
                     _workerLongWait = false;
                 _pending.Add(evt);
+                _hasData = true;
                 MarkBusy();
             }
 
@@ -608,7 +667,7 @@ namespace OzxApm.Network
             // (withdrawn consent keeps what is stored; Denied clears it all).
             // The sources' dirty flags stay set: the next collection asks them
             // all (force; ApmClient requests one when collection resumes).
-            if (!_config.TechnicalAllowed)
+            if (!Allowed)
             {
                 _cpForce = true;
                 return false;
@@ -682,9 +741,9 @@ namespace OzxApm.Network
                 slot.Collected = false;
                 try
                 {
-                    if (discard || _writeFailedInPump || !_config.TechnicalAllowed)
+                    if (discard || _writeFailedInPump || !Allowed)
                     {
-                        again = _config.TechnicalAllowed;
+                        again = Allowed;
                         continue;
                     }
                     if (slot.Events.Count == 0)
@@ -695,7 +754,7 @@ namespace OzxApm.Network
                 catch (Exception ex)
                 {
                     slot.HasFile = true; // unknown: rewritten or deleted next time
-                    again = _config.TechnicalAllowed; // the collection is lost: collect again
+                    again = Allowed; // the collection is lost: collect again
                     Warn($"Failed to write the count checkpoint: {ex.GetType().Name}: {ex.Message}");
                 }
                 finally
@@ -1259,7 +1318,7 @@ namespace OzxApm.Network
                 EnforceCap();
 
                 // Without consent nothing is written, not even the sequence file.
-                if (flush && _config.TechnicalAllowed && _lowWriter.Buffered.Count == 0 && _highWriter.Buffered.Count == 0)
+                if (flush && Allowed && _lowWriter.Buffered.Count == 0 && _highWriter.Buffered.Count == 0)
                 {
                     bool nothingPending;
                     lock (_lock)
@@ -1297,6 +1356,9 @@ namespace OzxApm.Network
                         _uploadState = UploadPoll.Empty; // PrepareUpload threw
                     if (_pending.Count == 0 && !_flushRequested && !_releaseFirstRequested && !_clearRequested && _completions.Count == 0)
                         idleGen = _busyGen;
+                    // Under the lock: an Enqueue sets it again (APM-12, HasData).
+                    _hasData = _pending.Count > 0 || _segments.Count > 0 || _inFlight.Count > 0 ||
+                        _lowWriter.OpenEvents > 0 || _highWriter.OpenEvents > 0 || _preparedUpload != null;
                 }
                 if (idleGen >= 0)
                     SignalIdle(idleGen);
@@ -1522,7 +1584,7 @@ namespace OzxApm.Network
         private void WriteEvents(List<BaseEvent> events)
         {
             // Second consent gate: consent may have been revoked after enqueue.
-            if (!_config.TechnicalAllowed)
+            if (!Allowed)
             {
                 for (int i = 0; i < events.Count; i++)
                     PerfSamplePool.Return(events[i]);
@@ -2216,7 +2278,7 @@ namespace OzxApm.Network
         {
             UploadBatch batch = null;
 
-            if (_config.TechnicalAllowed && _inFlight.Count == 0)
+            if (Allowed && _inFlight.Count == 0)
             {
                 ReleaseDueLowValue();
                 while (_segments.Count > 0 && batch == null)
