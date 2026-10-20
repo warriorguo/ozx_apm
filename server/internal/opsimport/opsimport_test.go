@@ -27,15 +27,15 @@ func TestParseFXRates(t *testing.T) {
 
 func TestParseFXRates_RefusesTheWholeFileOnOneBadLine(t *testing.T) {
 	cases := map[string]string{
-		"":                                         "empty",
-		"date,currency\n2026-10-19,EUR\n":          "missing column usd_per_unit",
-		"date,currency,usd_per_unit\n":             "no rows",
-		"date,currency,usd_per_unit\nx,EUR,1\n":    "line 2: date",
-		"date,currency,usd_per_unit\n2026-10-19,EURO,1\n": "line 2: currency",
+		"":                                      "empty",
+		"date,currency\n2026-10-19,EUR\n":       "missing column usd_per_unit",
+		"date,currency,usd_per_unit\n":          "no rows",
+		"date,currency,usd_per_unit\nx,EUR,1\n": "line 2: date",
+		"date,currency,usd_per_unit\n2026-10-19,EURO,1\n":                  "line 2: currency",
 		"date,currency,usd_per_unit\n2026-10-19,EUR,1\n2026-10-19,EUR,0\n": "line 3: usd_per_unit",
-		"date,currency,usd_per_unit\n2026-10-19,EUR,1,5\n":                  "", // extra field ignored
-		"date,currency,usd_per_unit\n2026-10-19,EUR,1;5\n":                  "line 2",
-		"date,currency,usd_per_unit\n1999-01-01,EUR,1\n":                    "date",
+		"date,currency,usd_per_unit\n2026-10-19,EUR,1,5\n":                 "", // extra field ignored
+		"date,currency,usd_per_unit\n2026-10-19,EUR,1;5\n":                 "line 2",
+		"date,currency,usd_per_unit\n1999-01-01,EUR,1\n":                   "date",
 	}
 	for in, want := range cases {
 		_, err := ParseFXRates(strings.NewReader(in), "")
