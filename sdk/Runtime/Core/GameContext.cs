@@ -119,6 +119,40 @@ namespace OzxApm.Core
             return new ContextSnapshot(-1, keys, values);
         }
 
+        /// <summary>
+        /// The entries whose key is in keys (APM-12: the ops events' context
+        /// whitelist). Returns this, without allocating, if every entry is kept;
+        /// Empty if none is.
+        /// </summary>
+        internal ContextSnapshot Select(ICollection<string> keys)
+        {
+            if (keys == null)
+                return this;
+            int kept = 0;
+            for (int i = 0; i < _keys.Length; i++)
+            {
+                if (keys.Contains(_keys[i]))
+                    kept++;
+            }
+            if (kept == _keys.Length)
+                return this;
+            if (kept == 0)
+                return Empty;
+            var k = new string[kept];
+            var v = new string[kept];
+            int n = 0;
+            for (int i = 0; i < _keys.Length; i++)
+            {
+                if (keys.Contains(_keys[i]))
+                {
+                    k[n] = _keys[i];
+                    v[n] = _values[i];
+                    n++;
+                }
+            }
+            return new ContextSnapshot(-1, k, v);
+        }
+
         private static string BuildJson(string[] keys, string[] values)
         {
             var sb = new StringBuilder(16 + keys.Length * 32);

@@ -326,6 +326,24 @@ namespace OzxApm.Tests
                 "\"props\":{\"placement\":\"revive\",\"revenue\":0.012345,\"rewarded\":true},\"ctx\":{\"runId\":\"r-7\"}}", json);
         }
 
+        // The ops events' context whitelist (ApmConfig.OpsContextKeys): the rest
+        // of the context never leaves the device with an ops event.
+        [Test]
+        public void ContextSelect_KeepsOnlyTheWhitelistedKeys()
+        {
+            GameContext.Set("runId", "r-1");
+            GameContext.Set("masterSeed", "18446744");
+            GameContext.Set("chapter", "2");
+            var all = GameContext.Current;
+            var keys = new HashSet<string>(new[] { "runId", "chapter", "room" }, StringComparer.Ordinal);
+            var ops = all.Select(keys);
+            Assert.AreEqual("{\"chapter\":\"2\",\"runId\":\"r-1\"}", ops.Json);
+            Assert.AreSame(all, all.Select(null), "null: the whole context");
+            Assert.AreSame(ContextSnapshot.Empty, all.Select(new HashSet<string> { "other" }));
+            var onlyKept = ops.Select(keys);
+            Assert.AreSame(ops, onlyKept, "nothing to drop: no copy");
+        }
+
         [Test]
         public void OpsEvent_IdFromTheWorker_AndOptionalFieldsLeftOut()
         {
@@ -480,6 +498,7 @@ namespace OzxApm.Tests
         {
             var client = Start();
             GameContext.Set("chapter", "3");
+            GameContext.Set("masterSeed", "18446744");
             Assert.IsTrue(ApmClient.OpsEvent(RunStart).Str(Mode, Hard).Int("chapter", 3).Send());
             Pump(client);
             string player = ApmClient.GetPlayerId();
@@ -494,7 +513,8 @@ namespace OzxApm.Tests
             StringAssert.Contains("\"channel\":\"googleplay\"", run);
             StringAssert.Contains("\"country\":\"DE\"", run);
             StringAssert.Contains("\"props\":{\"mode\":\"hard\",\"chapter\":3}", run);
-            StringAssert.Contains("\"chapter\":\"3\"", run);
+            StringAssert.Contains("\"ctx\":{\"chapter\":\"3\"}", run, "only ApmConfig.OpsContextKeys");
+            StringAssert.DoesNotContain("masterSeed", Text(OpsDir));
             StringAssert.DoesNotContain("device_id", run);
             StringAssert.DoesNotContain(client.Session.DeviceId, Text(OpsDir));
             Assert.AreEqual(0, Lines(_dir, RunStart).Length, "an ops event is not a technical custom event");

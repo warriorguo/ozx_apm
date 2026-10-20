@@ -317,6 +317,15 @@ namespace OzxApm.Core
         public string Country { get; set; } = null;
 
         /// <summary>
+        /// The game context keys (ApmClient.SetContext) an ops event carries;
+        /// the rest of the context never leaves the device with ops events. The
+        /// server keeps only the keys of its own whitelist (ops.context_keys,
+        /// the same list by default): to add a key, add it on both sides. Null:
+        /// the whole context is sent (the server still keeps only its whitelist).
+        /// </summary>
+        public string[] OpsContextKeys { get; set; } = { "runId", "chapter", "levelId", "room", "roomId", "revivesUsed" };
+
+        /// <summary>
         /// Disk the ops queue may use (bytes). Ops events are never dropped for
         /// any other reason; beyond this the oldest stored ones are (counted in
         /// ApmStats.OpsDroppedEvents). About 300-600 bytes per event.

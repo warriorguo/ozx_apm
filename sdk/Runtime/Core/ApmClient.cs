@@ -59,6 +59,23 @@ namespace OzxApm.Core
         private string _channel;
         private string _country;
         private long _opsEventsQueued;
+        // The context keys ops events carry (ApmConfig.OpsContextKeys; null: all),
+        // and the filtered snapshot of the current context (rebuilt only when
+        // the context changes; any thread).
+        private HashSet<string> _opsContextKeys;
+        private volatile OpsContextCache _opsContext;
+
+        private sealed class OpsContextCache
+        {
+            public readonly ContextSnapshot Source;
+            public readonly ContextSnapshot Ops;
+
+            public OpsContextCache(ContextSnapshot source, ContextSnapshot ops)
+            {
+                Source = source;
+                Ops = ops;
+            }
+        }
         private static bool _resetPlayerIdBeforeInit;
         // The session apm_session_start was sent for, and its foreground time
         // (main thread).
@@ -776,8 +793,8 @@ namespace OzxApm.Core
         // (the game context's limits). Never put personal data (names, e-mail
         // addresses, account or payment ids, chat or other input text, precise
         // location) in names, properties or units: they are stored as sent.
-        // Business/operations events (retention, funnels, purchases) are not
-        // these: they belong to APM-12's analytics events.
+        // Business/operations events (retention, funnels, ads) are not these:
+        // they are OpsEvent / ApmAds (APM-12, analytics consent).
         //
         // Every call works from any thread, before Initialize too (then it
         // does nothing and returns false), and never throws.
@@ -984,7 +1001,7 @@ namespace OzxApm.Core
                 name = name,
                 props = props,
                 prop_kinds = props != null ? kinds : null,
-                ctx = GameContext.Current,
+                ctx = OpsContext(),
                 app_version = _config.AppVersion,
                 platform = _platform,
                 session_id = session ?? sessions.SessionId,
@@ -996,6 +1013,22 @@ namespace OzxApm.Core
             storage.Enqueue(evt);
             System.Threading.Interlocked.Increment(ref _opsEventsQueued);
             return true;
+        }
+
+        /// <summary>
+        /// The current game context reduced to ApmConfig.OpsContextKeys: a
+        /// snapshot built once per context change, shared by the ops events
+        /// until the next one. Any thread (a race builds it twice, harmlessly).
+        /// </summary>
+        private ContextSnapshot OpsContext()
+        {
+            var current = GameContext.Current;
+            var cache = _opsContext;
+            if (cache != null && ReferenceEquals(cache.Source, current))
+                return cache.Ops;
+            var ops = current.Select(_opsContextKeys);
+            _opsContext = new OpsContextCache(current, ops);
+            return ops;
         }
 
         /// <summary>apm_session_start for the current session, once (main thread).</summary>
@@ -1394,6 +1427,7 @@ namespace OzxApm.Core
             {
                 _channel = PlayerIdentity.IsValid(_config.Channel) ? _config.Channel : null;
                 _country = PlayerCountry.Resolve(_config.Country);
+                _opsContextKeys = _config.OpsContextKeys == null ? null : new HashSet<string>(_config.OpsContextKeys, StringComparer.Ordinal);
                 // ResetPlayerId before Initialize made the new id (in memory).
                 _playerId = PlayerIdentity.Get(_config.AnalyticsAllowed);
                 string testPath = OpsStoragePathForTests ?? (StoragePathForTests != null ? StoragePathForTests + "_ops" : null);
