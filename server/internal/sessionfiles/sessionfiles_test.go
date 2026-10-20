@@ -6,12 +6,15 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/json"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -635,6 +638,91 @@ func TestPurge(t *testing.T) {
 	}
 	if f, _ := e.store.GetSessionFile(ctx, id3); f == nil {
 		t.Fatal("row deleted although its object was not")
+	}
+}
+
+// The archive the SDK writes (SessionArchive, generated on Unity's Mono by
+// SessionArchiveTests.WriteServerFixture): data descriptors, UTF-8 names,
+// Deflate. Go reads it, the validator accepts it, the upload completes.
+func TestSDKArchiveFixture(t *testing.T) {
+	data, err := os.ReadFile("testdata/sdk_session_apm13.zip")
+	if err != nil {
+		t.Fatal(err)
+	}
+	shaFile, err := os.ReadFile("testdata/sdk_session_apm13.zip.sha256")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := shaHex(data); got != strings.TrimSpace(string(shaFile)) {
+		t.Fatalf("SHA-256 %s, the SDK computed %s", got, shaFile)
+	}
+	files, raw, err := ValidateArchive(bytes.NewReader(data), int64(len(data)), testRecording)
+	if err != nil || files != 8 || raw == 0 {
+		t.Fatalf("validate: %d %d %v", files, raw, err)
+	}
+	zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := map[string]string{}
+	for _, f := range zr.File {
+		rc, err := f.Open()
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, err := io.ReadAll(rc) // checks the CRC
+		rc.Close()
+		if err != nil {
+			t.Fatalf("%s: %v", f.Name, err)
+		}
+		if f.Method != zip.Deflate || f.Flags&0x8 == 0 || f.Flags&0x800 == 0 {
+			t.Errorf("%s: method %d flags %x", f.Name, f.Method, f.Flags)
+		}
+		names[f.Name] = string(b)
+	}
+	if !strings.Contains(names[testRecording+"/session.json"], `"gitCommit":"6116e2e4ff38de10eac61ba3c425e8f50a3aacdb"`) ||
+		!strings.HasPrefix(names[testRecording+"/room01_f0_room_1_0/café_1-wave1_event.jsonl"], `{"t":3.0000,"frame":180`) ||
+		!strings.HasPrefix(names[testRecording+"/runstart.jsonl"], `{"t":0.5000`) {
+		t.Fatalf("entries %v", names)
+	}
+	e := newEnv(t, Config{})
+	_, state := e.upload(t, data, MinPartBytes)
+	if state.Status != models.SessionFileComplete || state.FileCount != 8 {
+		t.Fatalf("%+v", state)
+	}
+
+	// OZX's ai_trace.py reads the unzipped directory as it is
+	// (OZX_AI_TRACE=<ozx_base>/scripts/ai_trace.py; python3 -I).
+	script := os.Getenv("OZX_AI_TRACE")
+	if script == "" {
+		t.Log("OZX_AI_TRACE not set: ai_trace.py not run")
+		return
+	}
+	root := t.TempDir()
+	for name, content := range names {
+		p := filepath.Join(root, filepath.FromSlash(name))
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	out, err := exec.Command("python3", "-I", script, filepath.Join(root, testRecording), "--json").Output()
+	if err != nil {
+		t.Fatalf("ai_trace.py: %v", err)
+	}
+	var report struct {
+		Overview struct {
+			PlayerDeaths []map[string]interface{} `json:"playerDeaths"`
+		} `json:"overview"`
+		Anomalies []interface{} `json:"anomalies"`
+	}
+	if err := json.Unmarshal(out, &report); err != nil {
+		t.Fatal(err)
+	}
+	if d := report.Overview.PlayerDeaths; len(d) != 1 || d[0]["killerId"] != "quick_sand_worm" || d[0]["roomId"] != "f0_room_1_0" || len(report.Anomalies) != 0 {
+		t.Fatalf("ai_trace.py: %s", out)
 	}
 }
 

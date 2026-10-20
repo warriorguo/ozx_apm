@@ -77,6 +77,11 @@ namespace OzxApm.Core
             }
         }
         private static bool _resetPlayerIdBeforeInit;
+
+        // Session files (APM-13): development and editor builds only; null otherwise.
+        private SessionFileUploader _sessionFiles;
+        private static volatile SessionFileUploader s_sessionFiles;
+        private string _unityVersion;
         // The session apm_session_start was sent for, and its foreground time
         // (main thread).
         private string _opsSessionStarted;
@@ -347,6 +352,9 @@ namespace OzxApm.Core
 
         private void OnTechnicalConsent(ConsentState state)
         {
+            // Session files (APM-13): Granted resumes, otherwise the request under
+            // way is aborted; Denied deletes the queued copies.
+            _sessionFiles?.OnConsent(state);
             if (state == ConsentState.Granted)
             {
                 _sessionManager.OnConsentGranted();
@@ -483,6 +491,8 @@ namespace OzxApm.Core
         {
             _reporter.CancelInFlight();
             _offlineStorage.Clear(true);
+            // Queued session file uploads carry the old id too (APM-13).
+            _sessionFiles?.Clear();
             _sessionManager.ResetDeviceId();
             _sessionManager.StartNewSession();
             // Journals of earlier processes carry the old id (APM-7).
@@ -1410,6 +1420,10 @@ namespace OzxApm.Core
             }
             _offlineStorage.Start();
             CreateOpsQueue();
+#if UNITY_EDITOR || DEVELOPMENT_BUILD
+            // Compiled out of release players (APM-13).
+            CreateSessionFileUploader();
+#endif
 
             // The game clock events carry (APM-10): this is the main thread.
             GameClock.Init();
@@ -1472,6 +1486,108 @@ namespace OzxApm.Core
                 _opsStorage = null;
                 _opsReporter = null;
             }
+        }
+
+        /// <summary>
+        /// The session file uploader (APM-13), only where ApmSessionFiles.Allowed:
+        /// the Editor or a Development Build with build type dev/editor, uploads
+        /// enabled (UploadInEditor in the Editor) and EnableSessionFileUpload.
+        /// Its worker thread scans what an earlier launch left (no main-thread IO).
+        /// </summary>
+        private void CreateSessionFileUploader()
+        {
+            try
+            {
+                bool engineDev = SessionFileEngineDevForTests != null
+                    ? SessionFileEngineDevForTests()
+                    : Application.isEditor || Debug.isDebugBuild;
+                if (!_config.EnableSessionFileUpload || !_uploadsEnabled || !ApmSessionFiles.Allowed(_buildType, engineDev, engineDev))
+                    return;
+                _unityVersion = Application.unityVersion;
+                string root = SessionFilesPathForTests ?? System.IO.Path.Combine(Application.persistentDataPath, SessionFileUploader.DirectoryName);
+                var http = new SessionFileHttp(SessionFileTransportForTests ?? new UnityWebRequestSessionTransport());
+                _sessionFiles = new SessionFileUploader(_config, root, http, () => _config.TechnicalAllowed);
+                if (SessionFileUploaderSetupForTests != null)
+                    SessionFileUploaderSetupForTests(_sessionFiles);
+                if (_config.GetConsent(ConsentCategory.Technical) == ConsentState.Denied)
+                    _sessionFiles.Clear(); // copies left by an earlier launch
+                _sessionFiles.Start();
+                s_sessionFiles = _sessionFiles;
+            }
+            catch (Exception ex)
+            {
+                ReportInternalError("CreateSessionFileUploader", ex);
+                _sessionFiles = null;
+            }
+        }
+
+        internal static SessionFileUploader SessionFileUploader => s_sessionFiles;
+
+        /// <summary>ApmSessionFiles.Upload (any thread).</summary>
+        internal static string EnqueueSessionFiles(string directory, SessionUploadOptions options)
+        {
+            try
+            {
+                var client = _instance;
+                var uploader = s_sessionFiles;
+                if (!_isInitialized || ReferenceEquals(client, null) || uploader == null)
+                {
+                    Log(LogLevel.Warning, "ApmSessionFiles.Upload: not available (call Initialize first; development and editor builds only; " +
+                        "EnableSessionFileUpload, UploadInEditor in the Editor)");
+                    return null;
+                }
+                if (string.IsNullOrEmpty(directory))
+                {
+                    Log(LogLevel.Warning, "ApmSessionFiles.Upload: no directory");
+                    return null;
+                }
+                if (client._config.GetConsent(ConsentCategory.Technical) == ConsentState.Denied)
+                {
+                    Log(LogLevel.Info, "ApmSessionFiles.Upload: technical consent denied; nothing queued");
+                    return null;
+                }
+                string commit = options?.GitCommit;
+                if (string.IsNullOrEmpty(commit))
+                    commit = GetContext("gitCommit");
+                var sessions = client._sessionManager;
+                var facts = new SessionUploadFacts
+                {
+                    DeviceId = sessions?.DeviceId,
+                    SessionId = options?.ApmSessionId,
+                    CurrentSessionId = sessions?.SessionId,
+                    GitCommit = commit,
+                    AppVersion = client._config.AppVersion,
+                    Build = client._config.Build,
+                    BuildType = client._buildType,
+                    Platform = client._platform,
+                    DeviceModel = client._deviceModel,
+                    OsVersion = client._osVersion,
+                    UnityVersion = client._unityVersion
+                };
+                string id = uploader.Enqueue(directory, facts);
+                if (id != null)
+                    Log(LogLevel.Info, $"Session files: {directory} queued (upload {id})");
+                return id;
+            }
+            catch (Exception ex)
+            {
+                ReportInternalError("ApmSessionFiles.Upload", ex);
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// The current session id (APM-14 rules: random, a new one after a long
+        /// background). OZX writes it into a recording's session.json as
+        /// "apmSessionId", so the uploaded recording links to the session's time
+        /// line (APM-13). Any thread; null before Initialize.
+        /// </summary>
+        public static string GetSessionId()
+        {
+            var client = _instance;
+            if (!_isInitialized || ReferenceEquals(client, null))
+                return null;
+            return client._sessionManager?.SessionId;
         }
 
         /// <summary>
@@ -1837,6 +1953,16 @@ namespace OzxApm.Core
                 stats.LogLinesSeen = client._timeline.LogLinesSeen;
             stats.LastUpdateMs = client._lastUpdateTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
             stats.BuildType = client._buildType;
+            var sessionFiles = client._sessionFiles;
+            if (sessionFiles != null)
+            {
+                stats.SessionFilesEnabled = true;
+                stats.SessionFilesPending = sessionFiles.Pending;
+                stats.SessionFilesCompleted = sessionFiles.Completed;
+                stats.SessionFilesFailed = sessionFiles.Failed;
+                stats.SessionFileBytesSent = sessionFiles.BytesSent;
+                stats.SessionFileLastError = sessionFiles.LastError;
+            }
             stats.UploadsEnabled = client._uploadsEnabled;
             return stats;
         }
@@ -1862,6 +1988,13 @@ namespace OzxApm.Core
         internal OfflineStorage StorageForTests => _offlineStorage;
         /// <summary>APM-12: the ops queue's directory for the next Initialize (default: StoragePathForTests + "_ops").</summary>
         internal static string OpsStoragePathForTests;
+        // Session files (APM-13): directory, transport, the engine's "Editor or
+        // Development Build" answer, and a hook on the uploader before it starts.
+        internal static string SessionFilesPathForTests;
+        internal static ISessionHttpTransport SessionFileTransportForTests;
+        internal static Func<bool> SessionFileEngineDevForTests;
+        internal static Action<SessionFileUploader> SessionFileUploaderSetupForTests;
+        internal SessionFileUploader SessionFilesForTests => _sessionFiles;
         internal OfflineStorage OpsStorageForTests => _opsStorage;
         internal EventReporter OpsReporterForTests => _opsReporter;
         internal void FocusForTests(bool focus) => OnApplicationFocus(focus);
@@ -1905,6 +2038,10 @@ namespace OzxApm.Core
             UnityTombstoneDirForTests = null;
             ProbeForTests = null;
             PidForTests = 4242;
+            SessionFilesPathForTests = null;
+            SessionFileTransportForTests = null;
+            SessionFileEngineDevForTests = null;
+            SessionFileUploaderSetupForTests = null;
         }
 
         private void Update()
@@ -1982,6 +2119,9 @@ namespace OzxApm.Core
                     if (_uploadsEnabled)
                         _reporter.Update();
                     UpdateOps();
+                    // Session files (APM-13; dev builds): a field read while idle.
+                    // Its requests wait while the event and ops uploaders send.
+                    _sessionFiles?.Update(now, _reporter.IsSending || (_opsReporter != null && _opsReporter.IsSending));
                 }
                 catch (Exception ex)
                 {
@@ -2013,6 +2153,8 @@ namespace OzxApm.Core
             try
             {
                 _sessionManager.OnApplicationPause(paused);
+                // Session files (APM-13): no new step in the background.
+                _sessionFiles?.OnPause(paused);
                 // The journal says whether a later kill hit the game in the foreground (APM-7).
                 _crash?.OnPause(paused);
                 // The RSS reader sleeps in the background (APM-9).
@@ -2142,6 +2284,10 @@ namespace OzxApm.Core
                 // Unsent batches stay on disk and are uploaded on the next launch.
                 _reporter.Shutdown();
                 _opsReporter?.Shutdown();
+                // Session files resume from their state files at the next launch (APM-13).
+                s_sessionFiles = null;
+                _sessionFiles?.Shutdown(100);
+                _sessionFiles = null;
                 long start = System.Diagnostics.Stopwatch.GetTimestamp();
                 _offlineStorage.Shutdown(ShutdownFlushTimeoutMs);
                 if (_opsStorage != null)

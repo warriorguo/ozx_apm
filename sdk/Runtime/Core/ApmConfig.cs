@@ -334,6 +334,44 @@ namespace OzxApm.Core
         /// </summary>
         public int MaxOpsStorageBytes { get; set; } = 4 * 1024 * 1024;
 
+        // ------------------------------------------------------------------
+        // Session files (APM-13): AiTelemetry session directories uploaded by
+        // development builds (ApmSessionFiles.Upload). Compiled out of release
+        // players and refused at run time in them whatever is set here.
+
+        /// <summary>
+        /// Allow ApmSessionFiles.Upload in development and editor builds (it is
+        /// always a no-op in release builds). On by default; it does nothing until
+        /// the game calls Upload.
+        /// </summary>
+        public bool EnableSessionFileUpload { get; set; } = true;
+
+        /// <summary>
+        /// The server's session file upload key (OZX_SESSION_FILES_UPLOAD_KEY,
+        /// RELEASE.md APM-13). Set it only in development builds (e.g. from the
+        /// build script); without the right key the server refuses (401) and
+        /// the recordings wait on the device.
+        /// </summary>
+        public string SessionFilesUploadKey { get; set; } = "";
+
+        /// <summary>Send session files only on Wi-Fi / LAN (not on mobile data). Default on.</summary>
+        public bool SessionFilesWifiOnly { get; set; } = true;
+
+        /// <summary>Average upload rate of session files, bytes per second (0: unlimited). Default 512 KB/s.</summary>
+        public int SessionFilesBytesPerSecond { get; set; } = 512 * 1024;
+
+        /// <summary>Size of one uploaded part (64 KB - 4 MB). Default 512 KB: below proxies' body limits, resumable in small steps.</summary>
+        public int SessionFilePartBytes { get; set; } = 512 * 1024;
+
+        /// <summary>Disk the zipped recordings waiting for upload may use. Default 512 MB.</summary>
+        public long MaxSessionFileStorageBytes { get; set; } = 512L * 1024 * 1024;
+
+        /// <summary>Uploads that may wait at once; Upload refuses more. Default 10.</summary>
+        public int MaxPendingSessionFiles { get; set; } = 10;
+
+        /// <summary>A recording not uploaded within this many days is dropped from the queue. Default 14.</summary>
+        public int SessionFileMaxAgeDays { get; set; } = 14;
+
         /// <summary>
         /// Store the player's choice (SetConsent) in PlayerPrefs and use it on the
         /// next launch instead of the defaults. Turn it off if the game keeps the

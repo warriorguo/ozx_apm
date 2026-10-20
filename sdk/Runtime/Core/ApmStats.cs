@@ -135,5 +135,16 @@ namespace OzxApm.Core
         public long OpsLastSeq;
         /// <summary>Consecutive failed ops uploads (0 after a success).</summary>
         public int OpsUploadFailures;
+        /// <summary>APM-13: the session file uploader runs (a development or editor build).</summary>
+        public bool SessionFilesEnabled;
+        /// <summary>Session file uploads waiting or under way.</summary>
+        public int SessionFilesPending;
+        /// <summary>Session file uploads completed / dropped in this process.</summary>
+        public int SessionFilesCompleted;
+        public int SessionFilesFailed;
+        /// <summary>Session file bytes the server acknowledged in this process.</summary>
+        public long SessionFileBytesSent;
+        /// <summary>The last session file error (null: none).</summary>
+        public string SessionFileLastError;
     }
 }
