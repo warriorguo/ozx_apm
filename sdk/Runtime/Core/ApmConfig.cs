@@ -326,9 +326,11 @@ namespace OzxApm.Core
         public string[] OpsContextKeys { get; set; } = { "runId", "chapter", "levelId", "room", "roomId", "revivesUsed" };
 
         /// <summary>
-        /// Disk the ops queue may use (bytes). Ops events are never dropped for
-        /// any other reason; beyond this the oldest stored ones are (counted in
-        /// ApmStats.OpsDroppedEvents). About 300-600 bytes per event.
+        /// Disk the ops queue may use (bytes); beyond it the oldest stored ops
+        /// events are dropped (counted in ApmStats.OpsDroppedEvents). About
+        /// 300-600 bytes per event. The only other loss: more than
+        /// MaxQueueSize (1000) ops events sent within one write interval
+        /// (PersistIntervalMs) of the ops worker, or a disk that keeps failing.
         /// </summary>
         public int MaxOpsStorageBytes { get; set; } = 4 * 1024 * 1024;
 

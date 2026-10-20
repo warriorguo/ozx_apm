@@ -103,11 +103,13 @@ const (
 )
 
 // adRevenue is one row per ad impression (ad_show) in the range with its
-// revenue in US dollars.
+// revenue in US dollars (usd; no_rate: a currency without any imported rate,
+// counted 0). Every alias differs from the columns it is computed from (the
+// old analyzer of 23.8 substitutes an alias inside its own aggregate).
 const adRevenue = `SELECT e.d AS day, e.pid AS player_id, e.cc AS country, e.pl AS placement,
         e.nw AS network, e.cur AS currency,
-        e.rev * if(e.cur IN ('USD', ''), 1, r.rate) AS revenue_usd,
-        e.cur NOT IN ('USD', '') AND r.rate = 0 AS missing_rate
+        e.rev * if(e.cur IN ('USD', ''), 1, r.rate) AS usd,
+        e.cur NOT IN ('USD', '') AND r.rate = 0 AS no_rate
     FROM (
         SELECT day AS d, player_id AS pid, toString(country) AS cc, props['placement'] AS pl, lower(props['network']) AS nw,
             num_props['revenue'] AS rev, upper(props['currency']) AS cur
@@ -297,8 +299,8 @@ ORDER BY day`,
 		Key: "ad_revenue", Title: "Ad revenue per day and network (USD, estimated)", Display: "bar",
 		Description: "The revenue the ad SDKs estimated per impression, in US dollars (imported daily rates). impressions_without_rate: impressions in a currency with no imported rate (counted as 0).",
 		Dimensions:  []string{"day", "network"}, Metrics: []string{"revenue_usd"},
-		SQL: `SELECT day, network, round(sum(revenue_usd), 4) AS revenue_usd, count() AS impressions,
-    countIf(missing_rate) AS impressions_without_rate
+		SQL: `SELECT day, network, round(sum(usd), 4) AS revenue_usd, count() AS impressions,
+    countIf(no_rate) AS impressions_without_rate
 FROM (
     ` + adRevenue + `
 )
@@ -314,7 +316,7 @@ ORDER BY day, network`,
     round(r.rev / d.dau, 5) AS arpdau_usd
 FROM (` + dauCountry + `) AS d
 LEFT JOIN (
-    SELECT day, country, sum(revenue_usd) AS rev
+    SELECT day, country, sum(usd) AS rev
     FROM (
         ` + adRevenue + `
     )
@@ -330,7 +332,7 @@ ORDER BY day, revenue_usd DESC, country`,
     round(r.rev, 4) AS revenue_usd, d.dau AS dau,
     if(d.dau = 0, NULL, round(r.rev / d.dau, 5)) AS arpdau_usd
 FROM (
-    SELECT day, placement AS pl, sum(revenue_usd) AS rev, count() AS imps
+    SELECT day, placement AS pl, sum(usd) AS rev, count() AS imps
     FROM (
         ` + adRevenue + `
     )
@@ -400,7 +402,7 @@ ORDER BY indexOf(['0', '1-2', '3-5', '6+'], bucket)`,
         t_usd = 0 OR r_usd = 0, 1,
         abs(t_usd - r_usd) * 100 > {{threshold_pct}} * r_usd, 1, 0) AS over_threshold
 FROM (
-    SELECT day, network, country, count() AS t_imps, sum(revenue_usd) AS t_usd
+    SELECT day, network, country, count() AS t_imps, sum(usd) AS t_usd
     FROM (
         ` + adRevenue + `
     )
