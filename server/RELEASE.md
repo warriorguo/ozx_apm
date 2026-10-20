@@ -1178,7 +1178,9 @@ First occurrences are persisted within milliseconds; the counts of the
 current window live in memory until it closes (60 s, `Flush`, going to
 background, shutdown, an unhandled exception that ends the process). If the
 process is killed in the foreground (OOM, native crash, force-stop), the
-counts of that last window are lost, as before APM-3.
+counts of that last window are lost, as before APM-3. (Since APM-24 only
+those of the last few seconds: the counts are checkpointed to disk, see
+APM-24 below.)
 
 `ApmStats` has `ErrorsSeen`, `ErrorEvents` and `ErrorsInSummary`.
 
@@ -1444,7 +1446,8 @@ ApmClient.CancelTimer("room_switch_ms");
   perf samples). An unhandled exception that ends the process flushes the
   window before the process dies (with APM-3's exception counts); a process
   killed in the foreground (OOM, native crash, force-stop) loses the counts of
-  its current window; individual custom events are on disk within milliseconds.
+  its current window (since APM-24: only those after the last checkpoint, at
+  most 5 s); individual custom events are on disk within milliseconds.
 
 ### SDK: the breadcrumb time line (exceptions, crashes, janks)
 
@@ -4412,3 +4415,221 @@ new admin against an old server shows "n/a" for the rate (never the old
   run (the sandbox cannot reach ClickHouse).
 - The browser check on n192 and the summary's query time at production
   volume.
+
+## APM-24: windowed counts survive a kill (count checkpoints; additive schema change)
+
+Deploy order: **server, then SDK builds.** Each works without the other: the
+previous server ignores `recovered` and stores a recovered count as a normal
+row (the event id rules below hold there too: APM-19); the new server with an
+older SDK simply never sees the flag.
+
+### The bug
+
+Device test K1 (APM-3, A33, 14 force-stops): the first occurrence of an error
+is on disk within milliseconds, but its repeat count waits in memory until the
+60 s window closes. A process killed in the foreground (force-stop, OOM, a
+native crash, the system) lost the whole count: 21-115 `APMT k3-n` errors per
+round, `sum(count)` 1 on the server. The same held for custom events beyond
+the per-minute budget and for custom metric series (APM-6): exactly the
+context wanted when a crash is investigated. Since APM-4.
+
+### Design (SDK)
+
+- **What.** Every count that waits for its window: exception buckets (per
+  fingerprint, context and unhandled kind, the overflow buckets, the summary of
+  untracked errors), aggregated custom events, metric series. Not first
+  occurrences or individually sent events (queued at once, as before), not the
+  100 ms hold of an off-main-thread logged exception.
+- **Where.** The storage worker (`OfflineStorage`, thread `OzxApm.Storage`)
+  writes, per collector, `counts-exceptions.ckpt` / `counts-custom.ckpt` in the
+  event directory: one line per pending count, **exactly the JSON that would be
+  uploaded**, with `"recovered":true` and `"seq":0`, the common fields stamped
+  as for a queued event (`ApmClient.StampCommonFields`). Written as `.ckpt.tmp`,
+  then the previous file is deleted and the new one renamed; no fsync (the page
+  cache survives a process death, like the segments). At most
+  `4 x MaxBatchBytes` (256 KB) per file; counts beyond are left out of the
+  checkpoint (`ApmStats.CountCheckpointOmitted`) and still go out with their
+  window.
+- **When.** A counting call sets a dirty flag under the collector's existing
+  lock; the clean-to-dirty transition (once per checkpoint cycle, not per
+  count) asks the storage for a checkpoint (`RequestCheckpoint`: the storage
+  lock and, if the worker sleeps long, one signal). The worker collects at
+  most every `ApmConfig.CountCheckpointIntervalSeconds` (default **5 s**,
+  clamped 1-60, `0` = off), or less often for large files (the files' total
+  size at 4 KB/s: 16 s for 64 KB, about a minute for 256 KB), only when
+  something changed, and the first time at once. Nothing per frame, nothing
+  while nothing is counted.
+- **Window close.** A close (60 s, `Flush`, pause, shutdown, new session, an
+  unhandled exception that ends the process) hands the window's final events
+  to the queue, then marks the collector dirty and asks for an *urgent*
+  checkpoint, which rewrites (normally deletes) the file in the next worker
+  iteration. Ordering: the worker collects **before** it drains the queue, and
+  a collector answers `Busy` while a closed window's events are not yet queued
+  (`_closing`), so a checkpoint without a closed window's counts is only
+  written in an iteration that also wrote their final events (and not at all
+  when those writes failed). A kill between the two leaves both, see below.
+- **One event id per count.** A count gets a 128-bit id when its first
+  occurrence is counted (`EventIdSource`, SplitMix64 seeded from a Guid, no
+  allocation); every checkpoint copy and the window's final event carry it, the
+  timestamp (the count's first occurrence) and the same key column. For the
+  server they are the same event.
+- **Next launch.** Before anything else the storage turns a `.ckpt` (or, if the
+  process died between delete and rename, the complete `.ckpt.tmp`) into a
+  sealed segment named after the time it is found, so it is uploaded after
+  the dead process's own segments (which may hold the final counts).
+  `ApmStats.CountCheckpointsRecovered`.
+- **Consent (APM-14).** Nothing is written without technical consent, and
+  nothing deleted then either (withdrawn consent keeps what is stored, as for
+  segments); `Clear` (Denied, device id reset) deletes the files with
+  everything else; a collection stamped before a `Clear` is discarded and
+  collected again. Memory-only mode (WebGL, a second instance): no checkpoints.
+- **Native crashes.** Managed code cannot run at a signal, so "flush on the
+  crash path" is not possible for native crashes, kills and OOM; the
+  checkpoint is what survives. An unhandled managed exception that ends the
+  process already flushed its windows (APM-3/6).
+
+Alternatives considered:
+- *The APM-7 crash journal*: Android only (iOS kills are as frequent), runs
+  only with crash reporting, rewritten every 100 ms on change (exception
+  texts would make that write large), and would need its own parser and a
+  report path to rebuild events. The storage already has the format, the
+  consent rules and the upload.
+- *Periodic delta events* (a row per count every 5 s): exact without any id
+  logic, but up to 12 network rows a minute per count (each with the error's
+  text, 1-17 KB) instead of one, against a daily network cap.
+- *A 10 s window*: 6 times the rows, and still loses 10 s.
+
+### Server semantics and the daily views
+
+Each window of a count is stored once: either its final event (the process
+lived) or its last checkpoint copy (`recovered = 1`: the process died; the
+row holds the occurrences up to that checkpoint, at most ~5 s before the
+death; a recovered metric row's `window_ms` ends there too). Recovered rows are
+counts like any other: `sum(count)`, distributions, percentiles and the daily
+views include them.
+
+Both copies reach the server only when the process died between writing the
+final events and deleting the checkpoint (one file deletion, in the same
+worker iteration), or if a recovered file and a segment holding the finals
+both survive for another reason. Then the second one to arrive is dropped by
+APM-19's duplicate drop (same event id, in the same request or already
+stored: same app version, key column and timestamp, so the lookup finds it)
+and **never inserted, so the materialized views (`apm_exception_daily`,
+`apm_custom_event_daily`, `apm_custom_metric_daily`), which see every insert,
+count it once.** The final copy normally arrives first (its segment is older),
+so the larger count is kept; if the copy came first its count is kept, never
+both. What slips past the lookup (two uploads of the same id at the same
+moment, a failed lookup: APM-19 then inserts rather than lose data) is merged
+by the ReplacingMergeTree (event_id is in the sort key) in the table, but
+counted twice in the daily view, exactly as for any APM-19 re-send; one device
+uploads one request at a time, so this needs a server-side lookup failure.
+
+Why not a "keep the max" table: `ReplacingMergeTree(count)` or a version column
+needs a table rebuild (not within the `apm` grants), and the views would still
+sum every inserted version; dropping the second copy before insert keeps the
+views right without touching the tables.
+
+`seq` of a recovered row is 0 (a copy takes no number of the per-install
+sequence); sequence-gap checks filter `recovered = 0` (or `seq > 0`).
+
+### Schema
+
+`Migrate` adds (also in `scripts/migrate.sql`):
+
+```sql
+ALTER TABLE apm_exceptions ADD COLUMN IF NOT EXISTS recovered UInt8 DEFAULT 0;
+ALTER TABLE apm_custom_events ADD COLUMN IF NOT EXISTS recovered UInt8 DEFAULT 0;
+ALTER TABLE apm_custom_metrics ADD COLUMN IF NOT EXISTS recovered UInt8 DEFAULT 0;
+```
+
+Metadata only, idempotent, within the `apm` account's `ALTER ADD COLUMN`
+grant (ClickHouse 23.8/24.1/26.1); last column, same order in fresh and
+migrated tables. The daily views do not read it and are unchanged. Ingest
+reads it leniently (anything but JSON `true` is 0). The admin API does not
+show it yet; ad-hoc:
+
+```sql
+SELECT sum(count), sumIf(count, recovered = 1) FROM apm_exceptions WHERE fingerprint = '...';
+```
+
+### Cost
+
+Unity's Mono outside Unity (M-series Mac), `/tmp/claude-501/apm24/bench`
+(30-key context; main = 12c398a, best of 5 x 1M calls):
+
+| Path | main | APM-24 |
+|---|---|---|
+| Repeat of a 700-character bus error | 0.75-0.76 us, 0 B | 0.76-0.77 us, 0 B |
+| ... with a checkpoint collected every 1000 repeats (the request after it) | | 0.76-0.77 us, 0 B on the counting thread |
+| `RecordMetric`, known name and context | 0.079 us, 0 B | 0.079-0.085 us, 0 B |
+| `TrackEvent` beyond the budget | 0.126-0.128 us, 0 B | 0.131-0.136 us, 0 B |
+| One checkpoint on the worker (collect, stamp, serialize, write, replace): 1 / 3 buckets / 9 buckets (8 contexts + overflow) | | 127-169 us, 5.1-7.4 KB, file 2 / 6 / 18.6 KB |
+
+- Main thread: per frame nothing; per checkpoint cycle and collector one
+  storage lock and possibly one signal (from the thread that counted). The
+  counting calls stay allocation-free (Unity test
+  `Repeats_AndSamples_DoNotAllocate_WithCheckpointRequests`).
+- Storage worker: one checkpoint per collector at most every 5 s while counts
+  change (~0.15 ms on a Mac; a few times that on the A33), 5-7 KB of garbage
+  each; nothing while idle; one file deletion per window close.
+- Flash: a repeating error is a 2 KB file rewritten every 5 s (~25 KB a
+  minute); at most ~4 KB/s on average for any size; a file replaced before
+  the kernel's writeback is often never written to flash at all.
+
+### Rolling deploy and rollback
+
+The server first (the column); old and new binaries can serve side by side
+(the old one names its insert columns: its rows read `recovered = 0`; it
+stores recovered rows as normal counts, which they are). **Rollback:**
+redeploy the previous binary; no schema action, the column stays. SDK
+rollback: builds without APM-24 never write checkpoints; a `.ckpt` left by an
+APM-24 build is ignored (and deleted with the directory on `Clear`) by an
+older SDK. To turn checkpoints off without a rollback:
+`ApmConfig.CountCheckpointIntervalSeconds = 0`.
+
+### Verified
+
+- Server: `go vet`, `go test -race -short ./...` (handlers: recovered rows
+  stored with the flag for all three types, a wrong JSON type read as 0, the
+  checkpoint copy and the final count of one id stored once whichever comes
+  first and in one request, the SDK-written fixture
+  `processor/testdata/sdk_events_apm24.jsonl` stored as sent; schema: the
+  column last on exactly the three tables in CREATE and ALTER, no view reads
+  it; `migrate.sql` regenerated and checked).
+- SDK: compiles at C# 8 (Android, iOS, with `UNITY_2021_2_OR_NEWER`); on
+  Unity's Mono outside Unity all runtime tests pass except the 2 known
+  environment failures (314 pass; 117 need the Unity runtime); new
+  `CountCheckpointTests` (20 run here): the checkpoint uploaded by the next
+  launch as the same event, interval and change rules, urgent close, size
+  spacing, delete when empty, Busy retry, a Clear during the collection,
+  consent (Undecided writes nothing, Denied deletes), recovery of `.ckpt` over
+  `.ckpt.tmp`, a failed event write keeping the previous checkpoint, the size
+  cap, memory-only and a second instance never checkpointing, the K1
+  scenario (1 + 49 repeats, a checkpoint, 10 more, a kill: the next launch
+  uploads 1 and 49 with the count's first-occurrence fields), the final count
+  carrying the copy's id, a kill between final and delete (both with one id,
+  the final first), the untracked-errors summary, custom counts and metric
+  series after a kill and at a close, and a real worker thread with 4
+  logging threads, window closes and directory copies taken mid-run (no id
+  counted twice, never more than happened; after a clean stop every
+  occurrence uploaded exactly once, no file left; 5 runs).
+- Benchmark above (`/tmp/claude-501/apm24/bench/bench.sh`).
+
+### Not verified (for the lead)
+
+- Integration tests (`tests/integration/apm24_test.go`: through ingest ->
+  ClickHouse on both insert paths: recovered rows stored and summed, the copy
+  after a final dropped as a duplicate, the daily views equal to the tables,
+  the admin's exception count, OPTIMIZE FINAL merging a copy inserted past
+  the lookup) and the migration tests with the new column: not run (no
+  ClickHouse reachable from the sandbox).
+- Unity EditMode: `Repeats_AndSamples_DoNotAllocate_WithCheckpointRequests`
+  and `CountCheckpointApiTests` (through ApmClient: the copies' common fields,
+  the final events' ids, Denied deleting the files) need the Unity runtime.
+- The device: K1 again and the cost A/B (`/tmp/claude-501/apm24/DEVICE_PLAN.md`;
+  driver `/tmp/claude-501/apm24/ApmTestDriver.cs`, compile-checked), the file
+  sizes and write rate on the A33, a native crash instead of force-stop.
+- Not handled: counts collected while consent was granted and then withdrawn
+  (Undecided) stay in the checkpoint file and are uploaded once consent is
+  granted again in a later process (as stored segments are); if consent is
+  granted again in the same process, the next checkpoint replaces them.
