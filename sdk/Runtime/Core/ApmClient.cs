@@ -1278,6 +1278,11 @@ namespace OzxApm.Core
                     ReportInternalError(collector.GetType().Name + (on ? ".Start" : ".Stop"), ex);
                 }
             }
+            // APM-24: counts made while checkpoints could not be written (no
+            // consent) are collected at the next checkpoint (the storage then
+            // asks every collector).
+            if (on)
+                RequestCountCheckpoint(false);
         }
 
         /// <summary>
@@ -1766,6 +1771,8 @@ namespace OzxApm.Core
                 storage.AddCheckpointSource(_exceptionCollector);
             if (_customCollector != null)
                 storage.AddCheckpointSource(_customCollector);
+            // Counts made before the registration asked nobody.
+            storage.RequestCheckpoint(false);
         }
 
         /// <summary>

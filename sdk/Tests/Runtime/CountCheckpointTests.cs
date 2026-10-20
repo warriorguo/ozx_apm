@@ -313,8 +313,11 @@ namespace OzxApm.Tests
             Assert.AreEqual(0, UploadAll(next).Count);
         }
 
+        // Busy (a window's events are being queued): not retried by the storage
+        // (a close that never completed would make it poll every 10 ms); the
+        // close asks for an urgent checkpoint once its events are queued.
         [Test]
-        public void Busy_IsAskedAgainAtTheNextIteration()
+        public void Busy_WaitsForTheClosesRequest()
         {
             var (store, source) = StoreWithFake(Count("aaaa", 3));
             source.Busy = true;
@@ -322,8 +325,47 @@ namespace OzxApm.Tests
             store.Pump();
             Assert.AreEqual(0, CheckpointFiles().Length);
             source.Busy = false;
-            store.Pump(); // no new request: the retry is the storage's
+            store.ExpireCheckpointIntervalForTests();
+            store.Pump();
+            Assert.AreEqual(1, source.Calls, "no retry of its own");
+            store.RequestCheckpoint(true); // EnqueueAll's request
+            store.Pump();
             Assert.AreEqual(1, CheckpointFiles().Length);
+        }
+
+        // Counts made without consent: the dirty flags stay set and nobody asks
+        // again, so the storage asks every source at the next collection.
+        [Test]
+        public void AfterConsentIsGrantedAgain_EverySourceIsAsked()
+        {
+            var (store, source) = StoreWithFake(Count("aaaa", 3));
+            _config.SetConsentState(ConsentCategory.Technical, ConsentState.Undecided);
+            store.RequestCheckpoint(false);
+            store.Pump();
+            Assert.AreEqual(0, source.Calls);
+            _config.SetConsentState(ConsentCategory.Technical, ConsentState.Granted);
+            source.Dirty = false; // its own flag: it would answer Unchanged
+            store.RequestCheckpoint(false); // ApmClient, when collection resumes
+            store.ExpireCheckpointIntervalForTests();
+            store.Pump();
+            Assert.IsTrue(source.LastForce);
+            Assert.AreEqual(1, CheckpointFiles().Length);
+        }
+
+        // Turned off at run time: the file (its windows are sent anyway) goes.
+        [Test]
+        public void IntervalSetToZeroAtRunTime_DeletesTheFile()
+        {
+            var (store, source) = StoreWithFake(Count("aaaa", 3));
+            store.RequestCheckpoint(false);
+            store.Pump();
+            Assert.AreEqual(1, CheckpointFiles().Length);
+            // A request made just before the interval is set to 0 (afterwards
+            // RequestCheckpoint is a no-op).
+            store.RequestCheckpoint(true);
+            _config.CountCheckpointIntervalSeconds = 0f;
+            store.Pump();
+            Assert.AreEqual(0, CheckpointFiles().Length);
         }
 
         // Clear (device id reset) between the collection and the write: the
@@ -344,6 +386,7 @@ namespace OzxApm.Tests
             store.Pump();
             Assert.AreEqual(0, store.CheckpointWrites);
             source.Dirty = false; // unchanged since: still collected (forced)
+            store.ExpireCheckpointIntervalForTests(); // at the next due time
             store.Pump();
             Assert.IsTrue(source.LastForce);
             Assert.AreEqual(1, store.CheckpointWrites);
@@ -413,6 +456,7 @@ namespace OzxApm.Tests
 
             OfflineStorage.BeforeWriteHook = null;
             store.ResetWriteBackoffForTests();
+            store.ExpireCheckpointIntervalForTests(); // collected again at the next due time
             store.Pump();
             Assert.AreEqual(0, CheckpointFiles().Length, "collected again once the final count is on disk");
             var uploaded = UploadAll(store);

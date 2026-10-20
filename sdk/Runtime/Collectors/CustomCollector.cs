@@ -295,45 +295,53 @@ namespace OzxApm.Collectors
             bool clock = GameClock.Now(out double gameT, out int frame);
 
             CustomEvent evt = null;
-            List<BaseEvent> closed;
+            List<BaseEvent> closed = null;
             bool checkpoint = false;
-            lock (_sync)
+            try
             {
-                if (!_isActive)
-                    return false;
-                // On the time line only once it is certain to be collected (a
-                // consent withdrawal clears the time line after Stop).
-                _timeline?.RecordEvent(name, props, now);
-                closed = SyncSessionLocked();
-                _eventsTracked++;
-                if (TakeBudgetLocked(name))
+                lock (_sync)
                 {
-                    evt = new CustomEvent { timestamp = now, name = name, props = props, prop_kinds = props != null ? kinds : null, ctx = ctx };
-                    if (clock)
+                    if (!_isActive)
+                        return false;
+                    // On the time line only once it is certain to be collected (a
+                    // consent withdrawal clears the time line after Stop).
+                    _timeline?.RecordEvent(name, props, now);
+                    closed = SyncSessionLocked();
+                    _eventsTracked++;
+                    if (TakeBudgetLocked(name))
                     {
-                        evt.game_t = gameT;
-                        evt.frame = frame;
-                    }
-                }
-                else
-                {
-                    var s = FindSeriesLocked(false, name, ctx, now);
-                    if (s == null)
-                    {
-                        _eventsDropped++;
+                        evt = new CustomEvent { timestamp = now, name = name, props = props, prop_kinds = props != null ? kinds : null, ctx = ctx };
+                        if (clock)
+                        {
+                            evt.game_t = gameT;
+                            evt.frame = frame;
+                        }
                     }
                     else
                     {
-                        if (s.Count == 0)
-                            s.FirstMs = now;
-                        s.Count++;
-                        _eventsAggregated++;
-                        checkpoint = !_cpDirty;
-                        _cpDirty = true;
+                        var s = FindSeriesLocked(false, name, ctx, now);
+                        if (s == null)
+                        {
+                            _eventsDropped++;
+                        }
+                        else
+                        {
+                            if (s.Count == 0)
+                                s.FirstMs = now;
+                            s.Count++;
+                            _eventsAggregated++;
+                            checkpoint = !_cpDirty;
+                            _cpDirty = true;
+                        }
                     }
                 }
             }
-            EnqueueAll(closed);
+            finally
+            {
+                // Also when the code above threw: a closed window always reaches
+                // the queue (and _closing returns to 0; APM-24).
+                EnqueueAll(closed);
+            }
             if (evt != null)
                 Enqueue(evt);
             if (checkpoint)
@@ -454,44 +462,52 @@ namespace OzxApm.Collectors
             }
             var ctx = GameContext.Current;
             int key = MetricBuckets.Key(value);
-            List<BaseEvent> closed;
+            List<BaseEvent> closed = null;
             bool checkpoint = false;
-            lock (_sync)
+            try
             {
-                if (!_isActive)
-                    return false;
-                closed = SyncSessionLocked();
-                var s = FindSeriesLocked(true, name, ctx, 0);
-                if (s == null || double.IsInfinity(s.Sum + value))
+                lock (_sync)
                 {
-                    // Beyond the name limit, or a sum the wire cannot carry.
-                    _samplesDropped++;
-                }
-                else
-                {
-                    if (s.Count == 0)
+                    if (!_isActive)
+                        return false;
+                    closed = SyncSessionLocked();
+                    var s = FindSeriesLocked(true, name, ctx, 0);
+                    if (s == null || double.IsInfinity(s.Sum + value))
                     {
-                        s.FirstMs = Timeline.NowMs();
-                        s.Unit = ValidUnit(unit) ? unit : "";
-                        s.Min = value;
-                        s.Max = value;
+                        // Beyond the name limit, or a sum the wire cannot carry.
+                        _samplesDropped++;
                     }
                     else
                     {
-                        if (value < s.Min)
+                        if (s.Count == 0)
+                        {
+                            s.FirstMs = Timeline.NowMs();
+                            s.Unit = ValidUnit(unit) ? unit : "";
                             s.Min = value;
-                        if (value > s.Max)
                             s.Max = value;
+                        }
+                        else
+                        {
+                            if (value < s.Min)
+                                s.Min = value;
+                            if (value > s.Max)
+                                s.Max = value;
+                        }
+                        s.Count++;
+                        s.Sum += value;
+                        s.Hist.Add(key);
+                        _samples++;
+                        checkpoint = !_cpDirty;
+                        _cpDirty = true;
                     }
-                    s.Count++;
-                    s.Sum += value;
-                    s.Hist.Add(key);
-                    _samples++;
-                    checkpoint = !_cpDirty;
-                    _cpDirty = true;
                 }
             }
-            EnqueueAll(closed);
+            finally
+            {
+                // Also when the code above threw: a closed window always reaches
+                // the queue (and _closing returns to 0; APM-24).
+                EnqueueAll(closed);
+            }
             if (checkpoint)
                 RequestCheckpoint(false);
             return true;

@@ -4598,10 +4598,12 @@ older SDK. To turn checkpoints off without a rollback:
   it; `migrate.sql` regenerated and checked).
 - SDK: compiles at C# 8 (Android, iOS, with `UNITY_2021_2_OR_NEWER`); on
   Unity's Mono outside Unity all runtime tests pass except the 2 known
-  environment failures (314 pass; 117 need the Unity runtime); new
-  `CountCheckpointTests` (20 run here): the checkpoint uploaded by the next
+  environment failures (316 pass; 117 need the Unity runtime); new
+  `CountCheckpointTests` (22 run here): the checkpoint uploaded by the next
   launch as the same event, interval and change rules, urgent close, size
-  spacing, delete when empty, Busy retry, a Clear during the collection,
+  spacing, delete when empty, Busy waiting for the close's request, every
+  source asked after consent returns, the file deleted when the interval is
+  set to 0 at run time, a Clear during the collection,
   consent (Undecided writes nothing, Denied deletes), recovery of `.ckpt` over
   `.ckpt.tmp`, a failed event write keeping the previous checkpoint, the size
   cap, memory-only and a second instance never checkpointing, the K1
@@ -4614,6 +4616,19 @@ older SDK. To turn checkpoints off without a rollback:
   counted twice, never more than happened; after a clean stop every
   occurrence uploaded exactly once, no file left; 5 runs).
 - Benchmark above (`/tmp/claude-501/apm24/bench/bench.sh`).
+- A code review (another agent) found: a closed window not handed to the
+  queue when the code after the session check threw (the collector would
+  answer Busy for good and the worker re-requested every 10 ms): the hand-off
+  is now in a `finally`, and Busy is no longer re-requested by the storage
+  (the close asks itself); dirty flags latched when a request was consumed
+  without asking the sources (no consent, before registration, a failed
+  write): the next collection then asks every source, and ApmClient asks
+  after registration and when collection resumes; recovered segments (seq 0,
+  named when found) hid the earlier segments from the seq-file fallback
+  scan; a file left when the interval is set to 0 at run time; the summary
+  fingerprint parsed under the lock at every collection. All fixed with
+  tests; retries after a failed or discarded write now wait for the
+  interval (never a busy loop on a failing disk).
 
 ### Not verified (for the lead)
 

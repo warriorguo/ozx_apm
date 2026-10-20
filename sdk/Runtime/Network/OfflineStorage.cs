@@ -253,6 +253,9 @@ namespace OzxApm.Network
         private bool _writeFailedInPump; // worker: events of this iteration did not reach the disk
         private readonly MemoryStream _cpBuffer = new MemoryStream(4 * 1024);
         private long _cpWrites, _cpLastBytes, _cpRecoveredFiles, _cpOmitted;
+        // Segments made from recovered checkpoints (seq 0, named when found):
+        // not "the newest segment" for MaxSeqInNewestSegments.
+        private readonly HashSet<string> _recoveredSegmentNames = new HashSet<string>(StringComparer.Ordinal);
 
         /// <summary>
         /// APM-24: fills the common fields (version, device, session, scene,
@@ -564,7 +567,7 @@ namespace OzxApm.Network
         {
             if (!_cpRequested || !_persistToDisk)
                 return int.MaxValue;
-            if (CheckpointIntervalMs <= 0 || _cpUrgent || _cpForce || !_cpCollectedOnce)
+            if (CheckpointIntervalMs <= 0 || _cpUrgent || !_cpCollectedOnce)
                 return 0;
             int interval = CheckpointSpacingMs;
             int elapsed = unchecked(Environment.TickCount - _cpLastTick);
@@ -603,10 +606,33 @@ namespace OzxApm.Network
             _cpCollectedOnce = true;
             // Without consent nothing is written, and nothing is deleted
             // (withdrawn consent keeps what is stored; Denied clears it all).
-            if (!_config.TechnicalAllowed || CheckpointIntervalMs <= 0)
+            // The sources' dirty flags stay set: the next collection asks them
+            // all (force; ApmClient requests one when collection resumes).
+            if (!_config.TechnicalAllowed)
+            {
+                _cpForce = true;
                 return false;
+            }
+            if (CheckpointIntervalMs <= 0)
+            {
+                // Turned off at run time: a file left would hold counts whose
+                // windows are sent anyway.
+                _cpForce = true;
+                for (int i = 0; i < slots.Length; i++)
+                {
+                    try
+                    {
+                        DeleteCheckpointFiles(slots[i]);
+                    }
+                    catch (Exception ex)
+                    {
+                        Warn($"Failed to delete the count checkpoint: {ex.Message}");
+                    }
+                }
+                return false;
+            }
 
-            bool any = false, busy = false;
+            bool any = false;
             for (int i = 0; i < slots.Length; i++)
             {
                 var slot = slots[i];
@@ -623,24 +649,16 @@ namespace OzxApm.Network
                     slot.Events.Clear();
                     continue;
                 }
-                if (result == CheckpointCollect.Busy)
-                    busy = true;
-                else if (result == CheckpointCollect.Collected)
+                if (result == CheckpointCollect.Collected)
                 {
                     slot.Collected = true;
                     any = true;
                 }
             }
-            if (busy)
-            {
-                // A window is being closed right now: try again in the next
-                // iteration (its close requests an urgent checkpoint anyway).
-                lock (_lock)
-                {
-                    _cpRequested = true;
-                    _cpUrgent = true;
-                }
-            }
+            // Busy: a window is being closed right now; its close asks for an
+            // urgent checkpoint once its events are queued (EnqueueAll), so
+            // nothing is re-requested here (a request per iteration would make
+            // the worker poll every 10 ms if a close never completed).
             return any;
         }
 
@@ -676,7 +694,8 @@ namespace OzxApm.Network
                 }
                 catch (Exception ex)
                 {
-                    slot.HasFile = true; // unknown: deleted at the next close
+                    slot.HasFile = true; // unknown: rewritten or deleted next time
+                    again = _config.TechnicalAllowed; // the collection is lost: collect again
                     Warn($"Failed to write the count checkpoint: {ex.GetType().Name}: {ex.Message}");
                 }
                 finally
@@ -686,12 +705,11 @@ namespace OzxApm.Network
             }
             if (again)
             {
+                // At the next due time (not at once: a disk that keeps failing
+                // must not make the worker spin).
                 _cpForce = true;
                 lock (_lock)
-                {
                     _cpRequested = true;
-                    _cpUrgent = true;
-                }
             }
         }
 
@@ -814,6 +832,7 @@ namespace OzxApm.Network
                         baseName = SegmentBaseName(ms);
                     }
                     File.Move(source, Path.Combine(_storagePath, baseName + SegmentExtension));
+                    _recoveredSegmentNames.Add(baseName + SegmentExtension);
                     Interlocked.Increment(ref _cpRecoveredFiles);
                 }
                 catch (Exception ex)
@@ -1263,13 +1282,10 @@ namespace OzxApm.Network
                 if (checkpoints)
                 {
                     // Collected but not written (something above threw): collect
-                    // everything again next time.
+                    // everything again at the next due time.
                     _cpForce = true;
                     lock (_lock)
-                    {
                         _cpRequested = true;
-                        _cpUrgent = true;
-                    }
                 }
                 UpdateHighValueWaiting();
                 _drain.Clear();
@@ -1456,7 +1472,7 @@ namespace OzxApm.Network
             long newestMs = -1;
             for (int s = _segments.Count - 1; s >= 0 && newestMs < 0; s--)
             {
-                if (!_segments[s].Legacy)
+                if (!_segments[s].Legacy && !_recoveredSegmentNames.Contains(_segments[s].Name))
                     newestMs = SegmentCreatedMs(_segments[s].Name);
             }
             if (newestMs < 0)

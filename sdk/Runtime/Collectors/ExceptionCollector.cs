@@ -167,6 +167,7 @@ namespace OzxApm.Collectors
         private int _closing;
         private readonly EventIdSource _ids = new EventIdSource();
         private ulong _untrackedIdHi, _untrackedIdLo; // the window's summary event
+        private static string s_summaryFingerprint;
 
         // Breadcrumbs and recent warning/error lines (APM-6): the Timeline,
         // shared with the other collectors. Sent with the first occurrence of
@@ -549,31 +550,39 @@ namespace OzxApm.Collectors
             List<ExceptionEvent> closed = null;
             bool counted = false;
             bool checkpoint = false;
-            lock (_sync)
+            try
             {
-                // Checked under the lock: after Stop's final flush nothing is counted.
-                if (!_isActive)
-                    return;
-                closed = SyncSessionLocked();
-                bool wasDirty = _cpDirty;
-                if (_byRawKey.TryGetValue(key, out var known))
+                lock (_sync)
                 {
-                    counted = true;
-                    if (!(track && IsEchoOfUnhandled(known)))
+                    // Checked under the lock: after Stop's final flush nothing is counted.
+                    if (!_isActive)
+                        return;
+                    closed = SyncSessionLocked();
+                    bool wasDirty = _cpDirty;
+                    if (_byRawKey.TryGetValue(key, out var known))
                     {
-                        var occ = NewOccurrenceLocked(nowMs, ctx, null);
-                        object target = known;
-                        if (known.IsUntracked)
-                            CountUntrackedLocked(ref occ, null);
-                        else
-                            target = CountLocked(known, ref occ);
-                        if (track)
-                            RememberLog(known.Fingerprint, target, ref occ);
+                        counted = true;
+                        if (!(track && IsEchoOfUnhandled(known)))
+                        {
+                            var occ = NewOccurrenceLocked(nowMs, ctx, null);
+                            object target = known;
+                            if (known.IsUntracked)
+                                CountUntrackedLocked(ref occ, null);
+                            else
+                                target = CountLocked(known, ref occ);
+                            if (track)
+                                RememberLog(known.Fingerprint, target, ref occ);
+                        }
                     }
+                    checkpoint = !wasDirty && _cpDirty;
                 }
-                checkpoint = !wasDirty && _cpDirty;
             }
-            EnqueueAll(closed);
+            finally
+            {
+                // Also when the code above threw: a closed window always reaches
+                // the queue (and _closing returns to 0; APM-24).
+                EnqueueAll(closed);
+            }
             if (checkpoint)
                 RequestCheckpoint(false);
             if (counted)
@@ -595,77 +604,85 @@ namespace OzxApm.Collectors
             ExceptionEvent first = null;
             List<ExceptionEvent> closed = null;
             bool checkpoint = false;
-            lock (_sync)
+            try
             {
-                if (!_isActive)
-                    return;
-                closed = SyncSessionLocked();
-                bool wasDirty = _cpDirty;
-                if (track && unhandled == null && IsEchoOfUnhandled(info))
-                    goto Done;
-
-                // Another thread may have added the text meanwhile.
-                Entry entry;
-                if (!cacheKey || !_byRawKey.TryGetValue(key, out entry))
+                lock (_sync)
                 {
-                    if (!_entries.TryGetValue(info.Fingerprint, out entry))
+                    if (!_isActive)
+                        return;
+                    closed = SyncSessionLocked();
+                    bool wasDirty = _cpDirty;
+                    if (track && unhandled == null && IsEchoOfUnhandled(info))
+                        goto Done;
+
+                    // Another thread may have added the text meanwhile.
+                    Entry entry;
+                    if (!cacheKey || !_byRawKey.TryGetValue(key, out entry))
                     {
-                        entry = info;
-                        if (_entries.Count < MaxFingerprintsPerWindow)
-                            _entries[info.Fingerprint] = info;
-                        else
-                            info.IsUntracked = true;
+                        if (!_entries.TryGetValue(info.Fingerprint, out entry))
+                        {
+                            entry = info;
+                            if (_entries.Count < MaxFingerprintsPerWindow)
+                                _entries[info.Fingerprint] = info;
+                            else
+                                info.IsUntracked = true;
+                        }
+                        if (cacheKey && _byRawKey.Count < MaxRawKeys)
+                            _byRawKey[key] = entry;
                     }
-                    if (cacheKey && _byRawKey.Count < MaxRawKeys)
-                        _byRawKey[key] = entry;
-                }
 
-                var occ = NewOccurrenceLocked(nowMs, ctx, unhandled);
-                if (entry.IsUntracked)
-                {
-                    CountUntrackedLocked(ref occ, entry.Fingerprint);
-                    if (track)
-                        RememberLog(entry.Fingerprint, entry, ref occ);
-                    goto Done;
-                }
-
-                if (entry == info && _immediateSent < MaxImmediatePerWindow)
-                {
-                    // New fingerprint: the first occurrence goes to disk right away,
-                    // with the time it happened and the breadcrumbs that led to it.
-                    _immediateSent++;
-                    _eventsEnqueued++;
-                    first = BuildEvent(entry, 1, ref occ, false, _windowSessionId, SnapshotForEvent(rawMessage));
-                    if (hold)
+                    var occ = NewOccurrenceLocked(nowMs, ctx, unhandled);
+                    if (entry.IsUntracked)
                     {
-                        _held.Add(new HeldEvent { Event = first, Tick = Environment.TickCount });
-                        _heldCount = _held.Count;
+                        CountUntrackedLocked(ref occ, entry.Fingerprint);
                         if (track)
-                            RememberLog(entry.Fingerprint, first, ref occ);
-                        first = null;
+                            RememberLog(entry.Fingerprint, entry, ref occ);
+                        goto Done;
                     }
-                }
-                else
-                {
-                    // Same group, different text (e.g. another roomId in the
-                    // message), or the window's budget for immediate events is
-                    // spent: counted, reported at the end of the window.
-                    var bucket = CountLocked(entry, ref occ);
-                    if (track)
-                        RememberLog(entry.Fingerprint, bucket, ref occ);
-                }
 
-                if (entry == info && !onTimeline)
-                {
-                    // Record as breadcrumb (once per group and window, not per
-                    // repeat), unless the log line itself is on the time line
-                    // (errors and asserts are; exceptions are not).
-                    _timeline.RecordText("Exception: " + Truncate(FirstLine(info.Message), 100), nowMs);
+                    if (entry == info && _immediateSent < MaxImmediatePerWindow)
+                    {
+                        // New fingerprint: the first occurrence goes to disk right away,
+                        // with the time it happened and the breadcrumbs that led to it.
+                        _immediateSent++;
+                        _eventsEnqueued++;
+                        first = BuildEvent(entry, 1, ref occ, false, _windowSessionId, SnapshotForEvent(rawMessage));
+                        if (hold)
+                        {
+                            _held.Add(new HeldEvent { Event = first, Tick = Environment.TickCount });
+                            _heldCount = _held.Count;
+                            if (track)
+                                RememberLog(entry.Fingerprint, first, ref occ);
+                            first = null;
+                        }
+                    }
+                    else
+                    {
+                        // Same group, different text (e.g. another roomId in the
+                        // message), or the window's budget for immediate events is
+                        // spent: counted, reported at the end of the window.
+                        var bucket = CountLocked(entry, ref occ);
+                        if (track)
+                            RememberLog(entry.Fingerprint, bucket, ref occ);
+                    }
+
+                    if (entry == info && !onTimeline)
+                    {
+                        // Record as breadcrumb (once per group and window, not per
+                        // repeat), unless the log line itself is on the time line
+                        // (errors and asserts are; exceptions are not).
+                        _timeline.RecordText("Exception: " + Truncate(FirstLine(info.Message), 100), nowMs);
+                    }
+                Done:
+                    checkpoint = !wasDirty && _cpDirty;
                 }
-            Done:
-                checkpoint = !wasDirty && _cpDirty;
             }
-            EnqueueAll(closed);
+            finally
+            {
+                // Also when the code above threw: a closed window always reaches
+                // the queue (and _closing returns to 0; APM-24).
+                EnqueueAll(closed);
+            }
             if (first != null)
                 Enqueue(first);
             if (checkpoint)
@@ -731,48 +748,55 @@ namespace OzxApm.Collectors
             List<ExceptionEvent> closed = null;
             bool done = false;
             bool checkpoint = false;
-            lock (_sync)
+            try
             {
-                closed = SyncSessionLocked();
-                bool wasDirty = _cpDirty;
-                if (!mainThread && ReferenceEquals(t_logOwner, this) && t_logFingerprint == info.Fingerprint &&
-                    unchecked(Environment.TickCount - t_logTick) < EchoWindowMs)
+                lock (_sync)
                 {
-                    done = true;
-                    var target = t_logTarget;
-                    t_logOwner = null;
-                    t_logFingerprint = null;
-                    t_logTarget = null;
-                    if (target is ExceptionEvent held && RemoveHeldLocked(held))
+                    closed = SyncSessionLocked();
+                    bool wasDirty = _cpDirty;
+                    if (!mainThread && ReferenceEquals(t_logOwner, this) && t_logFingerprint == info.Fingerprint &&
+                        unchecked(Environment.TickCount - t_logTick) < EchoWindowMs)
                     {
-                        held.unhandled = kind;
-                        release = held;
-                    }
-                    else if (target is Bucket bucket && t_logWindow == _windowId && bucket.Count > 0 &&
-                             _entries.TryGetValue(info.Fingerprint, out var entry))
-                    {
-                        var occ = t_logOccurrence;
-                        if (bucket.Count == 1 && bucket.Unhandled == null)
+                        done = true;
+                        var target = t_logTarget;
+                        t_logOwner = null;
+                        t_logFingerprint = null;
+                        t_logTarget = null;
+                        if (target is ExceptionEvent held && RemoveHeldLocked(held))
                         {
-                            // Only this occurrence: the count itself becomes unhandled.
-                            bucket.Unhandled = kind;
-                            _cpDirty = true;
+                            held.unhandled = kind;
+                            release = held;
                         }
-                        else if (bucket.FirstSeq != occ.Seq)
+                        else if (target is Bucket bucket && t_logWindow == _windowId && bucket.Count > 0 &&
+                                 _entries.TryGetValue(info.Fingerprint, out var entry))
                         {
-                            bucket.Count--;
-                            occ.Unhandled = kind;
-                            CountLocked(entry, ref occ);
+                            var occ = t_logOccurrence;
+                            if (bucket.Count == 1 && bucket.Unhandled == null)
+                            {
+                                // Only this occurrence: the count itself becomes unhandled.
+                                bucket.Unhandled = kind;
+                                _cpDirty = true;
+                            }
+                            else if (bucket.FirstSeq != occ.Seq)
+                            {
+                                bucket.Count--;
+                                occ.Unhandled = kind;
+                                CountLocked(entry, ref occ);
+                            }
+                            // else: it was the first of a count that went on; moving it would
+                            // leave the count with the wrong first occurrence. Left unmarked.
                         }
-                        // else: it was the first of a count that went on; moving it would
-                        // leave the count with the wrong first occurrence. Left unmarked.
+                        // An untracked one (in the window's summary): counted once already.
                     }
-                    // An untracked one (in the window's summary): counted once already.
+                    checkpoint = !wasDirty && _cpDirty;
                 }
-                checkpoint = !wasDirty && _cpDirty;
             }
-
-            EnqueueAll(closed);
+            finally
+            {
+                // Also when the code above threw: a closed window always reaches
+                // the queue (and _closing returns to 0; APM-24).
+                EnqueueAll(closed);
+            }
             if (release != null)
                 Enqueue(release);
             if (checkpoint)
@@ -1045,7 +1069,11 @@ namespace OzxApm.Collectors
                 Stack = "",
                 Embedded = ""
             };
-            summary.Fingerprint = ExceptionParser.Analyze(summary.LogType, summary.Message, "", "").Fingerprint;
+            // Computed once: the numbers in the message are templated, so every
+            // summary has the same fingerprint (and the checkpoint collection on
+            // the storage worker does not parse under the lock every 5 s).
+            summary.Fingerprint = s_summaryFingerprint ??
+                (s_summaryFingerprint = ExceptionParser.Analyze(summary.LogType, summary.Message, "", "").Fingerprint);
             var occ = _untrackedFirst;
             var evt = BuildEvent(summary, _untrackedCount, ref occ, _untrackedMerged, _windowSessionId, null);
             evt.id_hi = _untrackedIdHi;
